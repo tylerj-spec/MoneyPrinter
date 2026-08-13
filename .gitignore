@@ -25,3 +25,8 @@ Thumbs.db
 # Local test/run artifacts
 *.log
 .pytest_cache/
+
+# Fetched market data - regenerable via `python fetch_data.py`, not source.
+# Keeping it out of git also avoids accidentally publishing paid-vendor data
+# (e.g. EODHD chains) under terms that may not permit redistribution.
+claude/app/mp_v01/data_store/

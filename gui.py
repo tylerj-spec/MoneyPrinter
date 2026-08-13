@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple Tkinter GUI for MoneyPrinter (claude/app/mp_v01).
+Simple Tkinter GUI for MoneyPrinter.
 
 Features:
 - Run the test suite (run_all.py) and show live output
@@ -8,10 +8,13 @@ Features:
 - Browse the data_store/bars and data_store/chains directories and view JSON files
 
 This GUI is intentionally dependency-free (stdlib only) so it can run with the
-project's zero-dependency core. Run from the repository:
+project's zero-dependency core. Run it from the repository root:
 
   python gui.py
 
+Lives at the repo root deliberately - it's the first thing anyone opening this
+project should be able to find and run, not something buried three folders deep.
+The actual pipeline it drives lives in claude/app/mp_v01/ (see MP_V01_DIR below).
 """
 from __future__ import annotations
 
@@ -25,10 +28,11 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
 
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data_store"
+MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
+DATA_DIR = MP_V01_DIR / "data_store"
 
 
 class SubprocessRunner(threading.Thread):
@@ -61,6 +65,11 @@ class SubprocessRunner(threading.Thread):
             self.out_q.put(f"\n<process exited {self.proc.returncode}>\n")
         except Exception:
             self.out_q.put(traceback.format_exc())
+            self.out_q.put("\n<process exited 1>\n")
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
 
 
 class MoneyPrinterGUI(tk.Tk):
@@ -68,6 +77,17 @@ class MoneyPrinterGUI(tk.Tk):
         super().__init__()
         self.title("MoneyPrinter GUI")
         self.geometry("1000x700")
+
+        if not MP_V01_DIR.exists():
+            messagebox.showerror(
+                "MoneyPrinter GUI",
+                f"Can't find the pipeline at:\n{MP_V01_DIR}\n\n"
+                "This file expects to live at the repository root, next to the "
+                "'claude' folder. If you moved it, move it back or update "
+                "MP_V01_DIR at the top of gui.py.",
+            )
+
+        self._current_runner: SubprocessRunner | None = None
 
         # Top frame: controls
         ctrl = ttk.Frame(self)
@@ -100,6 +120,13 @@ class MoneyPrinterGUI(tk.Tk):
         self.fetch_btn = ttk.Button(ctrl, text="Fetch Data", command=self.fetch_data)
         self.fetch_btn.grid(row=0, column=8, padx=4)
 
+        self.stop_btn = ttk.Button(ctrl, text="Stop", command=self.stop_running, state=tk.DISABLED)
+        self.stop_btn.grid(row=0, column=9, padx=4)
+
+        # These get disabled together while a job is running, so two jobs
+        # (e.g. tests + fetch) can't write into the console/data_store at once.
+        self._job_buttons = (self.run_tests_btn, self.fetch_btn)
+
         # Middle frame: output text and file browser
         middle = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         middle.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -127,7 +154,9 @@ class MoneyPrinterGUI(tk.Tk):
         ttk.Button(btns, text="Open", command=self.open_selected_file).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Reveal in File Manager", command=self.reveal_in_file_manager).pack(side=tk.LEFT, padx=4)
 
-        # Status bar
+        # Status bar - color-coded so pass/fail is visible without reading
+        # the console output (which "ALL GREEN" vs "N STEP(S) FAILED" can
+        # otherwise scroll past unnoticed in a long test run).
         self.status = ttk.Label(self, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -145,10 +174,29 @@ class MoneyPrinterGUI(tk.Tk):
         self.text.see(tk.END)
         self.text.configure(state=tk.DISABLED)
 
-    def _start_runner(self, args, cwd=None):
-        self.status.config(text="Running...")
-        runner = SubprocessRunner(args, cwd=cwd or HERE, env=os.environ.copy(), out_q=self._out_q)
+    def _set_status(self, text: str, color: str = "black"):
+        self.status.config(text=text, foreground=color)
+
+    def _set_job_buttons_enabled(self, enabled: bool):
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for b in self._job_buttons:
+            b.config(state=state)
+        self.stop_btn.config(state=tk.DISABLED if enabled else tk.NORMAL)
+
+    def _start_runner(self, args, label: str, cwd=None):
+        if self._current_runner is not None and self._current_runner.is_alive():
+            messagebox.showinfo("Busy", "Another job is already running. Stop it first or wait for it to finish.")
+            return
+        self._set_status(f"Running: {label} ...")
+        self._set_job_buttons_enabled(False)
+        runner = SubprocessRunner(args, cwd=cwd or MP_V01_DIR, env=os.environ.copy(), out_q=self._out_q)
+        self._current_runner = runner
         runner.start()
+
+    def stop_running(self):
+        if self._current_runner is not None and self._current_runner.is_alive():
+            self._current_runner.stop()
+            self._append_text("\n<stop requested>\n")
 
     def _poll(self):
         try:
@@ -156,29 +204,43 @@ class MoneyPrinterGUI(tk.Tk):
                 line = self._out_q.get_nowait()
                 self._append_text(line)
                 if line.startswith("<process exited"):
-                    self.status.config(text="Ready")
+                    self._set_job_buttons_enabled(True)
+                    try:
+                        code = int(line.strip().rstrip(">").rsplit(" ", 1)[-1])
+                    except ValueError:
+                        code = None
+                    if code == 0:
+                        self._set_status("Ready — last run passed", color="dark green")
+                    elif code is None:
+                        self._set_status("Ready", color="black")
+                    else:
+                        self._set_status(f"Ready — last run FAILED (exit {code})", color="red")
+                    self.refresh_store()
         except queue.Empty:
             pass
         self.after(100, self._poll)
 
     # ----------------- actions -----------------
     def run_tests(self):
-        # run run_all.py; ensure we run the script from its directory
         script = "run_all.py"
         self._append_text(f"\n=== Running tests: {script} ===\n")
-        self._start_runner([script], cwd=HERE)
+        self._start_runner([script], label="run_all.py", cwd=MP_V01_DIR)
 
     def fetch_data(self):
-        args = ["fetch_data.py", "--start", self.start_var.get(), "--end", self.end_var.get(), "--tickers", self.tickers_var.get()]
+        tickers = self.tickers_var.get().strip()
+        if not tickers:
+            messagebox.showwarning("Fetch Data", "Enter at least one ticker (e.g. SPY,QQQ,MSFT) first.")
+            return
+        args = ["fetch_data.py", "--start", self.start_var.get(), "--end", self.end_var.get(), "--tickers", tickers]
         if self.chains_var.get():
             args.append("--chains")
         self._append_text(f"\n=== Fetching data: {' '.join(args)} ===\n")
-        self._start_runner(args, cwd=HERE)
+        self._start_runner(args, label="fetch_data.py", cwd=MP_V01_DIR)
 
     def refresh_store(self):
         self.store_list.delete(0, tk.END)
         if not DATA_DIR.exists():
-            self.store_list.insert(tk.END, "(no data_store directory)")
+            self.store_list.insert(tk.END, "(no data_store directory yet - run Fetch Data)")
             return
         for sub in ("bars", "chains"):
             d = DATA_DIR / sub

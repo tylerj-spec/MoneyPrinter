@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-81 tests passing, zero external dependencies, in `claude/app/mp_v01/`. No real market data has been ingested yet. No strategy has been evaluated. No edge has been demonstrated. Any claim otherwise, from any agent, should be treated as false until it's backed by a run against real (not synthetic) data.
+76 tests passing in `claude/app/mp_v01/`. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once (the timezone-correct date math in `labels/contract.py` and the adapters relies on the IANA tz database, which Windows doesn't ship for Python's `zoneinfo`). No real market data has been ingested yet. No strategy has been evaluated. No edge has been demonstrated. Any claim otherwise, from any agent, should be treated as false until it's backed by a run against real (not synthetic) data.
 
 ## Why this exists
 
@@ -23,6 +23,7 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ## Layout
 
 ```
+├── gui.py                   Desktop GUI - run tests, fetch data, browse results. Start here.
 ├── claude/                  Claude's work: architecture, orchestration, adversarial review, QC
 │   ├── app/mp_v01/          The codebase — see below
 │   ├── market_research/     Data source and provider licensing analysis
@@ -51,6 +52,12 @@ A point-in-time-correct research pipeline, built to make hindsight structurally 
 
 ### Quickstart
 
+GUI (from the repo root):
+```bash
+python gui.py               # run tests, fetch data, and browse results from one window
+```
+
+Command line:
 ```bash
 cd claude/app/mp_v01
 python run_all.py          # runs the full zero-dependency test suite
