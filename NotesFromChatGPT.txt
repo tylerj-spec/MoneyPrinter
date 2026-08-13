@@ -1,0 +1,89 @@
+The repository has a solid safety foundation, but it is not ready for trustworthy historical stock or options testing yet. I reviewed current `main` at commit [`f31e9f1`](https://github.com/tylerj-spec/MoneyPrinter/commit/f31e9f1107b3488cd70306bed563ffc0fea96453) and ran the suite: all 76 tests passed. No live-order path or exposed credential was found.
+
+The most important issues are below, in priority order.
+
+## Blocking correctness issues
+
+| Priority | Finding                                                         | Why it matters                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P0       | Purging uses calendar days, not trading bars                    | A five-calendar-day gap can contain only two trading sessions. I reproduced a Thanksgiving-week split that incorrectly passed. This permits label leakage. See [`walkforward.py`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/claude/app/mp_v01/src/backtest/walkforward.py#L28-L69).                                                                                                                                                                           |
+| P0       | The five-day label accepts and compounds more than five returns | Passing six returns uses all six. I reproduced a sixth-day loss reversing what should have been a positive five-day label. Enforce exactly `[:HORIZON_TRADING_DAYS]`. See [`contract.py`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/claude/app/mp_v01/src/labels/contract.py#L87-L160).                                                                                                                                                                       |
+| P0       | Stock splits are not incorporated into returns                  | The adapter downloads unadjusted prices but adds only dividends. A 4:1 split therefore appears as a −75% daily return in my test. Fetch split factors and either calculate split-correct total returns or quarantine unresolved dates. See [`yahoo_daily.py`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/claude/app/mp_v01/src/adapters/yahoo_daily.py#L60-L122).                                                                                              |
+| P0       | Some risk and cost inputs fail open                             | A candidate missing `position_pct`, portfolio heat, and open-position count currently reaches `PAPER_TRADE_CANDIDATE`. A NaN option bid is considered tradeable, and negative contract quantity produces a negative “cost.” See [`risk.py`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/claude/app/mp_v01/src/gates/risk.py#L138-L174) and [`costs.py`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/claude/app/mp_v01/src/backtest/costs.py#L31-L63). |
+| P0       | The tested components are not connected                         | `fetch_data.py` writes dictionaries to JSON, while the PIT store consumes `EvidenceRecord`; there is no loader, feature builder, strategy, portfolio simulator, prediction ledger, or resolver. The current “end-to-end” demo uses synthetic inputs.                                                                                                                                                                                                                      |
+| P0       | The decision and execution clocks are mismatched                | The target starts at the day’s official close after a 15:45 decision, but no executable 15:45 quote or closing-auction fill is modeled. Options EOD chains are available only after the close, so they cannot legitimately select a same-day 15:45 contract.                                                                                                                                                                                                              |
+
+## Evaluation problems
+
+The current evaluator is useful as a prototype, but not yet a model-validation framework:
+
+* It accepts only test features and labels; there is no train/tune/calibration/test lifecycle.
+* `assert_no_future_features()` exists but is not invoked by the evaluator.
+* Permutation testing shuffles overlapping five-day labels independently, destroying serial dependence.
+* Models are not refitted during permutations, so the null does not include their ability to overfit.
+* Results are pooled classification accuracy. Trade advice needs return-based evaluation: post-cost expectancy, drawdown, turnover, exposure, calibration, Brier/log loss, and performance versus a simple benchmark.
+* There is no multiple-testing register, untouched final holdout, or point-in-time universe membership.
+
+Relevant code: [`evaluate.py`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/claude/app/mp_v01/src/backtest/evaluate.py#L83-L130).
+
+I would replace this interface with fold objects containing train/test observations, decision times and availability times. Each fold should fit only on its training window. Use block permutations or a stationary bootstrap, refitting the complete procedure each time.
+
+## Options-specific gaps
+
+The free Yahoo snapshot path is useful for collecting data forward, but it currently omits several fields required to follow a contract through time:
+
+* OCC contract symbol
+* quote/trade timestamps
+* underlying price at the snapshot
+* bid/ask size
+* multiplier and adjusted-deliverable status
+* contract-specific corporate actions
+* explicit DTE filtering
+
+It also captures only the nearest six expirations, which can miss the configured 21–60 DTE range when many weekly expirations exist. See [`fetch_data.py`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/claude/app/mp_v01/fetch_data.py#L84-L135).
+
+The EODHD adapter should also be contract-tested against the current API. The repository uses the older `/api/options/{symbol}` shape, while EODHD now documents its historical marketplace endpoint as `/api/mp/unicornbay/options/eod`, with history only since Q4 2023. [EODHD’s current options documentation](https://eodhd.com/lp/us-stock-options-api/) confirms it is end-of-day data, not intraday.
+
+For the data/clock decision:
+
+* If this is an end-of-day strategy, generate the pick after the chain becomes available and simulate entry the following session.
+* If the intended decision remains 15:45, use contemporaneous historical quotes. Alpaca currently offers historical options data since February 2024; its free feed is indicative, while subscribed OPRA data supplies consolidated quotes. [Alpaca historical options documentation](https://docs.alpaca.markets/us/docs/historical-option-data).
+* Treat free indicative data as suitable for pipeline testing, not evidence of realistic fills.
+
+Paper fills must also be recorded and compared with the simulator. Alpaca explicitly notes that its paper environment does not model several live effects, including full liquidity constraints and dividends. [Alpaca paper-trading limitations](https://docs.alpaca.markets/us/v1.4.2/docs/paper-trading).
+
+## Architectural cleanup
+
+There are still two runnable systems:
+
+* `claude/app/mp_v01` contains the careful PIT and risk machinery.
+* `market_intelligence_engine.py` remains an unvalidated training-and-prediction application.
+
+The GUI still exposes the latter, and [`MARKET_INTELLIGENCE_README.md`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/MARKET_INTELLIGENCE_README.md#L1-L33) describes it as a complete signal system, including claims that no longer match the code. I recommend:
+
+1. Make `mp_v01` the sole production package.
+2. Move useful indicator calculations into `src/features/`.
+3. Disable or remove MIE’s prediction/report entry point.
+4. Remove its GUI button.
+5. Replace the stale MIE documentation with an archival warning.
+
+Also consolidate the two conflicting dependency files into one locked `pyproject.toml`. CI currently tests only the standard-library core and never exercises provider parsing or installed dependencies.
+
+## Recommended implementation sequence
+
+1. Fix the six reproduced P0 correctness issues and add regression tests.
+2. Define a separate prediction clock and executable entry/exit contract.
+3. Build a validated bars/chains loader into a persistent PIT dataset.
+4. Add a feature builder that can read only `available_time <= decision_time`.
+5. Implement one simple stock-only baseline before ML.
+6. Add a real portfolio backtester with next-session fills, costs and benchmarks.
+7. Run null strategies on real SPY/QQQ/MSFT data; they must show no edge.
+8. Add walk-forward fitting, block permutation, calibration and a frozen holdout.
+9. Only after stock-level post-cost edge survives, add contract selection and options valuation.
+10. Build an append-only prediction ledger plus a separate outcome resolver.
+11. Schedule an idempotent paper-simulation job with locks, retries, freshness checks and alerts.
+12. Compare simulated fills with months of actual paper fills before considering real-money advice.
+
+One additional risk choice deserves reconsideration: [`SMALL_ACCOUNT`](https://github.com/tylerj-spec/MoneyPrinter/blob/main/claude/app/mp_v01/src/gates/account_profiles.py#L34-L51) relaxes the position cap to 10% because one option contract does not fit a 2% limit. A safer rule is to return `INFEASIBLE` and use fractional stock exposure; lot size should not cause the risk limit itself to expand.
+
+My recommended immediate milestone is an honest, reproducible stock-only backtest on the fixed SPY/QQQ/MSFT universe. The options layer should remain disabled until that pipeline demonstrates an out-of-sample edge after costs.
