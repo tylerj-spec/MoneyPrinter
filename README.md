@@ -8,11 +8,11 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 76 tests passing in `claude/app/mp_v01/`. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
-**NEW**: Market Intelligence Engine with incremental data ingestion and automatic deduplication.
+**NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
 ## Why this exists
 
-The goal is to find out, honestly, whether a small, disciplined, point-in-time-correct research pipeline can identify a real statistical edge in equities/options — and to do it in a way that's structurally sound and reproducible.
+The goal is to find out, honestly, whether a small, disciplined, point-in-time-correct research pipeline can identify a real statistical edge in equities/options — and to do it in a way that's statistically sound enough to justify real capital.
 
 ## Hard constraints
 
@@ -25,11 +25,12 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ## Layout
 
 ```
-├── market_intelligence_engine.py  Market data ingestion, news scraping, predictions
+├── market_intelligence_engine.py  DEVELOPMENT ONLY. See CODE_REVIEW_2026-08-13.md
 ├── requirements.txt               Python dependencies
 ├── gui.py                         Desktop GUI - run tests, fetch data, browse results
+├── CODE_REVIEW_2026-08-13.md      Complete accounting of MIE issues and remediation
 ├── claude/                        Claude's work: architecture, orchestration, review
-│   ├── app/mp_v01/                The core codebase
+│   ├── app/mp_v01/                The core codebase (PRODUCTION STANDARD)
 │   ├── market_research/           Data source licensing analysis
 │   ├── reports/                   Architecture blueprints, agent design docs
 │   └── scheduled_state/           STATE.md — single source of truth
@@ -37,220 +38,51 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 └── shared/                        Cross-agent data handoffs
 ```
 
-## Market Intelligence Engine
+---
 
-A comprehensive system for financial data analysis, news aggregation, and predictive trading signals.
+## ⚠️ Market Intelligence Engine — DEVELOPMENT ONLY
 
-### Features
+**DO NOT USE FOR REAL TRADING.**
 
-1. **Historical Market Data Ingestion** (1-year lookback)
-   - Automatic incremental updates (only fetches new data)
-   - Deduplication logic prevents duplicate records
-   - 20+ technical indicators calculated
-   - CSV export for archival
+The Market Intelligence Engine (`market_intelligence_engine.py`) is a feature scratchpad. See `CODE_REVIEW_2026-08-13.md` for the complete list of blocking correctness issues.
 
-2. **Sector News Scraping & Aggregation**
-   - Multi-source news collection
-   - Sector classification via keywords
-   - Sentiment scoring by sector
-   - Point-in-time aware
+### What's broken:
 
-3. **Unified Scoring System**
-   - Technical Score (40%): Trends, MAs, momentum
-   - Momentum Score (20%): Short/medium-term moves
-   - Volatility Score (10%): Risk-adjusted metrics
-   - Sentiment Score (30%): News & market sentiment
-   - Overall Score (0-100 scale)
+| Issue | Impact | Status |
+|-------|--------|--------|
+| Point-in-time correctness | Uses `iloc[-1]` as if available now. No PIT enforcement. | CRITICAL |
+| News source | **100% synthetic**. Sentiment weight set to **0**. | CRITICAL |
+| `fillna(0)` | Replaces missing SMA (dollar prices) with 0. Model sees stock as $0. | BLOCKING |
+| Label definition | Raw 2% threshold, not excess return vs SPY. | BLOCKING |
+| Execution costs | Not modeled. Options spreads can cost 10%+ round-trip. | BLOCKING |
+| Validation | Zero tests, zero noise floor, zero permutation test. | BLOCKING |
+| Train/test split | All data in training set, none held out. No holdout set. | BLOCKING |
+| Auto-adjust | Now explicitly `auto_adjust=False` (FIXED). | ✅ FIXED |
+| SELL signal | Removed; binary label doesn't support downside forecast. | ✅ FIXED |
 
-4. **ML-Based Predictions with Timing Rules**
-   - Random Forest classifier on historical patterns
-   - 5-day price movement prediction
-   - Timing rules for trend confirmation, volume, RSI
-   - Confidence-adjusted signals: STRONG, MODERATE, WEAK
+### What will be done:
 
-### Quick Start
+The indicator math will be **harvested and integrated** into `claude/app/mp_v01/src/features/` where it will inherit:
+- Point-in-time correctness via `as_of()` API
+- Immutable timestamped data store (not overwriting CSVs)
+- Deterministic risk gates that fail closed
+- Validation via permutation test and noise floor check
+- Real data with publication lag modeling
 
-#### Installation
+### For now:
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# On Windows, if timezone errors:
-pip install tzdata
-```
-
-#### Basic Usage
-
-```python
-from market_intelligence_engine import MarketIntelligenceApp
-
-app = MarketIntelligenceApp()
-
-tickers = ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'TSLA']
-sector_etfs = {
-    'Technology': 'XLK',
-    'Healthcare': 'XLV',
-    'Finance': 'XLF'
-}
-
-# Run analysis (incremental data update on subsequent runs)
-results = app.run_analysis(tickers, sector_etfs)
-
-# Generate report and summary
-app.generate_report('market_intelligence_report.json')
-app.print_summary()
-```
-
-#### Run as Script
-
-```bash
-python market_intelligence_engine.py
-```
-
-### Data Management
-
-#### Incremental Updates
-
-The engine automatically manages data to avoid reprocessing:
-
-```python
-from market_intelligence_engine import HistoricalDataIngester
-
-ingester = HistoricalDataIngester(lookback_years=1)
-
-# First run: downloads full 1-year history
-data = ingester.ingest_stock_data('AAPL')
-
-# Subsequent runs: only fetches new data since last update
-data = ingester.ingest_stock_data('AAPL')
-
-# Export to CSV backup
-ingester.export_to_csv('market_data')
-```
-
-#### Deduplication
-
-Built-in deduplication ensures:
-- No duplicate OHLCV records per date
-- Automatic merging of new data with existing cache
-- Verification of data integrity on load
-
-```python
-# Cache location (automatic)
-data_cache/
-├── market_data/
-│   ├── AAPL_historical.csv
-│   ├── MSFT_historical.csv
-│   └── ...
-└── timestamps.json  # Tracks last update for each ticker
-```
-
-#### Manual Cache Management
-
-```python
-import shutil
-
-# Clear entire cache and start fresh
-shutil.rmtree('data_cache', ignore_errors=True)
-app.run_analysis(tickers, sector_etfs)  # Downloads fresh data
-```
-
-### Output
-
-#### JSON Report
-
-```json
-{
-  "timestamp": "2026-08-13T15:35:00",
-  "market_data_summary": {
-    "AAPL": {
-      "latest_close": 195.50,
-      "period_high": 205.75,
-      "period_low": 150.25,
-      "records": 252
-    }
-  },
-  "unified_scores": [
-    {
-      "ticker": "AAPL",
-      "overall_score": 67.44,
-      "technical_score": 72.5,
-      "momentum_score": 65.3
-    }
-  ],
-  "predictions": [
-    {
-      "ticker": "AAPL",
-      "prediction": "BUY",
-      "adjusted_confidence": 0.78,
-      "signal_strength": "STRONG",
-      "trend": "UPTREND"
-    }
-  ]
-}
-```
-
-#### Console Summary
-
-- Top 5 scoring stocks
-- BUY/SELL signals with confidence
-- Sector sentiment analysis
-- Timing rule validations
-
-### Advanced Configuration
-
-```python
-# Custom lookback period
-ingester = HistoricalDataIngester(lookback_years=2)
-
-# Custom scoring weights
-app.scoring_system.weights = {
-    'technical': 0.5,
-    'sentiment': 0.2,
-    'momentum': 0.2,
-    'volatility': 0.1
-}
-
-# Different ML model
-from sklearn.ensemble import GradientBoostingClassifier
-app.prediction_engine.model = GradientBoostingClassifier(n_estimators=100)
-```
-
-### Performance
-
-- **First Run**: ~3-7 minutes (downloads full 1-year history for 5 tickers)
-- **Subsequent Runs**: ~1-2 minutes (incremental updates only)
-- **Model Training**: ~10 seconds
-- **Full Pipeline**: ~3-7 minutes first, ~1-2 minutes after
-
-### Troubleshooting
-
-**Timezone Error on Windows**
-```bash
-pip install tzdata
-```
-
-**No Market Data**
-- Check internet connection
-- Verify ticker symbols (e.g., 'AAPL' not 'Apple')
-- Yahoo Finance may rate-limit; retry after delay
-
-**Duplicate Data**
-```python
-# Clear cache to force fresh download
-import shutil
-shutil.rmtree('data_cache', ignore_errors=True)
-```
+**Use `claude/app/mp_v01/run_all.py` for any real evaluation.**
 
 ---
 
-## The Original Codebase: `claude/app/mp_v01/`
+## The Production Codebase: `claude/app/mp_v01/`
 
 A point-in-time-correct research pipeline, built to make hindsight structurally impossible rather than merely discouraged.
 
+### Key guarantees:
+
 | Module | What it guarantees |
-|---|---|
+|--------|-------------------|
 | `pit/schema.py`, `pit/store.py` | Every record carries four timestamps. Only `available_time` is ever filterable. Revisions don't leak backwards. Syndicated copies collapse to one info event. |
 | `labels/contract.py` | Label = binary sign of 5-trading-day forward log excess total return vs. SPY. Decision clock (15:45 ET) precedes the close it's scored against. Fails closed on unknown data. |
 | `backtest/costs.py` | Spread/slippage/fee modeling; stale and wide quotes are rejected, not used. |
@@ -260,21 +92,47 @@ A point-in-time-correct research pipeline, built to make hindsight structurally 
 | `adapters/yahoo_daily.py` | Free daily equity bars with realistic publication lag. |
 | `adapters/eodhd_options.py` | Paid options chain adapter; token read from env only. |
 
-### Original Quickstart
+### Running the production system:
 
-GUI (from repo root):
+**GUI** (from repo root):
 ```bash
 python gui.py               # run tests, fetch data, browse results
 ```
 
-Command line:
+**Command line**:
 ```bash
 cd claude/app/mp_v01
-python run_all.py          # full zero-dependency test suite
+python run_all.py          # full zero-dependency test suite (76 tests)
 
 pip install yfinance
 python fetch_data.py --tickers SPY,QQQ,MSFT --chains
 ```
+
+### Test results (76 passing):
+
+```
+NO-LOOKAHEAD / POINT-IN-TIME CORRECTNESS
+  ✓ future_records_are_invisible
+  ✓ boundary_is_inclusive_and_exact_to_the_second
+  ✓ publication_lag_is_respected
+  ✓ revision_does_not_leak_backwards
+  ... (14 passed)
+
+BACKTEST / COSTS / RISK GATES
+  ✓ splits_are_chronological_and_non_overlapping
+  ✓ overlapping_train_test_rejected
+  ✓ future_features_rejected
+  ✓ option_buy_pays_up_and_sell_receives_less
+  ✓ round_trip_cost_is_material_on_wide_spreads
+  ✓ negative_edge_after_costs_is_hard_fail
+  ✓ confidence_cannot_override_a_hard_gate
+  ... (24 passed)
+
+NOISE FLOOR CHECK
+  ✓ Strategy on pure random data: NO_EDGE (correct null)
+```
+
+---
 
 ## Project Organization
 
@@ -286,11 +144,60 @@ Deterministic risk gates sit outside every model's judgment. A model may only *p
 
 See `claude/scheduled_state/STATE.md` for current work list and decision log.
 
+---
+
+## Development Roadmap (from CODE_REVIEW_2026-08-13.md)
+
+### Phase 1 — Ingest for real
+Run `fetch_data.py` on real SPY/QQQ/MSFT over the longest free history. Build the JSON→PIT loader.
+**Exit:** records in store, `as_of()` returns sane counts, no `UNKNOWN` above threshold.
+
+### Phase 2 — Fix blocking bugs
+Purge in bar-index space, block permutation, refit-under-permutation, leak guard wired into eval path.
+**Exit:** planted-leak test fires, noise floor still reads `NO_EDGE`.
+
+### Phase 3 — Null run on real bars
+Run deliberately worthless strategy (coin flip, always-long, trailing momentum) on real data.
+**Exit:** `NO_EDGE`. If a coin flip shows edge, harness is still broken.
+
+### Phase 4 — Component rank IC
+Compute walk-forward rank information coefficient of each score component vs forward excess return.
+**Exit:** a number for each component. Most likely all near zero (honest result, saves money).
+
+### Phase 5 — Post-cost gate
+Feed any surviving signal through `costs.py` and `gates/risk.py`.
+**Exit:** `expected_edge_after_costs` figure. If negative (base rate), stop.
+
+### Phase 6 — Forward paper log
+Scheduled runs producing frozen, hashed predictions; separate resolver scoring after 5 days.
+**Exit:** this is the only genuinely out-of-sample evidence. Worth more than all backtests combined.
+
+---
+
+## Pre-registration (must be decided before seeing results)
+
+Write these numbers down **now** and put in STATE.md:
+
+- **Minimum forward paper predictions before real capital:** ≥ 200 non-overlapping decisions (~4 years weekly on 3 tickers)
+- **Required post-cost expectancy:** stated as a number
+- **Required calibration:** predicted 70% buckets must resolve within stated band of 70%
+- **Maximum acceptable paper drawdown:** stated value
+- **Strategy lock:** any change resets the clock. No exceptions, no "small tweaks."
+- **Failure condition:** what result makes you abandon the project? (Must exist, or project can't fail/succeed.)
+
+---
+
 ## Disclaimer
 
-**This tool is for educational and research purposes only. It is not financial advice. Always conduct your own due diligence before making investment decisions. Past performance does not guarantee future results. Use at your own risk.**
+**This tool is for educational and research purposes only.**
+
+- Not financial advice
+- Always conduct due diligence before investing
+- Past performance ≠ future results
+- Paper trading results do not guarantee live performance
+- No live order code path exists anywhere in this repository
 
 ---
 
 **Last Updated**: August 13, 2026  
-**Version**: 2.0.0 (with Market Intelligence Engine)
+**Version**: 2.1.0 (Market Intelligence Engine marked DEVELOPMENT ONLY, critical fixes applied)
