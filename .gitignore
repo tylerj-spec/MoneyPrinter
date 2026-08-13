@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Secrets — never committed, ever. Tokens live in env vars only.
+.env
+.env.*
+*.token
+*credentials*
+!**/CREDENTIAL_SETUP.md
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local test/run artifacts
+*.log
+.pytest_cache/
