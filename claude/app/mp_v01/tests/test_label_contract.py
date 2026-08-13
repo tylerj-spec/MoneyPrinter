@@ -15,10 +15,32 @@ def contract_is_versioned():
 
 @test
 def decision_clock_is_1545_et_not_the_close():
-    dt = decision_time_utc_for("2026-03-05")
+    dt = decision_time_utc_for("2026-06-15")   # unambiguously EDT (summer)
     assert dt.hour == 19 and dt.minute == 45, dt   # 15:45 EDT == 19:45 UTC
     # The 16:00 ET close is 20:00 UTC - strictly after the decision.
     assert dt.hour < 20, "decision must precede the close it is scored against"
+
+@test
+def decision_clock_is_correct_in_standard_time_too():
+    """2026-03-05 is BEFORE that year's DST start (2026-03-08), so it's EST
+    (UTC-5), not EDT. A hard-coded UTC-4 offset gets this silently wrong for
+    roughly half the year - this is exactly the bug a fixed offset causes."""
+    dt = decision_time_utc_for("2026-03-05")
+    assert dt.hour == 20 and dt.minute == 45, dt   # 15:45 EST == 20:45 UTC
+
+@test
+def decision_clock_is_correct_across_the_march_dst_transition():
+    before = decision_time_utc_for("2026-03-05")   # EST, UTC-5
+    after = decision_time_utc_for("2026-03-09")     # EDT, UTC-4 (DST started Mar 8)
+    assert before.hour == 20, before
+    assert after.hour == 19, after
+
+@test
+def decision_clock_is_correct_across_the_november_dst_transition():
+    before = decision_time_utc_for("2026-10-30")    # still EDT, UTC-4
+    after = decision_time_utc_for("2026-11-02")      # EST again (DST ended Nov 1), UTC-5
+    assert before.hour == 19, before
+    assert after.hour == 20, after
 
 @test
 def outperformance_labels_one():
@@ -78,6 +100,23 @@ def missing_dlret_imputes_total_loss_and_flags_it():
 @test
 def none_in_return_series_raises_rather_than_silently_zeroing():
     assert_raises(ValueError, log_total_return, [0.01, None])
+
+@test
+def a_gap_day_inside_the_window_fails_closed_instead_of_crashing():
+    """A None in the middle of an otherwise-long-enough series (e.g. one
+    NO_PRIOR_CLOSE bar) must not raise out of build_label - a batch label
+    builder processing thousands of instrument-days can't have one bad day
+    take down the whole run. It must come back as an unresolved label."""
+    lab = build_label("MSFT", "2026-03-05", [0.01, 0.01, None, 0.01, 0.01], FLAT)
+    assert lab.y is None
+    assert lab.status == LabelStatus.RETURN_GAP_UNRESOLVED
+    assert not lab.is_usable()
+
+@test
+def a_gap_day_in_the_benchmark_series_also_fails_closed():
+    lab = build_label("MSFT", "2026-03-05", [0.01]*5, [0.0, None, 0.0, 0.0, 0.0])
+    assert lab.y is None
+    assert lab.status == LabelStatus.RETURN_GAP_UNRESOLVED
 
 @test
 def labels_are_immutable():

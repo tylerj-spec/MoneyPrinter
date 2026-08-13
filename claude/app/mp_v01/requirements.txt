@@ -1,0 +1,12 @@
+# Optional. The test suite (run_all.py) needs nothing beyond the Python
+# standard library on Linux/macOS - these are only needed to pull LIVE
+# market data via fetch_data.py.
+yfinance>=0.2.40
+requests>=2.31
+
+# zoneinfo (stdlib since Python 3.9) needs an IANA timezone database.
+# Linux/macOS normally have one system-wide; Windows does not ship one for
+# older Python builds, so zoneinfo needs this pure-Python fallback there.
+# Harmless to install on any OS. If you're on Windows, run:
+#   pip install tzdata
+tzdata; sys_platform == "win32"

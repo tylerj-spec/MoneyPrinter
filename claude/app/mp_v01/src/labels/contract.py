@@ -20,14 +20,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timezone
 from enum import Enum
+
+from common.timezones import US_EASTERN as NY
 
 LABEL_CONTRACT_VERSION = "1.0.0"
 HORIZON_TRADING_DAYS = 5
 BENCHMARK = "SPY"
 DECISION_TIME_ET = time(15, 45)
-ET_UTC_OFFSET_HOURS = 4  # EDT. Real impl must use a tz database + exchange calendar.
 
 
 class LabelStatus(str, Enum):
@@ -35,6 +36,7 @@ class LabelStatus(str, Enum):
     CORPORATE_ACTION_UNRESOLVED = "CORPORATE_ACTION_UNRESOLVED"
     DELISTED_IN_HORIZON = "DELISTED_IN_HORIZON"
     INSUFFICIENT_FORWARD_BARS = "INSUFFICIENT_FORWARD_BARS"
+    RETURN_GAP_UNRESOLVED = "RETURN_GAP_UNRESOLVED"  # a None sits inside an otherwise-long-enough window
 
 
 @dataclass(frozen=True)
@@ -71,10 +73,15 @@ def log_total_return(daily_returns: list[float]) -> float:
 
 
 def decision_time_utc_for(date_str: str) -> datetime:
-    """15:45 ET on the given date, expressed in UTC."""
+    """15:45 ET on the given date, expressed in UTC.
+
+    Uses the IANA tz database (via common.timezones) rather than a fixed
+    offset, so this is correct on both sides of the March/November DST
+    transitions instead of silently off by an hour half the year.
+    """
     y, m, d = (int(x) for x in date_str.split("-"))
-    naive_et = datetime(y, m, d, DECISION_TIME_ET.hour, DECISION_TIME_ET.minute)
-    return (naive_et + timedelta(hours=ET_UTC_OFFSET_HOURS)).replace(tzinfo=timezone.utc)
+    return datetime(y, m, d, DECISION_TIME_ET.hour, DECISION_TIME_ET.minute,
+                     tzinfo=NY).astimezone(timezone.utc)
 
 
 def build_label(
@@ -123,11 +130,25 @@ def build_label(
         return Label(**base, y=None, excess_log_return=None,
                      status=LabelStatus.INSUFFICIENT_FORWARD_BARS)
 
-    inst_lr = log_total_return(inst)
+    # log_total_return() raises ValueError if a None sits inside the window
+    # (a gap day that wasn't caught by the length checks above, e.g. a
+    # NO_PRIOR_CLOSE bar in the middle of an otherwise sufficient series).
+    # Fail closed with an unresolved label instead of letting that exception
+    # escape and crash whatever is building labels in bulk.
+    try:
+        inst_lr = log_total_return(inst)
+    except ValueError:
+        return Label(**base, y=None, excess_log_return=None,
+                     status=LabelStatus.RETURN_GAP_UNRESOLVED)
+
     if instrument_id == BENCHMARK:
         excess = inst_lr          # absolute sign for the benchmark itself
     else:
-        bench_lr = log_total_return(benchmark_forward_returns[:len(inst)])
+        try:
+            bench_lr = log_total_return(benchmark_forward_returns[:len(inst)])
+        except ValueError:
+            return Label(**base, y=None, excess_log_return=None,
+                         status=LabelStatus.RETURN_GAP_UNRESOLVED)
         excess = inst_lr - bench_lr
 
     status = LabelStatus.DELISTED_IN_HORIZON if delisted_in_horizon else LabelStatus.OK

@@ -58,6 +58,32 @@ def every_bar_carries_both_timestamps():
     out = normalize_bars([{"date": "2026-03-02", "close": 100.0}], "SPY")
     assert "event_time" in out[0] and "available_time" in out[0]
 
+@test
+def nan_close_is_treated_as_missing_regardless_of_numeric_type():
+    """NaN detection must not depend on isinstance(x, float) - that misses
+    numpy.float32 and other numeric types that aren't Python float subclasses
+    but still follow IEEE self-inequality (x != x) for NaN."""
+    class FakeNumpyFloat32NaN:
+        """Mimics a NaN-like numeric scalar that ISN'T a Python float subclass."""
+        def __eq__(self, other): return False
+        def __ne__(self, other): return True
+
+    rows = [{"date": "2026-03-02", "close": 100.0},
+            {"date": "2026-03-03", "close": FakeNumpyFloat32NaN()}]
+    out = normalize_bars(rows, "SPY")
+    assert out[1]["status"] == "UNKNOWN", out[1]
+    assert out[1]["daily_total_return"] is None
+
+@test
+def decision_time_and_bar_available_time_stay_consistent_across_dst():
+    """The no-lookahead guarantee (available before next decision) must hold
+    on both sides of a DST transition, not just in the summer."""
+    from labels.contract import decision_time_utc_for
+    for d, next_d in (("2026-03-05", "2026-03-06"),   # both EST
+                      ("2026-03-09", "2026-03-10"),    # both EDT
+                      ("2026-10-30", "2026-11-02")):   # spans the Nov transition
+        assert bar_available_time(d) < decision_time_utc_for(next_d), d
+
 
 # ---------- evaluator ----------
 def _random_folds(seed=3, n_folds=6, per_fold=100):

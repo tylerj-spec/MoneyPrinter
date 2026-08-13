@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  run_all:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Deliberately not installing requirements.txt: the test suite itself
+      # is stdlib-only by design (see run_all.py). yfinance/requests are only
+      # needed for the live data-fetch path (fetch_data.py), which this
+      # workflow does not exercise - it stays offline and deterministic.
+      - name: Run the test suite
+        run: python claude/app/mp_v01/run_all.py

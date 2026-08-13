@@ -29,12 +29,13 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from common.timezones import US_EASTERN as NY
+
 TOKEN_ENV_VAR = "EODHD_API_TOKEN"
 BASE_URL = "https://eodhd.com/api"
 
 # EOD chain for date D is published after the close; treat as consumable next morning.
 CHAIN_AVAILABILITY_LAG_HOURS = 17
-ET_UTC_OFFSET_HOURS = 4
 
 
 class MissingCredential(RuntimeError):
@@ -65,9 +66,8 @@ def redact(text: str) -> str:
 
 def chain_available_time(chain_date: str) -> datetime:
     y, m, d = (int(x) for x in chain_date.split("-"))
-    close_utc = (datetime(y, m, d, 16, 0) + timedelta(hours=ET_UTC_OFFSET_HOURS)).replace(
-        tzinfo=timezone.utc)
-    return close_utc + timedelta(hours=CHAIN_AVAILABILITY_LAG_HOURS)
+    close_et = datetime(y, m, d, 16, 0, tzinfo=NY)
+    return (close_et + timedelta(hours=CHAIN_AVAILABILITY_LAG_HOURS)).astimezone(timezone.utc)
 
 
 def normalize_contract(raw: dict[str, Any], chain_date: str, underlying: str) -> dict[str, Any]:

@@ -36,26 +36,25 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from common.timezones import US_EASTERN as NY
+
 # Conservative: a session's daily bar is treated as consumable the following
 # morning, not at that session's own close. Tighten only with measured evidence
 # of actual publication latency.
 BAR_AVAILABILITY_LAG_HOURS = 17  # 16:00 ET close -> ~09:00 ET next morning
-ET_UTC_OFFSET_HOURS = 4
 
 
 def bar_available_time(bar_date: str) -> datetime:
     """When a daily bar for `bar_date` could first legitimately be consumed."""
     y, m, d = (int(x) for x in bar_date.split("-"))
-    close_et = datetime(y, m, d, 16, 0)
-    close_utc = (close_et + timedelta(hours=ET_UTC_OFFSET_HOURS)).replace(tzinfo=timezone.utc)
-    return close_utc + timedelta(hours=BAR_AVAILABILITY_LAG_HOURS)
+    close_et = datetime(y, m, d, 16, 0, tzinfo=NY)
+    return (close_et + timedelta(hours=BAR_AVAILABILITY_LAG_HOURS)).astimezone(timezone.utc)
 
 
 def bar_event_time(bar_date: str) -> datetime:
     """The close the bar describes."""
     y, m, d = (int(x) for x in bar_date.split("-"))
-    close_et = datetime(y, m, d, 16, 0)
-    return (close_et + timedelta(hours=ET_UTC_OFFSET_HOURS)).replace(tzinfo=timezone.utc)
+    return datetime(y, m, d, 16, 0, tzinfo=NY).astimezone(timezone.utc)
 
 
 def daily_total_return(close_prev: float, close: float, dividend: float = 0.0) -> float:
@@ -87,7 +86,12 @@ def normalize_bars(raw_rows: list[dict[str, Any]], ticker: str) -> list[dict[str
     for row in raw_rows:
         date = row.get("date")
         close = row.get("close")
-        if date is None or close is None or (isinstance(close, float) and close != close):
+        # `close != close` is true only for NaN-like values under IEEE 754
+        # semantics, and that self-inequality behavior is preserved by every
+        # numeric type we're likely to see here (float, numpy scalars,
+        # pandas NaN), so this catches NaN without needing an isinstance
+        # check that would miss numpy.float32 (not a Python float subclass).
+        if date is None or close is None or close != close:
             out.append({
                 "ticker": ticker, "date": date, "status": "UNKNOWN",
                 "reason": "missing date or close", "daily_total_return": None,
