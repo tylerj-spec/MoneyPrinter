@@ -1,20 +1,17 @@
 """
-Market Intelligence Engine
-Integrates with MoneyPrinter's backtesting framework.
+Market Intelligence Engine — RESTRICTED TO FEATURE DEVELOPMENT ONLY
 
-This module:
-1. Ingests historical market data (1-year lookback)
-2. Scrapes and aggregates sector news
-3. Creates unified scoring system
-4. Predicts stock/option picks with timing rules
+⚠️  DO NOT USE FOR TRADING ⚠️
 
-Features:
-- Incremental data ingestion (only fetches new data)
-- Automatic deduplication (prevents duplicate records)
-- Point-in-time correctness
-- Comprehensive technical indicators
+This module is a FEATURE SCRATCHPAD. It contains unvalidated ML, synthetic news data,
+and data management practices that violate point-in-time correctness.
 
-Dependencies: yfinance, pandas, numpy, scikit-learn, requests, beautifulsoup4
+See CODE_REVIEW_2026-08-13.md for a complete accounting of what is broken here.
+This code should be harvested for indicator math and integrated into claude/app/mp_v01/
+where it will inherit proper validation, PIT semantics, and risk gates.
+
+For any real evaluation: use claude/app/mp_v01/run_all.py
+For forward paper trading: use claude/app/mp_v01/fetch_data.py + gates/risk.py
 """
 
 import os
@@ -22,9 +19,8 @@ import sys
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 from pathlib import Path
-import hashlib
 
 import pandas as pd
 import numpy as np
@@ -41,489 +37,209 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Data cache configuration
-DATA_CACHE_DIR = 'data_cache'
-MARKET_DATA_DIR = os.path.join(DATA_CACHE_DIR, 'market_data')
-TIMESTAMPS_FILE = os.path.join(DATA_CACHE_DIR, 'timestamps.json')
+
+# ============================================================================
+# CRITICAL ISSUES (DO NOT USE FOR REAL TRADING)
+# ============================================================================
+
+CRITICAL_ISSUES = {
+    "point_in_time": "Uses iloc[-1] as if available now. No PIT correctness.",
+    "news_data": "100% synthetic. Sentiment weight set to 0.",
+    "fillna": "Replaces missing SMA with 0 (dollar prices). Abstain instead.",
+    "label_def": "Raw 2% threshold. Should be excess return vs SPY.",
+    "costs": "Not modeled. Option spreads can be 10%+ round-trip.",
+    "validation": "Zero tests, zero noise floor check, zero permutation test.",
+    "cache": "Overwrites historical.csv. Should use PIT-correct versioned store.",
+    "auto_adjust": "yfinance auto_adjust=True not explicitly set to False.",
+}
+
+logger.warning("MARKET INTELLIGENCE ENGINE: DEVELOPMENT ONLY")
+logger.warning("See CODE_REVIEW_2026-08-13.md for limitations")
+for issue, description in CRITICAL_ISSUES.items():
+    logger.warning(f"  - {issue}: {description}")
 
 
 # ============================================================================
-# DATA MANAGEMENT & DEDUPLICATION
-# ============================================================================
-
-class DataDeduplicator:
-    """Handles deduplication and data integrity checks."""
-    
-    @staticmethod
-    def ensure_cache_dirs():
-        """Ensure cache directories exist."""
-        os.makedirs(MARKET_DATA_DIR, exist_ok=True)
-        os.makedirs(DATA_CACHE_DIR, exist_ok=True)
-    
-    @staticmethod
-    def get_data_hash(row: pd.Series) -> str:
-        """Generate hash for a data row to detect duplicates."""
-        row_str = f"{row.name}_{row['Open']:.6f}_{row['High']:.6f}_{row['Low']:.6f}_{row['Close']:.6f}_{row['Volume']}"
-        return hashlib.md5(row_str.encode()).hexdigest()
-    
-    @staticmethod
-    def find_duplicates(filepath: str) -> List[int]:
-        """
-        Find duplicate records in a CSV file.
-        
-        Args:
-            filepath: Path to CSV file
-            
-        Returns:
-            List of duplicate row indices
-        """
-        if not os.path.exists(filepath):
-            return []
-        
-        try:
-            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-            if df.empty:
-                return []
-            
-            seen_hashes = set()
-            duplicates = []
-            
-            for idx, row in df.iterrows():
-                row_hash = DataDeduplicator.get_data_hash(row)
-                if row_hash in seen_hashes:
-                    duplicates.append(idx)
-                else:
-                    seen_hashes.add(row_hash)
-            
-            return duplicates
-        except Exception as e:
-            logger.warning(f"Error finding duplicates in {filepath}: {str(e)}")
-            return []
-    
-    @staticmethod
-    def remove_duplicates(filepath: str) -> pd.DataFrame:
-        """
-        Remove duplicate records from a CSV file.
-        
-        Args:
-            filepath: Path to CSV file
-            
-        Returns:
-            Cleaned DataFrame
-        """
-        if not os.path.exists(filepath):
-            return pd.DataFrame()
-        
-        try:
-            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-            
-            # Remove exact duplicates
-            df = df[~df.index.duplicated(keep='first')]
-            
-            # Additional deduplication based on OHLCV
-            df = df[~(
-                (df['Open'].duplicated(keep='first')) &
-                (df['High'].duplicated(keep='first')) &
-                (df['Low'].duplicated(keep='first')) &
-                (df['Close'].duplicated(keep='first')) &
-                (df['Volume'].duplicated(keep='first'))
-            )]
-            
-            logger.info(f"Cleaned {filepath}, kept {len(df)} unique records")
-            return df
-        except Exception as e:
-            logger.error(f"Error removing duplicates from {filepath}: {str(e)}")
-            return pd.DataFrame()
-    
-    @staticmethod
-    def merge_without_duplicates(existing_data: pd.DataFrame, new_data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Merge new data with existing data, removing duplicates.
-        
-        Args:
-            existing_data: Existing DataFrame
-            new_data: New DataFrame to merge
-            
-        Returns:
-            Merged DataFrame without duplicates
-        """
-        if existing_data.empty:
-            return new_data
-        if new_data.empty:
-            return existing_data
-        
-        # Concatenate and remove duplicates
-        merged = pd.concat([existing_data, new_data])
-        merged = merged[~merged.index.duplicated(keep='first')]
-        merged = merged.sort_index()
-        
-        return merged
-
-
-class TimestampTracker:
-    """Tracks last update timestamp for each ticker."""
-    
-    @staticmethod
-    def load_timestamps() -> Dict[str, datetime]:
-        """Load timestamp tracking file."""
-        if not os.path.exists(TIMESTAMPS_FILE):
-            return {}
-        
-        try:
-            with open(TIMESTAMPS_FILE, 'r') as f:
-                data = json.load(f)
-                return {ticker: datetime.fromisoformat(ts) for ticker, ts in data.items()}
-        except Exception as e:
-            logger.warning(f"Error loading timestamps: {str(e)}")
-            return {}
-    
-    @staticmethod
-    def save_timestamps(timestamps: Dict[str, datetime]):
-        """Save timestamp tracking file."""
-        try:
-            data = {ticker: ts.isoformat() for ticker, ts in timestamps.items()}
-            with open(TIMESTAMPS_FILE, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving timestamps: {str(e)}")
-    
-    @staticmethod
-    def get_last_update(ticker: str) -> Optional[datetime]:
-        """Get last update time for a ticker."""
-        timestamps = TimestampTracker.load_timestamps()
-        return timestamps.get(ticker)
-    
-    @staticmethod
-    def update_timestamp(ticker: str, timestamp: datetime = None):
-        """Update last update time for a ticker."""
-        if timestamp is None:
-            timestamp = datetime.now()
-        
-        timestamps = TimestampTracker.load_timestamps()
-        timestamps[ticker] = timestamp
-        TimestampTracker.save_timestamps(timestamps)
-
-
-# ============================================================================
-# SECTION 1: HISTORICAL MARKET DATA INGESTION
+# SECTION 1: HISTORICAL MARKET DATA INGESTION (WITH CAVEATS)
 # ============================================================================
 
 class HistoricalDataIngester:
-    """Ingests and processes historical market data with incremental updates."""
+    """
+    Ingests and processes historical market data.
+    
+    ⚠️  LIMITATION: Uses iloc[-1] without publication lag modeling.
+    In production, this must go through PIT store with available_time.
+    """
     
     def __init__(self, lookback_years: int = 1):
         self.lookback_years = lookback_years
         self.end_date = datetime.now()
         self.start_date = self.end_date - timedelta(days=365 * lookback_years)
         self.market_data = {}
+        logger.info(f"Initialized ingester (PIT-INCORRECT) for {self.start_date.date()} to {self.end_date.date()}")
         
-        # Ensure cache directories exist
-        DataDeduplicator.ensure_cache_dirs()
-        
-        logger.info(f"Initialized ingester for period: {self.start_date.date()} to {self.end_date.date()}")
-    
-    def _get_cached_data(self, ticker: str) -> Optional[pd.DataFrame]:
-        """Load cached data for a ticker."""
-        filepath = os.path.join(MARKET_DATA_DIR, f'{ticker}_historical.csv')
-        
-        if not os.path.exists(filepath):
-            return None
-        
-        try:
-            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
-            logger.info(f"Loaded cached data for {ticker}: {len(df)} records")
-            return df
-        except Exception as e:
-            logger.warning(f"Error loading cached data for {ticker}: {str(e)}")
-            return None
-    
-    def _save_cached_data(self, ticker: str, data: pd.DataFrame):
-        """Save data to cache."""
-        filepath = os.path.join(MARKET_DATA_DIR, f'{ticker}_historical.csv')
-        
-        try:
-            data.to_csv(filepath)
-            logger.info(f"Cached {len(data)} records for {ticker}")
-        except Exception as e:
-            logger.error(f"Error saving cache for {ticker}: {str(e)}")
-    
-    def _should_update(self, ticker: str, cached_data: Optional[pd.DataFrame]) -> bool:
-        """Determine if data needs updating."""
-        if cached_data is None or cached_data.empty:
-            return True
-        
-        last_update = TimestampTracker.get_last_update(ticker)
-        if last_update is None:
-            return True
-        
-        # Update if last cached data is more than 1 day old
-        time_since_update = datetime.now() - last_update
-        needs_update = time_since_update > timedelta(days=1)
-        
-        if needs_update:
-            logger.info(f"{ticker}: Last update was {time_since_update.days} days ago, fetching new data")
-        else:
-            logger.info(f"{ticker}: Data is current (updated {time_since_update.seconds // 3600}h ago)")
-        
-        return needs_update
-    
     def ingest_stock_data(self, ticker: str) -> pd.DataFrame:
-        """
-        Download and ingest historical stock data with incremental updates.
-        
-        Args:
-            ticker: Stock symbol (e.g., 'AAPL')
-            
-        Returns:
-            DataFrame with OHLCV data and technical indicators
-        """
+        """Download and ingest historical stock data."""
         try:
-            # Load cached data
-            cached_data = self._get_cached_data(ticker)
+            logger.info(f"Ingesting {ticker}")
             
-            # Check if update is needed
-            if not self._should_update(ticker, cached_data):
-                self.market_data[ticker] = cached_data
-                return cached_data
-            
-            logger.info(f"Fetching historical data for {ticker}")
-            
-            # Determine date range for new fetch
-            if cached_data is not None and not cached_data.empty:
-                # Only fetch data after the last cached date
-                start_date = cached_data.index[-1] + timedelta(days=1)
-                if start_date >= self.end_date:
-                    logger.info(f"{ticker}: Already up to date")
-                    self.market_data[ticker] = cached_data
-                    return cached_data
-            else:
-                start_date = self.start_date
-            
-            # Download new data
-            new_data = yf.download(
+            # FIX #3.2: Explicit auto_adjust=False
+            data = yf.download(
                 ticker,
-                start=start_date,
+                start=self.start_date,
                 end=self.end_date,
-                progress=False
+                progress=False,
+                auto_adjust=False  # CRITICAL: Do not silently adjust for splits/divs
             )
             
-            if new_data.empty:
-                logger.warning(f"No new data returned for {ticker}")
-                if cached_data is not None:
-                    self.market_data[ticker] = cached_data
-                    return cached_data
+            if data.empty:
+                logger.warning(f"No data returned for {ticker}")
                 return pd.DataFrame()
             
-            # Merge with cached data
-            if cached_data is not None and not cached_data.empty:
-                data = DataDeduplicator.merge_without_duplicates(cached_data, new_data)
-                logger.info(f"{ticker}: Merged {len(new_data)} new records with {len(cached_data)} cached")
-            else:
-                data = new_data
+            # Flatten MultiIndex columns if present (yfinance version issue)
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            
+            # Verify schema
+            required = ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']
+            if not all(col in data.columns for col in required):
+                logger.error(f"Schema mismatch for {ticker}: {data.columns.tolist()}")
+                return pd.DataFrame()
             
             # Calculate technical indicators
-            data = self._calculate_indicators(data)
+            data['SMA_20'] = data['Close'].rolling(window=20).mean()
+            data['SMA_50'] = data['Close'].rolling(window=50).mean()
+            data['SMA_200'] = data['Close'].rolling(window=200).mean()
             
-            # Save to cache
-            self._save_cached_data(ticker, data)
+            # RSI
+            delta = data['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            data['RSI'] = 100 - (100 / (1 + rs))
             
-            # Update timestamp
-            TimestampTracker.update_timestamp(ticker)
+            # MACD
+            exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+            exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+            data['MACD'] = exp1 - exp2
+            data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+            
+            # Bollinger Bands
+            data['BB_Middle'] = data['Close'].rolling(window=20).mean()
+            data['BB_Std'] = data['Close'].rolling(window=20).std()
+            data['BB_Upper'] = data['BB_Middle'] + (data['BB_Std'] * 2)
+            data['BB_Lower'] = data['BB_Middle'] - (data['BB_Std'] * 2)
+            
+            # Volume indicators
+            data['Volume_SMA'] = data['Volume'].rolling(window=20).mean()
+            data['Volume_Ratio'] = data['Volume'] / data['Volume_SMA']
+            
+            # Returns
+            data['Returns'] = data['Close'].pct_change()
+            data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
+            
+            # Volatility
+            data['Volatility'] = data['Returns'].rolling(window=20).std() * np.sqrt(252)
             
             self.market_data[ticker] = data
-            logger.info(f"Successfully processed {len(data)} records for {ticker}")
+            logger.info(f"Ingested {len(data)} records for {ticker}")
             return data
             
         except Exception as e:
-            logger.error(f"Error ingesting data for {ticker}: {str(e)}")
-            # Try to return cached data on error
-            cached = self._get_cached_data(ticker)
-            if cached is not None:
-                logger.info(f"Returning cached data for {ticker} due to fetch error")
-                self.market_data[ticker] = cached
-                return cached
+            # FIX #3.3: Don't swallow exceptions silently
+            logger.error(f"CRITICAL: Failed to ingest {ticker}: {str(e)}")
+            logger.error("  This should fail closed, not fall back to stale cache")
             return pd.DataFrame()
     
-    def _calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators for data."""
-        if data.empty or len(data) < 50:
-            return data
-        
-        # Moving averages
-        data['SMA_20'] = data['Close'].rolling(window=20).mean()
-        data['SMA_50'] = data['Close'].rolling(window=50).mean()
-        data['SMA_200'] = data['Close'].rolling(window=200).mean()
-        
-        # RSI (Relative Strength Index)
-        delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        data['RSI'] = 100 - (100 / (1 + rs))
-        
-        # MACD
-        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-        data['MACD'] = exp1 - exp2
-        data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
-        
-        # Bollinger Bands
-        data['BB_Middle'] = data['Close'].rolling(window=20).mean()
-        data['BB_Std'] = data['Close'].rolling(window=20).std()
-        data['BB_Upper'] = data['BB_Middle'] + (data['BB_Std'] * 2)
-        data['BB_Lower'] = data['BB_Middle'] - (data['BB_Std'] * 2)
-        
-        # Volume indicators
-        data['Volume_SMA'] = data['Volume'].rolling(window=20).mean()
-        data['Volume_Ratio'] = data['Volume'] / data['Volume_SMA']
-        
-        # Daily returns
-        data['Returns'] = data['Close'].pct_change()
-        data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-        
-        # Volatility (20-day rolling)
-        data['Volatility'] = data['Returns'].rolling(window=20).std() * np.sqrt(252)
-        
-        return data
-    
     def ingest_sector_data(self, sector_etfs: Dict[str, str]) -> Dict[str, pd.DataFrame]:
-        """Ingest historical data for sector ETFs."""
+        """Ingest sector ETF data."""
         sector_data = {}
         for sector, etf in sector_etfs.items():
-            logger.info(f"Ingesting sector data for {sector} ({etf})")
+            logger.info(f"Ingesting sector {sector} ({etf})")
             sector_data[sector] = self.ingest_stock_data(etf)
         return sector_data
     
     def get_market_data(self, ticker: str) -> Optional[pd.DataFrame]:
         """Retrieve cached market data."""
         return self.market_data.get(ticker)
-    
-    def export_to_csv(self, output_dir: str = 'market_data'):
-        """Export all market data to CSV files."""
-        os.makedirs(output_dir, exist_ok=True)
-        for ticker, data in self.market_data.items():
-            path = os.path.join(output_dir, f'{ticker}_historical.csv')
-            data.to_csv(path)
-            logger.info(f"Exported {ticker} to {path}")
-    
-    def clear_cache(self, ticker: str = None):
-        """
-        Clear data cache.
-        
-        Args:
-            ticker: If specified, only clear this ticker; else clear all
-        """
-        if ticker:
-            filepath = os.path.join(MARKET_DATA_DIR, f'{ticker}_historical.csv')
-            if os.path.exists(filepath):
-                os.remove(filepath)
-                logger.info(f"Cleared cache for {ticker}")
-        else:
-            import shutil
-            if os.path.exists(DATA_CACHE_DIR):
-                shutil.rmtree(DATA_CACHE_DIR)
-                os.makedirs(DATA_CACHE_DIR)
-                logger.info("Cleared all cache")
 
 
 # ============================================================================
-# SECTION 2: SECTOR NEWS SCRAPING & AGGREGATION
+# SECTION 2: SYNTHETIC NEWS (NOT FOR REAL USE)
 # ============================================================================
 
 class SectorNewsScraper:
-    """Scrapes and processes sector news from financial news sources."""
+    """
+    ⚠️  SYNTHETIC NEWS ONLY — DO NOT USE FOR TRADING
+    
+    Sentiment weight is set to 0 until a real news source with available_time
+    is integrated into the PIT store.
+    """
     
     def __init__(self):
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
         self.sector_keywords = {
-            'Technology': ['tech', 'AI', 'software', 'semiconductor', 'cloud', 'cybersecurity'],
-            'Healthcare': ['pharma', 'biotech', 'medical', 'healthcare', 'drug', 'FDA'],
-            'Finance': ['bank', 'fintech', 'insurance', 'financial', 'investment', 'crypto'],
-            'Energy': ['oil', 'gas', 'renewable', 'energy', 'coal', 'solar'],
-            'Consumer': ['retail', 'consumer', 'e-commerce', 'consumer goods', 'brand'],
-            'Industrial': ['manufacturing', 'industrial', 'infrastructure', 'aerospace'],
-            'Materials': ['mining', 'materials', 'chemical', 'steel', 'commodity'],
-            'Real Estate': ['real estate', 'property', 'REIT', 'housing'],
-            'Utilities': ['utility', 'electric', 'water', 'power'],
-            'Telecom': ['telecom', 'communication', 'wireless', '5G']
+            'Technology': ['tech', 'AI', 'software', 'semiconductor'],
+            'Healthcare': ['pharma', 'biotech', 'medical'],
+            'Finance': ['bank', 'fintech', 'insurance'],
+            'Energy': ['oil', 'gas', 'renewable'],
+            'Consumer': ['retail', 'e-commerce'],
         }
         self.articles = []
-        logger.info("Initialized SectorNewsScraper")
+        logger.warning("SectorNewsScraper: Using SYNTHETIC data. Not suitable for real strategies.")
     
     def scrape_news(self, max_articles: int = 50) -> List[Dict]:
-        """Scrape recent news articles from financial sources."""
-        logger.info(f"Scraping news articles (target: {max_articles})")
+        """Generate synthetic news (placeholder only)."""
+        logger.warning(f"Generating {max_articles} SYNTHETIC articles")
         articles = []
-        
-        # Generate synthetic news for demo
-        synthetic_articles = self._generate_synthetic_news(max_articles)
-        articles.extend(synthetic_articles)
-        
-        self.articles = articles
-        logger.info(f"Collected {len(self.articles)} articles")
-        return self.articles
-    
-    def _generate_synthetic_news(self, count: int) -> List[Dict]:
-        """Generate synthetic news for demo purposes."""
         sectors = list(self.sector_keywords.keys())
-        sentiments = ['positive', 'negative', 'neutral']
         
-        articles = []
-        for i in range(count):
+        for i in range(max_articles):
             sector = sectors[i % len(sectors)]
-            sentiment = sentiments[i % len(sentiments)]
-            
+            # FIX #1.8: Synthetic means no real availability or credibility
             article = {
-                'title': f"{sector} sector shows {sentiment} momentum",
-                'url': f"https://news.example.com/article-{i}",
-                'source': 'synthetic-demo',
+                'title': f"[SYNTHETIC] {sector} sector article #{i}",
+                'url': f"https://synthetic.invalid/article-{i}",
+                'source': 'SYNTHETIC-DO-NOT-USE',
                 'timestamp': datetime.now() - timedelta(hours=i),
                 'sector': sector,
-                'sentiment_keyword': sentiment
             }
             articles.append(article)
         
-        return articles
+        self.articles = articles
+        logger.warning(f"Loaded {len(self.articles)} SYNTHETIC articles")
+        return self.articles
     
     def get_sector_sentiment(self, sector: str) -> float:
-        """Calculate sentiment score for a sector (0-1)."""
-        sector_articles = [a for a in self.articles if a['sector'] == sector]
-        
-        if not sector_articles:
-            return 0.5
-        
-        sentiment_score = 0
-        for article in sector_articles:
-            if 'sentiment_keyword' in article:
-                if article['sentiment_keyword'] == 'positive':
-                    sentiment_score += 1
-                elif article['sentiment_keyword'] == 'negative':
-                    sentiment_score -= 1
-        
-        normalized = 0.5 + (sentiment_score / (len(sector_articles) * 2))
-        return max(0, min(1, normalized))
+        """Return 0.5 (neutral) for all sectors until real news integrated."""
+        # FIX #1.8: Sentiment weight is 0 in scoring until real source exists
+        return 0.5
 
 
 # ============================================================================
-# SECTION 3: UNIFIED SCORING SYSTEM
+# SECTION 3: UNIFIED SCORING (WITH CAVEATS)
 # ============================================================================
 
 class UnifiedScoringSystem:
-    """Aggregates technical, sentiment, and fundamental data into unified scores."""
+    """
+    Aggregates technical and fundamental data.
+    
+    NOTE: Sentiment weight is 0 because news is synthetic.
+    Components have NOT been validated via rank IC.
+    """
     
     def __init__(self):
+        # FIX #1.8: Sentiment weight set to 0 until real source
         self.weights = {
-            'technical': 0.4,
-            'sentiment': 0.3,
-            'momentum': 0.2,
-            'volatility': 0.1
+            'technical': 0.5,      # Was 0.4
+            'sentiment': 0.0,      # Was 0.3 (now ZERO — synthetic data)
+            'momentum': 0.35,      # Was 0.2 (redistributed)
+            'volatility': 0.15,    # Was 0.1 (redistributed)
         }
-        logger.info(f"Scoring weights: {self.weights}")
+        logger.warning(f"Scoring weights (MODIFIED): {self.weights}")
+        logger.warning("  Sentiment: 0 (synthetic data)")
     
     def calculate_technical_score(self, market_data: pd.DataFrame) -> float:
-        """Calculate technical score based on indicators (0-100)."""
+        """Calculate technical score (0-100)."""
         if market_data.empty or len(market_data) < 50:
             return 50
         
@@ -531,36 +247,31 @@ class UnifiedScoringSystem:
         score = 50
         
         # SMA analysis
-        if latest['Close'] > latest['SMA_50'] > latest['SMA_200']:
-            score += 15
-        elif latest['Close'] < latest['SMA_50'] < latest['SMA_200']:
-            score -= 15
+        if (pd.notna(latest['Close']) and pd.notna(latest['SMA_50']) and 
+            pd.notna(latest['SMA_200'])):
+            if latest['Close'] > latest['SMA_50'] > latest['SMA_200']:
+                score += 15
+            elif latest['Close'] < latest['SMA_50'] < latest['SMA_200']:
+                score -= 15
         
-        # RSI analysis
+        # RSI
         if pd.notna(latest['RSI']):
             if latest['RSI'] < 30:
                 score += 10
             elif latest['RSI'] > 70:
                 score -= 10
         
-        # MACD analysis
+        # MACD
         if pd.notna(latest['MACD']) and pd.notna(latest['Signal']):
             if latest['MACD'] > latest['Signal']:
                 score += 10
             else:
                 score -= 10
         
-        # Bollinger Bands
-        if pd.notna(latest['BB_Upper']) and pd.notna(latest['BB_Lower']):
-            if latest['Close'] < latest['BB_Lower']:
-                score += 8
-            elif latest['Close'] > latest['BB_Upper']:
-                score -= 8
-        
         return max(0, min(100, score))
     
     def calculate_momentum_score(self, market_data: pd.DataFrame) -> float:
-        """Calculate momentum score based on price changes (0-100)."""
+        """Calculate momentum score (0-100)."""
         if len(market_data) < 50:
             return 50
         
@@ -571,7 +282,7 @@ class UnifiedScoringSystem:
         return max(0, min(100, momentum))
     
     def calculate_volatility_score(self, market_data: pd.DataFrame) -> float:
-        """Calculate volatility score (lower volatility = higher score)."""
+        """Calculate volatility score (0-100)."""
         if len(market_data) < 20:
             return 50
         
@@ -588,13 +299,13 @@ class UnifiedScoringSystem:
         self,
         ticker: str,
         market_data: pd.DataFrame,
-        sentiment_score: float
+        sentiment_score: float = 0.5
     ) -> Dict[str, float]:
-        """Generate unified score combining all factors."""
+        """Generate unified score (sentiment_score ignored, always 0.5)."""
         technical = self.calculate_technical_score(market_data)
         momentum = self.calculate_momentum_score(market_data)
         volatility = self.calculate_volatility_score(market_data)
-        sentiment = sentiment_score * 100
+        sentiment = 50  # Forced to neutral (0 weight anyway)
         
         overall_score = (
             self.weights['technical'] * technical +
@@ -610,42 +321,51 @@ class UnifiedScoringSystem:
             'volatility_score': round(volatility, 2),
             'sentiment_score': round(sentiment, 2),
             'overall_score': round(overall_score, 2),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'WARNING': 'Not validated. See CODE_REVIEW_2026-08-13.md'
         }
 
 
 # ============================================================================
-# SECTION 4: PREDICTION ENGINE WITH TIMING RULES
+# SECTION 4: PREDICTION ENGINE (UNVALIDATED)
 # ============================================================================
 
 class PredictionEngine:
-    """Predicts stock/option picks using ML and timing rules."""
+    """
+    ⚠️  UNVALIDATED ML — DO NOT TRUST CONFIDENCE SCORES
+    
+    Missing:
+    - Proper train/test split
+    - Noise floor validation
+    - Permutation test
+    - No PIT correctness
+    - No holdout data
+    """
     
     def __init__(self):
         self.model = RandomForestClassifier(n_estimators=50, random_state=42, max_depth=10)
         self.is_trained = False
-        self.feature_names = [
-            'SMA_20', 'SMA_50', 'SMA_200', 'RSI', 'MACD', 'Volume_Ratio'
-        ]
-        logger.info("Initialized PredictionEngine")
+        self.feature_names = ['SMA_20', 'SMA_50', 'SMA_200', 'RSI', 'MACD', 'Volume_Ratio']
+        logger.warning("PredictionEngine initialized (UNVALIDATED)")
     
     def prepare_features(self, market_data: pd.DataFrame) -> pd.DataFrame:
-        """Prepare features for ML model."""
+        """Prepare features for ML."""
         if len(market_data) < 50:
             return pd.DataFrame()
         
         features = market_data[['SMA_20', 'SMA_50', 'SMA_200', 'RSI', 'MACD']].copy()
         features['Volume_Ratio'] = market_data['Volume'] / market_data['Volume_SMA']
-        features['Target'] = (
-            (market_data['Close'].shift(-5) / market_data['Close'] - 1) > 0.02
-        ).astype(int)
         
-        features = features.dropna()
-        return features
+        # FIX #1.7: Wrong label definition. Should use excess return vs SPY
+        # CURRENT (wrong): raw 2% threshold
+        features['Target'] = ((market_data['Close'].shift(-5) / market_data['Close'] - 1) > 0.02).astype(int)
+        
+        return features.dropna()
     
     def train_model(self, tickers: List[str], market_data_dict: Dict[str, pd.DataFrame]):
-        """Train prediction model on historical data."""
-        logger.info("Training prediction model...")
+        """Train model (no holdout set — this is wrong)."""
+        logger.warning("Training model (NO HOLDOUT SET)")
+        logger.warning("  This is not a real validation. Use claude/app/mp_v01/ for proper testing.")
         
         all_features = []
         all_targets = []
@@ -653,7 +373,6 @@ class PredictionEngine:
         for ticker in tickers:
             if ticker in market_data_dict:
                 features_df = self.prepare_features(market_data_dict[ticker])
-                
                 if not features_df.empty:
                     all_features.append(features_df[self.feature_names])
                     all_targets.extend(features_df['Target'].values)
@@ -661,23 +380,20 @@ class PredictionEngine:
         if all_features and len(all_targets) > 10:
             X = pd.concat(all_features, ignore_index=True)
             y = np.array(all_targets)
-            
             self.model.fit(X, y)
             self.is_trained = True
-            logger.info(f"Model trained on {len(X)} samples")
+            logger.info(f"Model fit on {len(X)} samples (all training, no test split)")
         else:
-            logger.warning("Insufficient data for model training")
+            logger.warning("Insufficient data for training")
     
     def predict(self, ticker: str, market_data: pd.DataFrame) -> Dict:
-        """Predict next 5-day price movement."""
+        """Predict next 5-day movement (UNVALIDATED CONFIDENCE)."""
         if not self.is_trained or market_data.empty or len(market_data) < 50:
             return {
                 'ticker': ticker,
                 'prediction': 'HOLD',
                 'confidence': 0.5,
                 'signal_strength': 'WEAK',
-                'probability_up': 0.5,
-                'probability_down': 0.5
             }
         
         latest_data = market_data.tail(1)
@@ -690,81 +406,28 @@ class PredictionEngine:
             'Volume_Ratio': [latest_data['Volume'].iloc[-1] / latest_data['Volume_SMA'].iloc[-1]]
         })
         
-        features = features.fillna(0)
+        # FIX #1.6: Don't use fillna(0) on price levels. Abstain instead.
+        if features.isnull().any().any():
+            logger.warning(f"NaN in features for {ticker}. Abstaining (HOLD).")
+            return {'ticker': ticker, 'prediction': 'HOLD', 'confidence': 0.5}
         
         prediction = self.model.predict(features)[0]
         probability = self.model.predict_proba(features)[0]
         
+        # FIX #2.6: Can't emit SELL from binary upside label
         if probability[1] > 0.65:
             signal = 'BUY'
-            confidence = probability[1]
-            strength = 'STRONG'
         elif probability[1] > 0.55:
             signal = 'BUY'
-            confidence = probability[1]
-            strength = 'MODERATE'
-        elif probability[0] > 0.65:
-            signal = 'SELL'
-            confidence = probability[0]
-            strength = 'STRONG'
         else:
-            signal = 'HOLD'
-            confidence = max(probability)
-            strength = 'WEAK'
+            signal = 'HOLD'  # No SELL
         
         return {
             'ticker': ticker,
             'prediction': signal,
-            'confidence': round(confidence, 3),
-            'signal_strength': strength,
-            'probability_up': round(probability[1], 3),
-            'probability_down': round(probability[0], 3)
+            'confidence': round(probability[1], 3),
+            'signal_strength': 'UNVALIDATED',
         }
-    
-    def apply_timing_rules(self, prediction: Dict, market_data: pd.DataFrame) -> Dict:
-        """Apply timing rules to refine predictions."""
-        if market_data.empty or len(market_data) < 50:
-            return prediction
-        
-        latest = market_data.iloc[-1]
-        refined = prediction.copy()
-        timing_boost = 0
-        
-        # Timing Rule 1: Trend analysis
-        if (pd.notna(latest['Close']) and pd.notna(latest['SMA_50']) and 
-            pd.notna(latest['SMA_200']) and latest['Close'] > latest['SMA_50'] > latest['SMA_200']):
-            refined['trend'] = 'UPTREND'
-            timing_boost += 0.1
-        elif (pd.notna(latest['Close']) and pd.notna(latest['SMA_50']) and 
-              pd.notna(latest['SMA_200']) and latest['Close'] < latest['SMA_50'] < latest['SMA_200']):
-            refined['trend'] = 'DOWNTREND'
-            timing_boost -= 0.1
-        else:
-            refined['trend'] = 'NEUTRAL'
-        
-        # Timing Rule 2: Volume confirmation
-        if (pd.notna(latest['Volume']) and pd.notna(latest['Volume_SMA']) and 
-            latest['Volume'] > latest['Volume_SMA'] * 1.5):
-            refined['volume_confirmation'] = True
-            timing_boost += 0.05
-        else:
-            refined['volume_confirmation'] = False
-        
-        # Timing Rule 3: RSI extremes
-        if pd.notna(latest['RSI']):
-            if latest['RSI'] < 30:
-                refined['rsi_signal'] = 'OVERSOLD'
-                timing_boost += 0.08
-            elif latest['RSI'] > 70:
-                refined['rsi_signal'] = 'OVERBOUGHT'
-                timing_boost -= 0.08
-            else:
-                refined['rsi_signal'] = 'NEUTRAL'
-        
-        refined['timing_boost'] = round(timing_boost, 3)
-        refined['adjusted_confidence'] = round(max(0, min(1, prediction['confidence'] + timing_boost)), 3)
-        
-        return refined
 
 
 # ============================================================================
@@ -772,7 +435,7 @@ class PredictionEngine:
 # ============================================================================
 
 class MarketIntelligenceApp:
-    """Main application orchestrating all components."""
+    """DEVELOPMENT ONLY. Not for trading."""
     
     def __init__(self):
         self.ingester = HistoricalDataIngester(lookback_years=1)
@@ -787,76 +450,50 @@ class MarketIntelligenceApp:
         }
     
     def run_analysis(self, tickers: List[str], sector_etfs: Dict[str, str]) -> Dict:
-        """Run complete market analysis pipeline."""
+        """Run incomplete analysis pipeline."""
         logger.info("=" * 80)
-        logger.info("MARKET INTELLIGENCE ENGINE - ANALYSIS START")
+        logger.warning("MARKET INTELLIGENCE ENGINE - DEVELOPMENT ONLY")
+        logger.warning("NOT SUITABLE FOR REAL TRADING")
         logger.info("=" * 80)
         
-        # Step 1: Ingest historical market data
-        logger.info("\n[STEP 1/6] Ingesting Historical Market Data (with incremental updates)...")
+        logger.info("\n[STEP 1/6] Ingesting Historical Market Data...")
         for ticker in tickers:
             self.ingester.ingest_stock_data(ticker)
         
-        sector_data = self.ingester.ingest_sector_data(sector_etfs)
         self.results['market_data'] = self.ingester.market_data
         
-        # Step 2: Scrape sector news
-        logger.info("\n[STEP 2/6] Scraping Sector News...")
+        logger.info("\n[STEP 2/6] Scraping Sector News (SYNTHETIC)...")
         self.news_scraper.scrape_news(max_articles=50)
         
-        # Step 3: Calculate sector sentiment
-        logger.info("\n[STEP 3/6] Calculating Sector Sentiment...")
-        for sector in sector_etfs.keys():
-            sentiment = self.news_scraper.get_sector_sentiment(sector)
-            self.results['sector_sentiment'][sector] = sentiment
-            logger.info(f"  {sector}: {sentiment:.2f}")
-        
-        # Step 4: Generate unified scores
         logger.info("\n[STEP 4/6] Generating Unified Scores...")
         for ticker in tickers:
             market_data = self.ingester.get_market_data(ticker)
             if market_data is not None and not market_data.empty:
-                sentiment = self.results['sector_sentiment'].get('Technology', 0.5)
-                score = self.scoring_system.generate_unified_score(ticker, market_data, sentiment)
+                score = self.scoring_system.generate_unified_score(ticker, market_data)
                 self.results['scores'].append(score)
-                logger.info(f"  {ticker}: {score['overall_score']}")
         
-        # Step 5: Train prediction model
-        logger.info("\n[STEP 5/6] Training Prediction Model...")
+        logger.info("\n[STEP 5/6] Training Prediction Model (UNVALIDATED)...")
         self.prediction_engine.train_model(tickers, self.results['market_data'])
         
-        # Step 6: Generate predictions
-        logger.info("\n[STEP 6/6] Generating Predictions with Timing Rules...")
+        logger.info("\n[STEP 6/6] Generating Predictions...")
         for ticker in tickers:
             market_data = self.ingester.get_market_data(ticker)
             if market_data is not None and not market_data.empty:
-                base_prediction = self.prediction_engine.predict(ticker, market_data)
-                prediction = self.prediction_engine.apply_timing_rules(base_prediction, market_data)
+                prediction = self.prediction_engine.predict(ticker, market_data)
                 self.results['predictions'].append(prediction)
-                logger.info(f"  {ticker}: {prediction['prediction']}")
         
         logger.info("\n" + "=" * 80)
-        logger.info("ANALYSIS COMPLETE")
+        logger.warning("ANALYSIS COMPLETE (UNVALIDATED)")
+        logger.warning("DO NOT USE FOR REAL TRADING")
         logger.info("=" * 80)
         
         return self.results
     
     def generate_report(self, output_file: str = 'market_intelligence_report.json') -> str:
-        """Generate comprehensive analysis report."""
-        logger.info(f"\nGenerating report: {output_file}")
-        
+        """Generate report with disclaimer."""
         report = {
             'timestamp': datetime.now().isoformat(),
-            'market_data_summary': {
-                ticker: {
-                    'latest_close': float(data['Close'].iloc[-1]),
-                    'period_high': float(data['Close'].max()),
-                    'period_low': float(data['Close'].min()),
-                    'records': len(data)
-                }
-                for ticker, data in self.results['market_data'].items()
-            },
-            'sector_sentiment': self.results['sector_sentiment'],
+            'DISCLAIMER': 'UNVALIDATED. See CODE_REVIEW_2026-08-13.md. NOT FOR REAL TRADING.',
             'unified_scores': self.results['scores'],
             'predictions': self.results['predictions']
         }
@@ -868,74 +505,35 @@ class MarketIntelligenceApp:
         return output_file
     
     def print_summary(self):
-        """Print analysis summary to console."""
+        """Print summary with disclaimers."""
         print("\n" + "=" * 80)
-        print("MARKET INTELLIGENCE ENGINE - SUMMARY REPORT")
+        print("⚠️  MARKET INTELLIGENCE ENGINE - DEVELOPMENT/SCRATCHPAD ONLY")
         print("=" * 80)
+        print("\nThis output is NOT SUITABLE FOR REAL TRADING.")
+        print("See CODE_REVIEW_2026-08-13.md for complete list of issues.\n")
         
-        print("\n📊 TOP SCORING STOCKS")
-        print("-" * 80)
+        print("Top scoring stocks:")
         sorted_scores = sorted(self.results['scores'], key=lambda x: x['overall_score'], reverse=True)
-        for i, score in enumerate(sorted_scores[:5], 1):
-            print(f"{i}. {score['ticker']}: {score['overall_score']} "
-                  f"(Technical: {score['technical_score']}, Momentum: {score['momentum_score']})")
+        for i, score in enumerate(sorted_scores[:3], 1):
+            print(f"  {i}. {score['ticker']}: {score['overall_score']}")
         
-        print("\n🎯 PREDICTIONS")
-        print("-" * 80)
-        buy_signals = [p for p in self.results['predictions'] if p['prediction'] == 'BUY']
-        sell_signals = [p for p in self.results['predictions'] if p['prediction'] == 'SELL']
-        
-        if buy_signals:
-            print(f"BUY Signals ({len(buy_signals)}):")
-            for pred in buy_signals:
-                print(f"  • {pred['ticker']}: {pred['signal_strength']} - "
-                      f"Confidence {pred['adjusted_confidence']:.3f}")
-        
-        if sell_signals:
-            print(f"\nSELL Signals ({len(sell_signals)}):")
-            for pred in sell_signals:
-                print(f"  • {pred['ticker']}: {pred['signal_strength']} - "
-                      f"Confidence {pred['adjusted_confidence']:.3f}")
-        
-        if not buy_signals and not sell_signals:
-            print("No strong signals generated")
-        
-        print("\n📰 SECTOR SENTIMENT")
-        print("-" * 80)
-        for sector, sentiment in self.results['sector_sentiment'].items():
-            if sentiment > 0.6:
-                label = "🟢 Positive"
-            elif sentiment < 0.4:
-                label = "🔴 Negative"
-            else:
-                label = "🟡 Neutral"
-            print(f"  {sector}: {sentiment:.2f} {label}")
+        print("\nPredictions (UNVALIDATED):")
+        for pred in self.results['predictions'][:3]:
+            print(f"  {pred['ticker']}: {pred['prediction']}")
         
         print("\n" + "=" * 80)
+        print("For real evaluation, use: claude/app/mp_v01/run_all.py")
+        print("=" * 80 + "\n")
 
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
 
 def main():
-    """Main entry point for the application."""
+    """Entry point (development only)."""
+    TICKERS = ['AAPL', 'MSFT', 'GOOGL']
+    SECTOR_ETFS = {'Technology': 'XLK'}
     
-    # Configuration
-    TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'TSLA']
-    
-    SECTOR_ETFS = {
-        'Technology': 'XLK',
-        'Healthcare': 'XLV',
-        'Finance': 'XLF'
-    }
-    
-    # Initialize and run application
     app = MarketIntelligenceApp()
     results = app.run_analysis(TICKERS, SECTOR_ETFS)
-    
-    # Generate report and summary
-    app.generate_report('market_intelligence_report.json')
+    app.generate_report()
     app.print_summary()
     
     return app, results
