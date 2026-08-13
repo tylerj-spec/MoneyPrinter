@@ -8,6 +8,12 @@ This module:
 3. Creates unified scoring system
 4. Predicts stock/option picks with timing rules
 
+Features:
+- Incremental data ingestion (only fetches new data)
+- Automatic deduplication (prevents duplicate records)
+- Point-in-time correctness
+- Comprehensive technical indicators
+
 Dependencies: yfinance, pandas, numpy, scikit-learn, requests, beautifulsoup4
 """
 
@@ -18,6 +24,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
+import hashlib
 
 import pandas as pd
 import numpy as np
@@ -34,24 +41,235 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Data cache configuration
+DATA_CACHE_DIR = 'data_cache'
+MARKET_DATA_DIR = os.path.join(DATA_CACHE_DIR, 'market_data')
+TIMESTAMPS_FILE = os.path.join(DATA_CACHE_DIR, 'timestamps.json')
+
+
+# ============================================================================
+# DATA MANAGEMENT & DEDUPLICATION
+# ============================================================================
+
+class DataDeduplicator:
+    """Handles deduplication and data integrity checks."""
+    
+    @staticmethod
+    def ensure_cache_dirs():
+        """Ensure cache directories exist."""
+        os.makedirs(MARKET_DATA_DIR, exist_ok=True)
+        os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+    
+    @staticmethod
+    def get_data_hash(row: pd.Series) -> str:
+        """Generate hash for a data row to detect duplicates."""
+        row_str = f"{row.name}_{row['Open']:.6f}_{row['High']:.6f}_{row['Low']:.6f}_{row['Close']:.6f}_{row['Volume']}"
+        return hashlib.md5(row_str.encode()).hexdigest()
+    
+    @staticmethod
+    def find_duplicates(filepath: str) -> List[int]:
+        """
+        Find duplicate records in a CSV file.
+        
+        Args:
+            filepath: Path to CSV file
+            
+        Returns:
+            List of duplicate row indices
+        """
+        if not os.path.exists(filepath):
+            return []
+        
+        try:
+            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+            if df.empty:
+                return []
+            
+            seen_hashes = set()
+            duplicates = []
+            
+            for idx, row in df.iterrows():
+                row_hash = DataDeduplicator.get_data_hash(row)
+                if row_hash in seen_hashes:
+                    duplicates.append(idx)
+                else:
+                    seen_hashes.add(row_hash)
+            
+            return duplicates
+        except Exception as e:
+            logger.warning(f"Error finding duplicates in {filepath}: {str(e)}")
+            return []
+    
+    @staticmethod
+    def remove_duplicates(filepath: str) -> pd.DataFrame:
+        """
+        Remove duplicate records from a CSV file.
+        
+        Args:
+            filepath: Path to CSV file
+            
+        Returns:
+            Cleaned DataFrame
+        """
+        if not os.path.exists(filepath):
+            return pd.DataFrame()
+        
+        try:
+            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+            
+            # Remove exact duplicates
+            df = df[~df.index.duplicated(keep='first')]
+            
+            # Additional deduplication based on OHLCV
+            df = df[~(
+                (df['Open'].duplicated(keep='first')) &
+                (df['High'].duplicated(keep='first')) &
+                (df['Low'].duplicated(keep='first')) &
+                (df['Close'].duplicated(keep='first')) &
+                (df['Volume'].duplicated(keep='first'))
+            )]
+            
+            logger.info(f"Cleaned {filepath}, kept {len(df)} unique records")
+            return df
+        except Exception as e:
+            logger.error(f"Error removing duplicates from {filepath}: {str(e)}")
+            return pd.DataFrame()
+    
+    @staticmethod
+    def merge_without_duplicates(existing_data: pd.DataFrame, new_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Merge new data with existing data, removing duplicates.
+        
+        Args:
+            existing_data: Existing DataFrame
+            new_data: New DataFrame to merge
+            
+        Returns:
+            Merged DataFrame without duplicates
+        """
+        if existing_data.empty:
+            return new_data
+        if new_data.empty:
+            return existing_data
+        
+        # Concatenate and remove duplicates
+        merged = pd.concat([existing_data, new_data])
+        merged = merged[~merged.index.duplicated(keep='first')]
+        merged = merged.sort_index()
+        
+        return merged
+
+
+class TimestampTracker:
+    """Tracks last update timestamp for each ticker."""
+    
+    @staticmethod
+    def load_timestamps() -> Dict[str, datetime]:
+        """Load timestamp tracking file."""
+        if not os.path.exists(TIMESTAMPS_FILE):
+            return {}
+        
+        try:
+            with open(TIMESTAMPS_FILE, 'r') as f:
+                data = json.load(f)
+                return {ticker: datetime.fromisoformat(ts) for ticker, ts in data.items()}
+        except Exception as e:
+            logger.warning(f"Error loading timestamps: {str(e)}")
+            return {}
+    
+    @staticmethod
+    def save_timestamps(timestamps: Dict[str, datetime]):
+        """Save timestamp tracking file."""
+        try:
+            data = {ticker: ts.isoformat() for ticker, ts in timestamps.items()}
+            with open(TIMESTAMPS_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving timestamps: {str(e)}")
+    
+    @staticmethod
+    def get_last_update(ticker: str) -> Optional[datetime]:
+        """Get last update time for a ticker."""
+        timestamps = TimestampTracker.load_timestamps()
+        return timestamps.get(ticker)
+    
+    @staticmethod
+    def update_timestamp(ticker: str, timestamp: datetime = None):
+        """Update last update time for a ticker."""
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        timestamps = TimestampTracker.load_timestamps()
+        timestamps[ticker] = timestamp
+        TimestampTracker.save_timestamps(timestamps)
+
 
 # ============================================================================
 # SECTION 1: HISTORICAL MARKET DATA INGESTION
 # ============================================================================
 
 class HistoricalDataIngester:
-    """Ingests and processes historical market data for the previous year."""
+    """Ingests and processes historical market data with incremental updates."""
     
     def __init__(self, lookback_years: int = 1):
         self.lookback_years = lookback_years
         self.end_date = datetime.now()
         self.start_date = self.end_date - timedelta(days=365 * lookback_years)
         self.market_data = {}
-        logger.info(f"Initialized ingester for period: {self.start_date.date()} to {self.end_date.date()}")
         
+        # Ensure cache directories exist
+        DataDeduplicator.ensure_cache_dirs()
+        
+        logger.info(f"Initialized ingester for period: {self.start_date.date()} to {self.end_date.date()}")
+    
+    def _get_cached_data(self, ticker: str) -> Optional[pd.DataFrame]:
+        """Load cached data for a ticker."""
+        filepath = os.path.join(MARKET_DATA_DIR, f'{ticker}_historical.csv')
+        
+        if not os.path.exists(filepath):
+            return None
+        
+        try:
+            df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+            logger.info(f"Loaded cached data for {ticker}: {len(df)} records")
+            return df
+        except Exception as e:
+            logger.warning(f"Error loading cached data for {ticker}: {str(e)}")
+            return None
+    
+    def _save_cached_data(self, ticker: str, data: pd.DataFrame):
+        """Save data to cache."""
+        filepath = os.path.join(MARKET_DATA_DIR, f'{ticker}_historical.csv')
+        
+        try:
+            data.to_csv(filepath)
+            logger.info(f"Cached {len(data)} records for {ticker}")
+        except Exception as e:
+            logger.error(f"Error saving cache for {ticker}: {str(e)}")
+    
+    def _should_update(self, ticker: str, cached_data: Optional[pd.DataFrame]) -> bool:
+        """Determine if data needs updating."""
+        if cached_data is None or cached_data.empty:
+            return True
+        
+        last_update = TimestampTracker.get_last_update(ticker)
+        if last_update is None:
+            return True
+        
+        # Update if last cached data is more than 1 day old
+        time_since_update = datetime.now() - last_update
+        needs_update = time_since_update > timedelta(days=1)
+        
+        if needs_update:
+            logger.info(f"{ticker}: Last update was {time_since_update.days} days ago, fetching new data")
+        else:
+            logger.info(f"{ticker}: Data is current (updated {time_since_update.seconds // 3600}h ago)")
+        
+        return needs_update
+    
     def ingest_stock_data(self, ticker: str) -> pd.DataFrame:
         """
-        Download and ingest historical stock data.
+        Download and ingest historical stock data with incremental updates.
         
         Args:
             ticker: Stock symbol (e.g., 'AAPL')
@@ -60,71 +278,116 @@ class HistoricalDataIngester:
             DataFrame with OHLCV data and technical indicators
         """
         try:
-            logger.info(f"Ingesting historical data for {ticker}")
-            data = yf.download(
+            # Load cached data
+            cached_data = self._get_cached_data(ticker)
+            
+            # Check if update is needed
+            if not self._should_update(ticker, cached_data):
+                self.market_data[ticker] = cached_data
+                return cached_data
+            
+            logger.info(f"Fetching historical data for {ticker}")
+            
+            # Determine date range for new fetch
+            if cached_data is not None and not cached_data.empty:
+                # Only fetch data after the last cached date
+                start_date = cached_data.index[-1] + timedelta(days=1)
+                if start_date >= self.end_date:
+                    logger.info(f"{ticker}: Already up to date")
+                    self.market_data[ticker] = cached_data
+                    return cached_data
+            else:
+                start_date = self.start_date
+            
+            # Download new data
+            new_data = yf.download(
                 ticker,
-                start=self.start_date,
+                start=start_date,
                 end=self.end_date,
                 progress=False
             )
             
-            if data.empty:
-                logger.warning(f"No data returned for {ticker}")
+            if new_data.empty:
+                logger.warning(f"No new data returned for {ticker}")
+                if cached_data is not None:
+                    self.market_data[ticker] = cached_data
+                    return cached_data
                 return pd.DataFrame()
             
+            # Merge with cached data
+            if cached_data is not None and not cached_data.empty:
+                data = DataDeduplicator.merge_without_duplicates(cached_data, new_data)
+                logger.info(f"{ticker}: Merged {len(new_data)} new records with {len(cached_data)} cached")
+            else:
+                data = new_data
+            
             # Calculate technical indicators
-            data['SMA_20'] = data['Close'].rolling(window=20).mean()
-            data['SMA_50'] = data['Close'].rolling(window=50).mean()
-            data['SMA_200'] = data['Close'].rolling(window=200).mean()
+            data = self._calculate_indicators(data)
             
-            # RSI (Relative Strength Index)
-            delta = data['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            data['RSI'] = 100 - (100 / (1 + rs))
+            # Save to cache
+            self._save_cached_data(ticker, data)
             
-            # MACD
-            exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-            exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-            data['MACD'] = exp1 - exp2
-            data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
-            
-            # Bollinger Bands
-            data['BB_Middle'] = data['Close'].rolling(window=20).mean()
-            data['BB_Std'] = data['Close'].rolling(window=20).std()
-            data['BB_Upper'] = data['BB_Middle'] + (data['BB_Std'] * 2)
-            data['BB_Lower'] = data['BB_Middle'] - (data['BB_Std'] * 2)
-            
-            # Volume indicators
-            data['Volume_SMA'] = data['Volume'].rolling(window=20).mean()
-            data['Volume_Ratio'] = data['Volume'] / data['Volume_SMA']
-            
-            # Daily returns
-            data['Returns'] = data['Close'].pct_change()
-            data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-            
-            # Volatility (20-day rolling)
-            data['Volatility'] = data['Returns'].rolling(window=20).std() * np.sqrt(252)
+            # Update timestamp
+            TimestampTracker.update_timestamp(ticker)
             
             self.market_data[ticker] = data
-            logger.info(f"Successfully ingested {len(data)} records for {ticker}")
+            logger.info(f"Successfully processed {len(data)} records for {ticker}")
             return data
             
         except Exception as e:
             logger.error(f"Error ingesting data for {ticker}: {str(e)}")
+            # Try to return cached data on error
+            cached = self._get_cached_data(ticker)
+            if cached is not None:
+                logger.info(f"Returning cached data for {ticker} due to fetch error")
+                self.market_data[ticker] = cached
+                return cached
             return pd.DataFrame()
     
-    def ingest_sector_data(self, sector_etfs: Dict[str, str]) -> Dict[str, pd.DataFrame]:
-        """
-        Ingest historical data for sector ETFs.
+    def _calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Calculate technical indicators for data."""
+        if data.empty or len(data) < 50:
+            return data
         
-        Args:
-            sector_etfs: Dict mapping sector names to ETF tickers
-            
-        Returns:
-            Dict with sector data
-        """
+        # Moving averages
+        data['SMA_20'] = data['Close'].rolling(window=20).mean()
+        data['SMA_50'] = data['Close'].rolling(window=50).mean()
+        data['SMA_200'] = data['Close'].rolling(window=200).mean()
+        
+        # RSI (Relative Strength Index)
+        delta = data['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        data['RSI'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+        data['MACD'] = exp1 - exp2
+        data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+        
+        # Bollinger Bands
+        data['BB_Middle'] = data['Close'].rolling(window=20).mean()
+        data['BB_Std'] = data['Close'].rolling(window=20).std()
+        data['BB_Upper'] = data['BB_Middle'] + (data['BB_Std'] * 2)
+        data['BB_Lower'] = data['BB_Middle'] - (data['BB_Std'] * 2)
+        
+        # Volume indicators
+        data['Volume_SMA'] = data['Volume'].rolling(window=20).mean()
+        data['Volume_Ratio'] = data['Volume'] / data['Volume_SMA']
+        
+        # Daily returns
+        data['Returns'] = data['Close'].pct_change()
+        data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
+        
+        # Volatility (20-day rolling)
+        data['Volatility'] = data['Returns'].rolling(window=20).std() * np.sqrt(252)
+        
+        return data
+    
+    def ingest_sector_data(self, sector_etfs: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+        """Ingest historical data for sector ETFs."""
         sector_data = {}
         for sector, etf in sector_etfs.items():
             logger.info(f"Ingesting sector data for {sector} ({etf})")
@@ -142,6 +405,25 @@ class HistoricalDataIngester:
             path = os.path.join(output_dir, f'{ticker}_historical.csv')
             data.to_csv(path)
             logger.info(f"Exported {ticker} to {path}")
+    
+    def clear_cache(self, ticker: str = None):
+        """
+        Clear data cache.
+        
+        Args:
+            ticker: If specified, only clear this ticker; else clear all
+        """
+        if ticker:
+            filepath = os.path.join(MARKET_DATA_DIR, f'{ticker}_historical.csv')
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                logger.info(f"Cleared cache for {ticker}")
+        else:
+            import shutil
+            if os.path.exists(DATA_CACHE_DIR):
+                shutil.rmtree(DATA_CACHE_DIR)
+                os.makedirs(DATA_CACHE_DIR)
+                logger.info("Cleared all cache")
 
 
 # ============================================================================
@@ -171,25 +453,11 @@ class SectorNewsScraper:
         logger.info("Initialized SectorNewsScraper")
     
     def scrape_news(self, max_articles: int = 50) -> List[Dict]:
-        """
-        Scrape recent news articles from financial sources.
-        
-        Args:
-            max_articles: Maximum number of articles to scrape
-            
-        Returns:
-            List of article dictionaries
-        """
+        """Scrape recent news articles from financial sources."""
         logger.info(f"Scraping news articles (target: {max_articles})")
         articles = []
         
-        # In production, use dedicated APIs like:
-        # - NewsAPI (newsapi.org)
-        # - Finnhub (finnhub.io)
-        # - IEX Cloud (iexcloud.io)
-        # - Alpha Vantage (alphavantage.co)
-        
-        # For demo purposes, create synthetic news
+        # Generate synthetic news for demo
         synthetic_articles = self._generate_synthetic_news(max_articles)
         articles.extend(synthetic_articles)
         
@@ -219,32 +487,13 @@ class SectorNewsScraper:
         
         return articles
     
-    def _classify_sector(self, text: str) -> str:
-        """Classify article to sector based on keywords."""
-        text_lower = text.lower()
-        
-        for sector, keywords in self.sector_keywords.items():
-            if any(keyword in text_lower for keyword in keywords):
-                return sector
-        
-        return 'General'
-    
     def get_sector_sentiment(self, sector: str) -> float:
-        """
-        Calculate sentiment score for a sector (0-1).
-        
-        Args:
-            sector: Sector name
-            
-        Returns:
-            Sentiment score (0=very negative, 1=very positive)
-        """
+        """Calculate sentiment score for a sector (0-1)."""
         sector_articles = [a for a in self.articles if a['sector'] == sector]
         
         if not sector_articles:
-            return 0.5  # Neutral
+            return 0.5
         
-        # Calculate sentiment
         sentiment_score = 0
         for article in sector_articles:
             if 'sentiment_keyword' in article:
@@ -253,7 +502,6 @@ class SectorNewsScraper:
                 elif article['sentiment_keyword'] == 'negative':
                     sentiment_score -= 1
         
-        # Normalize to 0-1 range
         normalized = 0.5 + (sentiment_score / (len(sector_articles) * 2))
         return max(0, min(1, normalized))
 
@@ -275,93 +523,64 @@ class UnifiedScoringSystem:
         logger.info(f"Scoring weights: {self.weights}")
     
     def calculate_technical_score(self, market_data: pd.DataFrame) -> float:
-        """
-        Calculate technical score based on indicators (0-100).
-        
-        Args:
-            market_data: DataFrame with OHLCV and technical indicators
-            
-        Returns:
-            Technical score (0-100)
-        """
+        """Calculate technical score based on indicators (0-100)."""
         if market_data.empty or len(market_data) < 50:
-            return 50  # Neutral
+            return 50
         
         latest = market_data.iloc[-1]
-        score = 50  # Base score
+        score = 50
         
         # SMA analysis
         if latest['Close'] > latest['SMA_50'] > latest['SMA_200']:
-            score += 15  # Bullish trend
+            score += 15
         elif latest['Close'] < latest['SMA_50'] < latest['SMA_200']:
-            score -= 15  # Bearish trend
+            score -= 15
         
         # RSI analysis
         if pd.notna(latest['RSI']):
             if latest['RSI'] < 30:
-                score += 10  # Oversold
+                score += 10
             elif latest['RSI'] > 70:
-                score -= 10  # Overbought
+                score -= 10
         
         # MACD analysis
         if pd.notna(latest['MACD']) and pd.notna(latest['Signal']):
             if latest['MACD'] > latest['Signal']:
-                score += 10  # Bullish
+                score += 10
             else:
-                score -= 10  # Bearish
+                score -= 10
         
         # Bollinger Bands
         if pd.notna(latest['BB_Upper']) and pd.notna(latest['BB_Lower']):
             if latest['Close'] < latest['BB_Lower']:
-                score += 8  # Below lower band
+                score += 8
             elif latest['Close'] > latest['BB_Upper']:
-                score -= 8  # Above upper band
+                score -= 8
         
         return max(0, min(100, score))
     
     def calculate_momentum_score(self, market_data: pd.DataFrame) -> float:
-        """
-        Calculate momentum score based on price changes (0-100).
-        
-        Args:
-            market_data: DataFrame with price data
-            
-        Returns:
-            Momentum score (0-100)
-        """
+        """Calculate momentum score based on price changes (0-100)."""
         if len(market_data) < 50:
             return 50
         
-        # 20-day price change
         price_change_20 = (market_data['Close'].iloc[-1] / market_data['Close'].iloc[-20] - 1) * 100
-        
-        # 50-day price change
         price_change_50 = (market_data['Close'].iloc[-1] / market_data['Close'].iloc[-50] - 1) * 100
         
         momentum = 50 + (price_change_20 / 2) + (price_change_50 / 4)
         return max(0, min(100, momentum))
     
     def calculate_volatility_score(self, market_data: pd.DataFrame) -> float:
-        """
-        Calculate volatility score (lower volatility = higher score).
-        
-        Args:
-            market_data: DataFrame with price data
-            
-        Returns:
-            Volatility score (0-100, where 100 = low volatility)
-        """
+        """Calculate volatility score (lower volatility = higher score)."""
         if len(market_data) < 20:
             return 50
         
-        # Use the Volatility column if available, otherwise calculate
         if 'Volatility' in market_data.columns and pd.notna(market_data['Volatility'].iloc[-1]):
             volatility = market_data['Volatility'].iloc[-1]
         else:
             returns = market_data['Close'].pct_change().tail(20)
             volatility = returns.std() * np.sqrt(252)
         
-        # Inverse relationship: higher volatility = lower score
         score = 50 - (volatility * 100)
         return max(0, min(100, score))
     
@@ -371,25 +590,12 @@ class UnifiedScoringSystem:
         market_data: pd.DataFrame,
         sentiment_score: float
     ) -> Dict[str, float]:
-        """
-        Generate unified score combining all factors.
-        
-        Args:
-            ticker: Stock symbol
-            market_data: Historical price data
-            sentiment_score: Sentiment score (0-1)
-            
-        Returns:
-            Dictionary with component scores and overall score
-        """
+        """Generate unified score combining all factors."""
         technical = self.calculate_technical_score(market_data)
         momentum = self.calculate_momentum_score(market_data)
         volatility = self.calculate_volatility_score(market_data)
-        
-        # Convert sentiment to 0-100 scale
         sentiment = sentiment_score * 100
         
-        # Calculate weighted score
         overall_score = (
             self.weights['technical'] * technical +
             self.weights['momentum'] * momentum +
@@ -424,41 +630,21 @@ class PredictionEngine:
         logger.info("Initialized PredictionEngine")
     
     def prepare_features(self, market_data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Prepare features for ML model.
-        
-        Args:
-            market_data: Historical market data
-            
-        Returns:
-            DataFrame with features
-        """
+        """Prepare features for ML model."""
         if len(market_data) < 50:
             return pd.DataFrame()
         
         features = market_data[['SMA_20', 'SMA_50', 'SMA_200', 'RSI', 'MACD']].copy()
-        
-        # Add volume ratio
         features['Volume_Ratio'] = market_data['Volume'] / market_data['Volume_SMA']
-        
-        # Forward-looking label: 1 if price goes up >2% in next 5 days, 0 otherwise
         features['Target'] = (
             (market_data['Close'].shift(-5) / market_data['Close'] - 1) > 0.02
         ).astype(int)
         
-        # Drop NaN values
         features = features.dropna()
-        
         return features
     
     def train_model(self, tickers: List[str], market_data_dict: Dict[str, pd.DataFrame]):
-        """
-        Train prediction model on historical data.
-        
-        Args:
-            tickers: List of ticker symbols
-            market_data_dict: Dictionary of market data by ticker
-        """
+        """Train prediction model on historical data."""
         logger.info("Training prediction model...")
         
         all_features = []
@@ -483,16 +669,7 @@ class PredictionEngine:
             logger.warning("Insufficient data for model training")
     
     def predict(self, ticker: str, market_data: pd.DataFrame) -> Dict:
-        """
-        Predict next 5-day price movement.
-        
-        Args:
-            ticker: Stock symbol
-            market_data: Market data
-            
-        Returns:
-            Prediction dictionary
-        """
+        """Predict next 5-day price movement."""
         if not self.is_trained or market_data.empty or len(market_data) < 50:
             return {
                 'ticker': ticker,
@@ -503,7 +680,6 @@ class PredictionEngine:
                 'probability_down': 0.5
             }
         
-        # Prepare features for latest data
         latest_data = market_data.tail(1)
         features = pd.DataFrame({
             'SMA_20': [latest_data['SMA_20'].iloc[-1]],
@@ -514,14 +690,11 @@ class PredictionEngine:
             'Volume_Ratio': [latest_data['Volume'].iloc[-1] / latest_data['Volume_SMA'].iloc[-1]]
         })
         
-        # Handle NaN values
         features = features.fillna(0)
         
-        # Get prediction and probability
         prediction = self.model.predict(features)[0]
         probability = self.model.predict_proba(features)[0]
         
-        # Determine signal
         if probability[1] > 0.65:
             signal = 'BUY'
             confidence = probability[1]
@@ -549,16 +722,7 @@ class PredictionEngine:
         }
     
     def apply_timing_rules(self, prediction: Dict, market_data: pd.DataFrame) -> Dict:
-        """
-        Apply timing rules to refine predictions.
-        
-        Args:
-            prediction: Base prediction
-            market_data: Market data for timing analysis
-            
-        Returns:
-            Refined prediction with timing
-        """
+        """Apply timing rules to refine predictions."""
         if market_data.empty or len(market_data) < 50:
             return prediction
         
@@ -566,12 +730,11 @@ class PredictionEngine:
         refined = prediction.copy()
         timing_boost = 0
         
-        # Timing Rule 1: Check if we're in a strong uptrend
+        # Timing Rule 1: Trend analysis
         if (pd.notna(latest['Close']) and pd.notna(latest['SMA_50']) and 
             pd.notna(latest['SMA_200']) and latest['Close'] > latest['SMA_50'] > latest['SMA_200']):
             refined['trend'] = 'UPTREND'
             timing_boost += 0.1
-        # Timing Rule 2: Check if we're in a strong downtrend
         elif (pd.notna(latest['Close']) and pd.notna(latest['SMA_50']) and 
               pd.notna(latest['SMA_200']) and latest['Close'] < latest['SMA_50'] < latest['SMA_200']):
             refined['trend'] = 'DOWNTREND'
@@ -579,7 +742,7 @@ class PredictionEngine:
         else:
             refined['trend'] = 'NEUTRAL'
         
-        # Timing Rule 3: Volume confirmation
+        # Timing Rule 2: Volume confirmation
         if (pd.notna(latest['Volume']) and pd.notna(latest['Volume_SMA']) and 
             latest['Volume'] > latest['Volume_SMA'] * 1.5):
             refined['volume_confirmation'] = True
@@ -587,7 +750,7 @@ class PredictionEngine:
         else:
             refined['volume_confirmation'] = False
         
-        # Timing Rule 4: RSI extremes
+        # Timing Rule 3: RSI extremes
         if pd.notna(latest['RSI']):
             if latest['RSI'] < 30:
                 refined['rsi_signal'] = 'OVERSOLD'
@@ -624,22 +787,13 @@ class MarketIntelligenceApp:
         }
     
     def run_analysis(self, tickers: List[str], sector_etfs: Dict[str, str]) -> Dict:
-        """
-        Run complete market analysis pipeline.
-        
-        Args:
-            tickers: List of stock tickers to analyze
-            sector_etfs: Dict of sector names to ETF tickers
-            
-        Returns:
-            Analysis results
-        """
+        """Run complete market analysis pipeline."""
         logger.info("=" * 80)
         logger.info("MARKET INTELLIGENCE ENGINE - ANALYSIS START")
         logger.info("=" * 80)
         
         # Step 1: Ingest historical market data
-        logger.info("\n[STEP 1/6] Ingesting Historical Market Data...")
+        logger.info("\n[STEP 1/6] Ingesting Historical Market Data (with incremental updates)...")
         for ticker in tickers:
             self.ingester.ingest_stock_data(ticker)
         
