@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-Enhanced MoneyPrinter GUI with live output streaming, better UX, and MIE support.
+MoneyPrinter desktop GUI - fetch market data, turn it into an Excel workbook.
 
-Features:
-- Run tests (run_all.py) with live output streaming
-- Fetch data with real-time progress
-- Run Market Intelligence Engine with live metrics
-- Browse data_store directories and view JSON files
-- Console output with syntax highlighting for success/failure/warnings
-- Better status indicators and progress tracking
+    python gui.py
 
-Run from repo root:
-  python gui.py
+Three buttons, in order: fetch, export, open the folder. Everything else is
+tucked under Advanced. The console shows exactly which command ran, so anything
+you can do here you can also do from a terminal.
+
+Paper/simulation research only. Nothing in this project places an order.
 """
 from __future__ import annotations
 
@@ -21,448 +18,450 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
-DATA_DIR = MP_V01_DIR / "data_store"
+FETCH_SCRIPT = MP_V01_DIR / "fetch_data.py"
+EXPORT_SCRIPT = HERE / "excel_report.py"
+MIE_SCRIPT = HERE / "market_intelligence_engine.py"
+TEST_SCRIPT = HERE / "run_tests.py"
+DEFAULT_OUT_DIR = HERE / "excel_out"
+SETTINGS_FILE = Path.home() / ".moneyprinter_gui.json"
+
+BENCHMARK = "SPY"          # labels are excess return vs this; see labels/contract.py
+
+
+# ---------------------------------------------------------------------------
+# Output classification
+#
+# Deliberately narrow. An earlier version coloured any line containing "pass"
+# green, which painted the risk gate's PASS verdict - meaning "do NOT trade" -
+# as if it were good news. Only explicit test markers count.
+# ---------------------------------------------------------------------------
+
+def classify(line: str) -> str:
+    s = line.strip()
+    low = s.lower()
+    if s.startswith("$ "):
+        return "command"
+    if s.startswith("<process exited"):
+        return "info"
+    if "passed," in low and "failed" in low:
+        return "success" if " 0 failed" in low else "error"
+    if ("traceback" in low or low.startswith("error") or "FAILED:" in s
+            or s.startswith("FAIL") or s.startswith("!!")
+            or "STEP(S) FAILED" in s or "✗" in s or "❌" in s):
+        return "error"
+    if s.startswith("PASS") or s.startswith("✓") or "ALL GREEN" in s or "✅" in s:
+        return "success"
+    if low.startswith("warning") or "⚠" in s:
+        return "warning"
+    return "normal"
 
 
 class SubprocessRunner(threading.Thread):
-    """Runs subprocess in background thread, pipes output to queue."""
-    def __init__(self, cmd, cwd: Path | None = None, env: dict | None = None, out_q: queue.Queue | None = None):
-        super().__init__(daemon=True)
-        self.cmd = cmd
-        self.cwd = cwd
-        self.env = env
-        self.out_q = out_q or queue.Queue()
-        self.proc = None
+    """Runs one python script, streaming its output into a queue."""
 
-    def run(self):
+    def __init__(self, args: list[str], cwd: Path, out_q: queue.Queue):
+        super().__init__(daemon=True)
+        self.args = args
+        self.cwd = cwd
+        self.out_q = out_q
+        self.proc: subprocess.Popen | None = None
+
+    def run(self) -> None:
+        cmd = [sys.executable] + [str(a) for a in self.args]
         try:
-            full_cmd = [sys.executable] + list(self.cmd)
-            self.out_q.put(("command", f"$ {' '.join(full_cmd)}\n"))
+            self.out_q.put(("command", f"$ {' '.join(cmd)}\n"))
             self.proc = subprocess.Popen(
-                full_cmd,
-                cwd=str(self.cwd) if self.cwd is not None else None,
-                env=self.env,
+                cmd,
+                cwd=str(self.cwd),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=1,
                 universal_newlines=True,
+                encoding="utf-8",
+                errors="replace",
             )
             assert self.proc.stdout is not None
             for line in self.proc.stdout:
-                # Simple heuristics for coloring output
-                if any(x in line.lower() for x in ["pass", "success", "✓", "✅"]):
-                    self.out_q.put(("success", line))
-                elif any(x in line.lower() for x in ["fail", "error", "✗", "❌"]):
-                    self.out_q.put(("error", line))
-                elif any(x in line.lower() for x in ["warning", "⚠️", "skip"]):
-                    self.out_q.put(("warning", line))
-                else:
-                    self.out_q.put(("normal", line))
+                self.out_q.put((classify(line), line))
             self.proc.wait()
-            self.out_q.put(("info", f"\n<process exited {self.proc.returncode}>\n"))
+            self.out_q.put(("done", self.proc.returncode))
         except Exception:
             self.out_q.put(("error", traceback.format_exc()))
-            self.out_q.put(("info", "\n<process exited 1>\n"))
+            self.out_q.put(("done", 1))
 
-    def stop(self):
+    def stop(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
 
 
 class MoneyPrinterGUI(tk.Tk):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.title("MoneyPrinter — AI Trading Research")
-        self.geometry("1400x800")
-        
-        # Configure text tags for colored output
-        self._setup_text_tags()
+        self.title("MoneyPrinter — market data to Excel")
+        self.geometry("1020x720")
+        self.minsize(860, 560)
 
-        if not MP_V01_DIR.exists():
-            messagebox.showerror(
-                "MoneyPrinter GUI",
-                f"Can't find the pipeline at:\n{MP_V01_DIR}\n\n"
-                "This file expects to live at the repository root, next to the "
-                "'claude' folder. If you moved it, move it back or update "
-                "MP_V01_DIR at the top of gui.py.",
-            )
-
-        self._current_runner: SubprocessRunner | None = None
+        self._runner: SubprocessRunner | None = None
         self._start_time: float | None = None
+        self._pending_workbook: Path | None = None
+        self._last_workbook: Path | None = None
+        self._out_q: queue.Queue = queue.Queue()
 
-        # ===== TOP FRAME: MAIN CONTROLS =====
-        top_frame = ttk.Frame(self)
-        top_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
-
-        # Title
-        title = ttk.Label(top_frame, text="MoneyPrinter Research Pipeline", font=("Arial", 14, "bold"))
-        title.pack(anchor=tk.W, pady=(0, 8))
-
-        # ===== CONTROL BUTTONS =====
-        ctrl = ttk.Frame(top_frame)
-        ctrl.pack(fill=tk.X, pady=(0, 8))
-
-        # Production system
-        prod_frame = ttk.LabelFrame(ctrl, text="Production System (mp_v01)", padding=8)
-        prod_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-
-        self.run_tests_btn = ttk.Button(prod_frame, text="▶ Run All Tests (76)", command=self.run_tests)
-        self.run_tests_btn.pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(prod_frame, text="Tickers:").pack(side=tk.LEFT, padx=(8, 0))
-        self.tickers_var = tk.StringVar(value="SPY,QQQ,MSFT")
-        self.tickers_entry = ttk.Entry(prod_frame, textvariable=self.tickers_var, width=18)
-        self.tickers_entry.pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(prod_frame, text="Start:").pack(side=tk.LEFT, padx=(8, 0))
-        self.start_var = tk.StringVar(value="2019-01-01")
-        self.start_entry = ttk.Entry(prod_frame, textvariable=self.start_var, width=12)
-        self.start_entry.pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(prod_frame, text="End:").pack(side=tk.LEFT, padx=(8, 0))
+        saved = self._load_settings()
+        self.tickers_var = tk.StringVar(value=saved.get("tickers", "SPY,QQQ,MSFT"))
+        self.start_var = tk.StringVar(value=saved.get("start", "2019-01-01"))
         self.end_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
-        self.end_entry = ttk.Entry(prod_frame, textvariable=self.end_var, width=12)
-        self.end_entry.pack(side=tk.LEFT, padx=4)
+        self.chains_var = tk.BooleanVar(value=bool(saved.get("chains", False)))
+        self.outdir_var = tk.StringVar(value=saved.get("outdir", str(DEFAULT_OUT_DIR)))
+        self.mie_tickers_var = tk.StringVar(value=saved.get("mie_tickers", "AAPL,MSFT,GOOGL"))
 
-        self.chains_var = tk.BooleanVar(value=False)
-        self.chains_cb = ttk.Checkbutton(prod_frame, text="Options (--chains)", variable=self.chains_var)
-        self.chains_cb.pack(side=tk.LEFT, padx=8)
-
-        self.fetch_btn = ttk.Button(prod_frame, text="📥 Fetch Data", command=self.fetch_data)
-        self.fetch_btn.pack(side=tk.LEFT, padx=4)
-
-        # Development system
-        dev_frame = ttk.LabelFrame(ctrl, text="Development (market_intelligence_engine)", padding=8)
-        dev_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-
-        ttk.Label(dev_frame, text="Tickers:").pack(side=tk.LEFT, padx=(0, 0))
-        self.mie_tickers_var = tk.StringVar(value="AAPL,MSFT,GOOGL")
-        self.mie_tickers_entry = ttk.Entry(dev_frame, textvariable=self.mie_tickers_var, width=18)
-        self.mie_tickers_entry.pack(side=tk.LEFT, padx=4)
-
-        self.mie_btn = ttk.Button(dev_frame, text="🧪 Run MIE (DEV ONLY)", command=self.run_mie)
-        self.mie_btn.pack(side=tk.LEFT, padx=4)
-
-        # Stop button
-        self.stop_btn = ttk.Button(dev_frame, text="⏹ Stop", command=self.stop_running, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=4)
-
-        self._job_buttons = (self.run_tests_btn, self.fetch_btn, self.mie_btn)
-
-        # ===== MIDDLE FRAME: OUTPUT + BROWSER =====
-        middle = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        middle.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-
-        # LEFT: Console output with syntax highlighting
-        out_frame = ttk.Frame(middle)
-        middle.add(out_frame, weight=3)
-
-        out_label_frame = ttk.Frame(out_frame)
-        out_label_frame.pack(fill=tk.X, pady=(0, 4))
-        
-        ttk.Label(out_label_frame, text="📟 Console Output", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-        self.elapsed_label = ttk.Label(out_label_frame, text="", foreground="gray")
-        self.elapsed_label.pack(side=tk.RIGHT)
-
-        self.text = scrolledtext.ScrolledText(out_frame, wrap=tk.CHAR, font=("Courier", 9))
-        self.text.pack(fill=tk.BOTH, expand=True)
-        self.text.configure(state=tk.DISABLED)
-
-        # RIGHT: Data store browser
-        browse_frame = ttk.LabelFrame(middle, text="📂 Data Store Browser", padding=6)
-        middle.add(browse_frame, weight=1)
-
-        self.store_list = tk.Listbox(browse_frame, height=20, font=("Courier", 9))
-        self.store_list.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        self.store_list.bind('<Double-Button-1>', lambda e: self.open_selected_file())
-
-        btns = ttk.Frame(browse_frame)
-        btns.pack(fill=tk.X)
-        ttk.Button(btns, text="🔄 Refresh", command=self.refresh_store).pack(side=tk.LEFT, padx=2, pady=2)
-        ttk.Button(btns, text="👁 Open", command=self.open_selected_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="📂 Reveal", command=self.reveal_in_file_manager).pack(side=tk.LEFT, padx=2)
-
-        # ===== BOTTOM: STATUS BAR =====
-        status_frame = ttk.Frame(self)
-        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
-
-        self.status = ttk.Label(status_frame, text="✓ Ready", relief=tk.SUNKEN, anchor=tk.W)
-        self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self.progress = ttk.Progressbar(status_frame, mode='indeterminate', length=100)
-        self.progress.pack(side=tk.RIGHT, padx=8, pady=4)
-
-        # Queue and poller
-        self._out_q = queue.Queue()
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll()
 
-        # Initial refresh
-        self.refresh_store()
+        if not MP_V01_DIR.is_dir():
+            self._log(
+                f"Cannot find the pipeline at {MP_V01_DIR}.\n"
+                "gui.py expects to sit in the repository root, next to the 'claude' "
+                "folder. Move it back, or edit MP_V01_DIR at the top of this file.\n",
+                "error",
+            )
 
-    def _setup_text_tags(self):
-        """Configure syntax highlighting for console output."""
-        self.text_tags = {}
-        
-        # Define tag styles
-        styles = {
-            "success": {"foreground": "#00AA00", "font": ("Courier", 9)},
-            "error": {"foreground": "#FF3333", "font": ("Courier", 9, "bold")},
-            "warning": {"foreground": "#FF9900", "font": ("Courier", 9)},
-            "command": {"foreground": "#0066FF", "font": ("Courier", 9, "bold")},
-            "info": {"foreground": "#666666", "font": ("Courier", 9, "italic")},
-            "normal": {"foreground": "#000000", "font": ("Courier", 9)},
+    # -- layout ------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        self._setup_tags()
+
+        head = ttk.Frame(self, padding=(12, 10, 12, 0))
+        head.pack(fill=tk.X)
+        ttk.Label(head, text="MoneyPrinter", font=("Segoe UI", 16, "bold")).pack(anchor=tk.W)
+        ttk.Label(
+            head,
+            text="Fetch point-in-time market data, then export it to a workbook you "
+                 "can work in. Paper/simulation research only — nothing here places an order.",
+            foreground="#555555",
+            wraplength=960,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 8))
+
+        # --- step 1 inputs -------------------------------------------------
+        box = ttk.LabelFrame(self, text=" What to fetch ", padding=10)
+        box.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        row = ttk.Frame(box)
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="Tickers").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.tickers_var, width=26).pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Label(row, text="Start").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.start_var, width=12).pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Label(row, text="End").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.end_var, width=12).pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Checkbutton(row, text="also snapshot today's option chains",
+                        variable=self.chains_var).pack(side=tk.LEFT)
+
+        ttk.Label(
+            box,
+            text=f"Keep {BENCHMARK} in the list. The label is excess return vs {BENCHMARK}, "
+                 f"so without it no labels can be built for anything else.",
+            foreground="#777777",
+        ).pack(anchor=tk.W, pady=(6, 0))
+
+        # --- the three steps ----------------------------------------------
+        steps = ttk.Frame(self, padding=(12, 0))
+        steps.pack(fill=tk.X)
+        self.fetch_btn = ttk.Button(steps, text="1 · Fetch market data", command=self.fetch_data)
+        self.fetch_btn.pack(side=tk.LEFT)
+        self.export_btn = ttk.Button(steps, text="2 · Build Excel workbook", command=self.export_excel)
+        self.export_btn.pack(side=tk.LEFT, padx=6)
+        ttk.Button(steps, text="3 · Open output folder", command=self.open_output).pack(side=tk.LEFT)
+
+        out_row = ttk.Frame(self, padding=(12, 8))
+        out_row.pack(fill=tk.X)
+        ttk.Label(out_row, text="Workbooks go to").pack(side=tk.LEFT)
+        ttk.Entry(out_row, textvariable=self.outdir_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(out_row, text="Change…", command=self.choose_output).pack(side=tk.LEFT)
+
+        # --- advanced -------------------------------------------------------
+        adv = ttk.LabelFrame(self, text=" Advanced ", padding=8)
+        adv.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self.tests_btn = ttk.Button(adv, text="Run test suite", command=self.run_tests)
+        self.tests_btn.pack(side=tk.LEFT)
+        ttk.Label(adv, text="   MIE tickers").pack(side=tk.LEFT)
+        ttk.Entry(adv, textvariable=self.mie_tickers_var, width=20).pack(side=tk.LEFT, padx=6)
+        self.mie_btn = ttk.Button(adv, text="Run MIE (dev only)", command=self.run_mie)
+        self.mie_btn.pack(side=tk.LEFT)
+        self.stop_btn = ttk.Button(adv, text="Stop", command=self.stop_running, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.RIGHT)
+
+        self._job_buttons = (self.fetch_btn, self.export_btn, self.tests_btn, self.mie_btn)
+
+        # --- console --------------------------------------------------------
+        con = ttk.Frame(self, padding=(12, 0))
+        con.pack(fill=tk.BOTH, expand=True)
+        bar = ttk.Frame(con)
+        bar.pack(fill=tk.X)
+        ttk.Label(bar, text="Console", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.elapsed_label = ttk.Label(bar, text="", foreground="#777777")
+        self.elapsed_label.pack(side=tk.RIGHT)
+        ttk.Button(bar, text="Clear", command=self.clear_console).pack(side=tk.RIGHT, padx=6)
+
+        self.text = scrolledtext.ScrolledText(con, wrap=tk.WORD, font=("Consolas", 9),
+                                              height=18, background="#FBFBFB")
+        self.text.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
+        self.text.configure(state=tk.DISABLED)
+        for tag, cfg in self._tag_styles.items():
+            self.text.tag_configure(tag, **cfg)
+
+        # --- status ---------------------------------------------------------
+        status = ttk.Frame(self)
+        status.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status = ttk.Label(status, text="Ready", relief=tk.SUNKEN, anchor=tk.W, padding=4)
+        self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.progress = ttk.Progressbar(status, mode="indeterminate", length=120)
+        self.progress.pack(side=tk.RIGHT, padx=8, pady=4)
+
+    def _setup_tags(self) -> None:
+        self._tag_styles = {
+            "success": {"foreground": "#0B7A28"},
+            "error": {"foreground": "#C0281C"},
+            "warning": {"foreground": "#B26B00"},
+            "command": {"foreground": "#1F5FBF"},
+            "info": {"foreground": "#777777"},
+            "normal": {"foreground": "#1A1A1A"},
         }
-        
-        self.text_tags = styles
 
-    def _append_text(self, s: str, tag: str = "normal"):
-        """Append colored text to console."""
+    # -- small helpers -----------------------------------------------------
+
+    def _log(self, s: str, tag: str = "normal") -> None:
         self.text.configure(state=tk.NORMAL)
         self.text.insert(tk.END, s, tag)
         self.text.see(tk.END)
         self.text.configure(state=tk.DISABLED)
 
-    def _set_status(self, text: str, color: str = "black", icon: str = "✓"):
-        """Update status bar."""
-        self.status.config(text=f"{icon} {text}", foreground=color)
+    def _banner(self, title: str, tag: str = "command") -> None:
+        self._log("\n" + "─" * 78 + f"\n{title}\n" + "─" * 78 + "\n\n", tag)
 
-    def _set_job_buttons_enabled(self, enabled: bool):
-        state = tk.NORMAL if enabled else tk.DISABLED
+    def clear_console(self) -> None:
+        self.text.configure(state=tk.NORMAL)
+        self.text.delete(1.0, tk.END)
+        self.text.configure(state=tk.DISABLED)
+
+    def _set_status(self, text: str, color: str = "black") -> None:
+        self.status.config(text=text, foreground=color)
+
+    def _busy(self, busy: bool) -> None:
         for b in self._job_buttons:
-            b.config(state=state)
-        self.stop_btn.config(state=tk.DISABLED if enabled else tk.NORMAL)
+            b.config(state=tk.DISABLED if busy else tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
 
-    def _start_runner(self, args, label: str, cwd=None):
-        if self._current_runner is not None and self._current_runner.is_alive():
-            messagebox.showinfo("Busy", "Another job is running. Stop it first or wait for it to finish.")
-            return
-        
-        self._set_status(f"Running: {label} ...", icon="▶")
-        self._set_job_buttons_enabled(False)
-        self.progress.start()
-        
-        import time
+    def out_dir(self) -> Path:
+        return Path(self.outdir_var.get().strip() or DEFAULT_OUT_DIR).expanduser()
+
+    def _tickers(self) -> list[str]:
+        return [t.strip().upper() for t in self.tickers_var.get().split(",") if t.strip()]
+
+    @staticmethod
+    def _valid_date(s: str) -> bool:
+        try:
+            datetime.strptime(s.strip(), "%Y-%m-%d")
+            return True
+        except ValueError:
+            return False
+
+    # -- settings ----------------------------------------------------------
+
+    def _load_settings(self) -> dict:
+        try:
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_settings(self) -> None:
+        try:
+            SETTINGS_FILE.write_text(json.dumps({
+                "tickers": self.tickers_var.get(),
+                "start": self.start_var.get(),
+                "chains": self.chains_var.get(),
+                "outdir": self.outdir_var.get(),
+                "mie_tickers": self.mie_tickers_var.get(),
+            }, indent=2), encoding="utf-8")
+        except Exception:
+            pass          # a settings file we cannot write is not worth a dialog
+
+    def _on_close(self) -> None:
+        self._save_settings()
+        if self._runner is not None and self._runner.is_alive():
+            self._runner.stop()
+        self.destroy()
+
+    # -- job plumbing ------------------------------------------------------
+
+    def _start(self, args: list, label: str, cwd: Path) -> bool:
+        if self._runner is not None and self._runner.is_alive():
+            messagebox.showinfo("Busy", "Something is already running. Wait for it, or press Stop.")
+            return False
+        self._set_status(f"Running {label}…")
+        self._busy(True)
+        self.progress.start(12)
         self._start_time = time.time()
-        
-        runner = SubprocessRunner(args, cwd=cwd or MP_V01_DIR, env=os.environ.copy(), out_q=self._out_q)
-        self._current_runner = runner
-        runner.start()
+        self._runner = SubprocessRunner(args, cwd, self._out_q)
+        self._runner.start()
+        return True
 
-    def stop_running(self):
-        if self._current_runner is not None and self._current_runner.is_alive():
-            self._current_runner.stop()
-            self._append_text("\n⏹ Stop requested\n", "warning")
+    def stop_running(self) -> None:
+        if self._runner is not None and self._runner.is_alive():
+            self._runner.stop()
+            self._log("\nStop requested.\n", "warning")
 
-    def _update_elapsed_time(self):
-        """Update elapsed time display."""
-        if self._start_time is not None:
-            import time
-            elapsed = time.time() - self._start_time
-            minutes = int(elapsed // 60)
-            seconds = int(elapsed % 60)
-            self.elapsed_label.config(text=f"⏱ {minutes}m {seconds}s")
-
-    def _poll(self):
-        """Poll output queue and update GUI."""
+    def _poll(self) -> None:
         try:
             while True:
-                tag, line = self._out_q.get_nowait()
-                self._append_text(line, tag)
-                
-                if line.startswith("<process exited"):
-                    self._set_job_buttons_enabled(True)
-                    self.progress.stop()
-                    
-                    try:
-                        code = int(line.strip().rstrip(">").rsplit(" ", 1)[-1])
-                    except ValueError:
-                        code = None
-                    
-                    if code == 0:
-                        self._set_status("Ready — last run passed ✓", color="darkgreen", icon="✓")
-                    elif code is None:
-                        self._set_status("Ready", icon="✓")
-                    else:
-                        self._set_status(f"Ready — last run FAILED (exit {code})", color="red", icon="✗")
-                    
-                    self.refresh_store()
-                    self._start_time = None
+                tag, payload = self._out_q.get_nowait()
+                if tag == "done":
+                    self._finish(int(payload))
+                else:
+                    self._log(payload, tag)
         except queue.Empty:
             pass
-        
-        self._update_elapsed_time()
+
+        if self._start_time is not None:
+            elapsed = int(time.time() - self._start_time)
+            self.elapsed_label.config(text=f"{elapsed // 60}m {elapsed % 60:02d}s")
         self.after(100, self._poll)
 
-    # ===== ACTIONS =====
+    def _finish(self, code: int) -> None:
+        self._busy(False)
+        self.progress.stop()
+        self._start_time = None
+        self._log(f"\n<process exited {code}>\n", "info")
 
-    def run_tests(self):
-        """Run the production test suite."""
-        self.text.configure(state=tk.NORMAL)
-        self.text.delete(1.0, tk.END)
-        self.text.configure(state=tk.DISABLED)
-        self._append_text("\n" + "=" * 80 + "\n", "command")
-        self._append_text("Running production test suite: run_all.py\n", "command")
-        self._append_text("This runs 76 tests covering PIT correctness, costs, and risk gates.\n", "info")
-        self._append_text("=" * 80 + "\n\n", "command")
-        self._start_runner(["run_all.py"], label="run_all.py", cwd=MP_V01_DIR)
+        if code == 0 and self._pending_workbook is not None:
+            self._last_workbook = self._pending_workbook
+            self._set_status(f"Workbook ready — {self._last_workbook.name}", "#0B7A28")
+            self._log(f"\nOpen it with '3 · Open output folder', or double-click:\n"
+                      f"  {self._last_workbook}\n", "success")
+        elif code == 0:
+            self._set_status("Finished", "#0B7A28")
+        else:
+            self._set_status(f"Last run failed (exit {code}) — see console", "#C0281C")
+        self._pending_workbook = None
+        self._save_settings()
 
-    def fetch_data(self):
-        """Fetch market data."""
-        tickers = self.tickers_var.get().strip()
+    # -- actions -----------------------------------------------------------
+
+    def fetch_data(self) -> None:
+        tickers = self._tickers()
         if not tickers:
-            messagebox.showwarning("Fetch Data", "Enter at least one ticker (e.g. SPY,QQQ,MSFT) first.")
+            messagebox.showwarning("Fetch", "Enter at least one ticker, e.g. SPY,QQQ,MSFT.")
             return
-        
-        self.text.configure(state=tk.NORMAL)
-        self.text.delete(1.0, tk.END)
-        self.text.configure(state=tk.DISABLED)
-        
-        args = ["fetch_data.py", "--start", self.start_var.get(), "--end", self.end_var.get(), "--tickers", tickers]
+        for name, value in (("Start", self.start_var.get()), ("End", self.end_var.get())):
+            if not self._valid_date(value):
+                messagebox.showwarning("Fetch", f"{name} date must look like 2019-01-01.")
+                return
+        if BENCHMARK not in tickers:
+            proceed = messagebox.askyesno(
+                "Benchmark missing",
+                f"{BENCHMARK} is not in your ticker list.\n\n"
+                f"Labels are the forward excess return vs {BENCHMARK}, so without it the "
+                f"workbook will contain bars but no labels for these tickers.\n\n"
+                f"Fetch anyway?",
+            )
+            if not proceed:
+                return
+
+        args = [FETCH_SCRIPT, "--tickers", ",".join(tickers),
+                "--start", self.start_var.get().strip(), "--end", self.end_var.get().strip()]
         if self.chains_var.get():
             args.append("--chains")
-        
-        self._append_text("\n" + "=" * 80 + "\n", "command")
-        self._append_text(f"Fetching market data: {' '.join(args)}\n", "command")
-        self._append_text("=" * 80 + "\n\n", "command")
-        self._start_runner(args, label="fetch_data.py", cwd=MP_V01_DIR)
 
-    def run_mie(self):
-        """Run Market Intelligence Engine (development only)."""
-        tickers = self.mie_tickers_var.get().strip()
+        self._banner("Fetching daily bars from Yahoo (free, no API key)")
+        self._log("Needs yfinance:  pip install yfinance\n"
+                  "Each run writes a new immutable vintage; nothing is overwritten.\n\n", "info")
+        self._start(args, "fetch_data.py", MP_V01_DIR)
+
+    def export_excel(self) -> None:
+        out_dir = self.out_dir()
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Output folder", f"Cannot create {out_dir}:\n{e}")
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = out_dir / f"moneyprinter_{stamp}.xlsx"
+
+        self._banner("Building the Excel workbook")
+        self._log("Exports every ticker currently in the data store. Needs openpyxl:\n"
+                  "  pip install openpyxl\n\n", "info")
+        self._pending_workbook = target
+        if not self._start([EXPORT_SCRIPT, "--out", target], "excel_report.py", HERE):
+            self._pending_workbook = None
+
+    def run_tests(self) -> None:
+        self._banner("Running every test suite (no network, no market data)")
+        self._start([TEST_SCRIPT], "run_tests.py", HERE)
+
+    def run_mie(self) -> None:
+        tickers = [t.strip().upper() for t in self.mie_tickers_var.get().split(",") if t.strip()]
         if not tickers:
-            messagebox.showwarning("Run MIE", "Enter at least one ticker (e.g. AAPL,MSFT,GOOGL) first.")
+            messagebox.showwarning("MIE", "Enter at least one ticker, e.g. AAPL,MSFT.")
             return
-        
-        self.text.configure(state=tk.NORMAL)
-        self.text.delete(1.0, tk.END)
-        self.text.configure(state=tk.DISABLED)
-        
-        self._append_text("\n" + "=" * 80 + "\n", "warning")
-        self._append_text("⚠️  MARKET INTELLIGENCE ENGINE - DEVELOPMENT ONLY\n", "warning")
-        self._append_text("See CODE_REVIEW_2026-08-13.md for limitations and blockers.\n", "warning")
-        self._append_text("=" * 80 + "\n\n", "warning")
-        
-        # Create a wrapper script to run MIE with custom tickers
-        script_content = f"""
-import sys
-sys.path.insert(0, '{HERE}')
+        self._banner("MARKET INTELLIGENCE ENGINE — DEVELOPMENT ONLY", "warning")
+        self._log("Unvalidated output. Not point-in-time correct, news input is synthetic.\n"
+                  "See CODE_REVIEW_2026-08-13.md before believing any number it prints.\n\n",
+                  "warning")
+        # Passed as real arguments. This used to be generated by interpolating the
+        # ticker string into a temp .py file written next to the repo root, which
+        # broke on any unexpected character and left the file behind.
+        self._start([MIE_SCRIPT, "--tickers", ",".join(tickers)], "market_intelligence_engine.py", HERE)
 
-from market_intelligence_engine import MarketIntelligenceApp
+    def choose_output(self) -> None:
+        chosen = filedialog.askdirectory(initialdir=str(self.out_dir().parent),
+                                         title="Where should workbooks go?")
+        if chosen:
+            self.outdir_var.set(chosen)
+            self._save_settings()
 
-tickers = '{tickers}'.split(',')
-tickers = [t.strip() for t in tickers]
-
-app = MarketIntelligenceApp()
-results = app.run_analysis(tickers, {{'Technology': 'XLK', 'Healthcare': 'XLV'}})
-app.generate_report('market_intelligence_report.json')
-app.print_summary()
-"""
-        
-        script_path = HERE / "_run_mie_temp.py"
-        script_path.write_text(script_content)
-        
-        self._start_runner(["_run_mie_temp.py"], label="market_intelligence_engine.py", cwd=HERE)
-
-    def refresh_store(self):
-        """Refresh the data store browser."""
-        self.store_list.delete(0, tk.END)
-        if not DATA_DIR.exists():
-            self.store_list.insert(tk.END, "(no data_store directory yet)")
-            return
-        
-        for sub in ("bars", "chains"):
-            d = DATA_DIR / sub
-            if d.exists() and d.is_dir():
-                files = list(d.iterdir())
-                self.store_list.insert(tk.END, f"📁 {sub}/ ({len(files)} files)")
-                for p in sorted(files)[:20]:  # Limit to first 20
-                    self.store_list.insert(tk.END, f"  {p.name}")
-                if len(files) > 20:
-                    self.store_list.insert(tk.END, f"  ... and {len(files) - 20} more")
-
-    def open_selected_file(self):
-        """Open selected file from data store."""
-        sel = self.store_list.curselection()
-        if not sel:
-            messagebox.showinfo("Open", "Select a file from the list first")
-            return
-        
-        label = self.store_list.get(sel[0]).strip()
-        if label.startswith("📁"):
-            messagebox.showinfo("Open", "Select a file, not a directory")
-            return
-        if label.startswith("..."):
-            messagebox.showinfo("Open", "Too many files to display. Check directory manually.")
-            return
-        
-        # Remove leading spaces and reconstruct path
-        label = label.lstrip()
-        parent = self.store_list.get(sel[0] - 1).replace("📁 ", "").split("/")[0]
-        path = DATA_DIR / parent / label
-        
-        if not path.exists():
-            messagebox.showerror("Open", f"File not found: {path}")
-            return
-        
+    def open_output(self) -> None:
+        out_dir = self.out_dir()
         try:
-            text = path.read_text(encoding="utf-8")
-            try:
-                obj = json.loads(text)
-                pretty = json.dumps(obj, indent=2, default=str)
-                self._append_text(f"\n\n{'=' * 80}\n", "command")
-                self._append_text(f"File: {label}\n", "command")
-                self._append_text(f"{'=' * 80}\n\n", "command")
-                self._append_text(pretty + "\n", "normal")
-            except Exception:
-                self._append_text(f"\n\n{'=' * 80}\n", "command")
-                self._append_text(f"File: {label} (raw)\n", "command")
-                self._append_text(f"{'=' * 80}\n\n", "command")
-                self._append_text(text[:5000] + "\n", "normal")
-                if len(text) > 5000:
-                    self._append_text("...(truncated)\n", "info")
-        except Exception as e:
-            messagebox.showerror("Open", f"Failed to read file: {e}")
-
-    def reveal_in_file_manager(self):
-        """Open file manager to selected location."""
-        sel = self.store_list.curselection()
-        if not sel:
-            path = DATA_DIR
-        else:
-            label = self.store_list.get(sel[0])
-            if "📁" in label:
-                parent = label.replace("📁 ", "").split("/")[0]
-                path = DATA_DIR / parent
-            else:
-                path = DATA_DIR
-        
-        if not path.exists():
-            messagebox.showerror("Reveal", f"Path not found: {path}")
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Open folder", f"Cannot create {out_dir}:\n{e}")
             return
-        
+        target = self._last_workbook if (
+            self._last_workbook and self._last_workbook.exists()) else None
         try:
-            if sys.platform.startswith("darwin"):
-                subprocess.run(["open", str(path)])
-            elif sys.platform.startswith("win"):
-                subprocess.run(["explorer", str(path)])
+            if sys.platform.startswith("win"):
+                if target:
+                    # /select and the path must be a single argument.
+                    # explorer exits non-zero even on success, so don't check.
+                    subprocess.run(["explorer", f"/select,{target}"])
+                else:
+                    os.startfile(str(out_dir))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", "-R", str(target)] if target else ["open", str(out_dir)])
             else:
-                subprocess.run(["xdg-open", str(path)])
+                subprocess.run(["xdg-open", str(out_dir)])
         except Exception as e:
-            messagebox.showerror("Reveal", f"Failed to open file manager: {e}")
+            messagebox.showerror("Open folder", f"Could not open {out_dir}:\n{e}")
 
 
-def main():
-    app = MoneyPrinterGUI()
-    app.mainloop()
+def main() -> int:
+    MoneyPrinterGUI().mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

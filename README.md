@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-76 tests passing in `claude/app/mp_v01/`. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+99 tests passing (`python run_tests.py`): 76 in `claude/app/mp_v01/`, 23 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
@@ -27,7 +27,12 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ```
 ├── market_intelligence_engine.py  DEVELOPMENT ONLY. See CODE_REVIEW_2026-08-13.md
 ├── requirements.txt               Python dependencies
-├── gui.py                         Desktop GUI - run tests, fetch data, browse results
+├── gui.py                         Desktop GUI - fetch data, build the Excel workbook
+├── run_gui.bat                    Windows double-click launcher for the GUI
+├── excel_report.py                Data store -> .xlsx (bars, labels, summary)
+├── run_tests.py                   Runs every suite in the repo
+├── tests/                         Tests for the Excel export and the GUI
+├── excel_out/                     Generated workbooks (gitignored)
 ├── CODE_REVIEW_2026-08-13.md      Complete accounting of MIE issues and remediation
 ├── claude/                        Claude's work: architecture, orchestration, review
 │   ├── app/mp_v01/                The core codebase (PRODUCTION STANDARD)
@@ -96,17 +101,84 @@ A point-in-time-correct research pipeline, built to make hindsight structurally 
 
 **GUI** (from repo root):
 ```bash
-python gui.py               # run tests, fetch data, browse results
+python gui.py               # or double-click run_gui.bat on Windows
 ```
+
+Three buttons, in order: fetch data, build the Excel workbook, open the folder.
+The test suite and the dev-only MIE sit under Advanced. Every command it runs is
+echoed into the console, so anything the GUI does you can also do from a terminal.
 
 **Command line**:
 ```bash
+python run_tests.py        # every suite: pipeline, Excel export, GUI (99 tests)
+
 cd claude/app/mp_v01
-python run_all.py          # full zero-dependency test suite (76 tests)
+python run_all.py          # just the zero-dependency pipeline suite (76 tests)
 
 pip install yfinance
 python fetch_data.py --tickers SPY,QQQ,MSFT --chains
 ```
+
+---
+
+## Working in Excel
+
+`excel_report.py` turns the point-in-time store into one workbook. It imports
+`labels/contract.py` rather than re-deriving the target, so the spreadsheet and
+the codebase cannot drift apart on what `y` means.
+
+```bash
+python excel_report.py                      # everything in the store
+python excel_report.py --tickers SPY,MSFT   # a subset
+```
+
+| Sheet | What's in it |
+|-------|--------------|
+| `README` | Generated timestamp, source vintage files, label definition, what every status value means |
+| `Summary` | One row per ticker: coverage, gap count, label base rate |
+| `Bars_<TICKER>` | OHLCV, dividends, daily total return, both PIT timestamps, plus **live formulas** for `sma_20`, `sma_50`, `vol_20d_annualised` |
+| `Labels` | The label contract v1.0 target: 5-day forward log excess total return vs SPY, its sign, and the fail-closed status |
+
+The SMA and volatility columns are real Excel formulas, not pasted values — widen
+the `AVERAGE()` range and the column recalculates, so windows can be retuned in
+the sheet without touching Python. All three look backwards only.
+
+Three things worth knowing before you trust a cell:
+
+- **Blank means missing.** Nothing is interpolated or forward-filled. A gap breaks
+  the return chain and turns the affected labels `RETURN_GAP_UNRESOLVED`.
+- **`available_time_utc` is the only timestamp a backtest may filter on.** It is the
+  morning *after* the session, not that session's own close.
+- **The `Labels` sheet is the answer key.** Forward-looking by construction: correct
+  for fitting and scoring, never as an input feature.
+- **SPY must be in the store.** Excess return vs SPY is undefined without it, so no
+  labels are built for other tickers and the workbook says so rather than
+  substituting a different benchmark.
+
+Each export writes a new timestamped file under `excel_out/`, so a workbook you have
+edited by hand is never overwritten.
+
+---
+
+## Local setup (Windows)
+
+```bat
+pip install yfinance openpyxl tzdata
+```
+
+That is everything the GUI and the Excel export need — the heavy pins in
+`requirements.txt` (pandas, scikit-learn, backtrader) are only for the
+development-only Market Intelligence Engine.
+
+Then double-click `run_gui.bat`, or:
+
+```bat
+python gui.py
+```
+
+If Python is not found, reinstall from python.org with **"Add python.exe to PATH"**
+ticked. `tzdata` is required on Windows: `zoneinfo` has no IANA database there, and
+the label's 15:45 ET decision clock would otherwise be an hour off for half the year.
 
 ### Test results (76 passing):
 
@@ -199,5 +271,5 @@ Write these numbers down **now** and put in STATE.md:
 
 ---
 
-**Last Updated**: August 13, 2026  
-**Version**: 2.1.0 (Market Intelligence Engine marked DEVELOPMENT ONLY, critical fixes applied)
+**Last Updated**: August 29, 2026  
+**Version**: 2.2.0 (Excel export, rebuilt GUI, 99 tests)

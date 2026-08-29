@@ -14,6 +14,7 @@ For any real evaluation: use claude/app/mp_v01/run_all.py
 For forward paper trading: use claude/app/mp_v01/fetch_data.py + gates/risk.py
 """
 
+import argparse
 import os
 import sys
 import json
@@ -526,16 +527,27 @@ class MarketIntelligenceApp:
         print("=" * 80 + "\n")
 
 
-def main():
+def main(argv: Optional[List[str]] = None):
     """Entry point (development only)."""
-    TICKERS = ['AAPL', 'MSFT', 'GOOGL']
+    ap = argparse.ArgumentParser(
+        description="Market Intelligence Engine - DEVELOPMENT ONLY, not for trading."
+    )
+    ap.add_argument('--tickers', default='AAPL,MSFT,GOOGL',
+                    help='comma-separated tickers to analyse')
+    ap.add_argument('--out', default='market_intelligence_report.json',
+                    help='path for the JSON report')
+    a = ap.parse_args(argv)
+
+    tickers = [t.strip().upper() for t in a.tickers.split(',') if t.strip()]
+    if not tickers:
+        ap.error('--tickers needs at least one symbol')
     SECTOR_ETFS = {'Technology': 'XLK'}
-    
+
     app = MarketIntelligenceApp()
-    results = app.run_analysis(TICKERS, SECTOR_ETFS)
-    app.generate_report()
+    results = app.run_analysis(tickers, SECTOR_ETFS)
+    app.generate_report(a.out)
     app.print_summary()
-    
+
     return app, results
 
 

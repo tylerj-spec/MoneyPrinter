@@ -30,3 +30,8 @@ Thumbs.db
 # Keeping it out of git also avoids accidentally publishing paid-vendor data
 # (e.g. EODHD chains) under terms that may not permit redistribution.
 claude/app/mp_v01/data_store/
+
+# Excel workbooks built by excel_report.py / gui.py. Regenerable from the
+# data store, and the ones you have edited by hand are yours, not the repo's.
+excel_out/
+*.xlsx
