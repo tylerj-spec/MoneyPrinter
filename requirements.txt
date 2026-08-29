@@ -21,6 +21,9 @@ backtrader==1.9.76
 # Timezone handling (CRITICAL on Windows)
 tzdata==2024.1
 
+# Excel output (used by excel_report.py and the GUI's "Build Excel workbook")
+openpyxl==3.1.5
+
 # Data visualization (optional)
 matplotlib==3.8.3
 seaborn==0.13.1

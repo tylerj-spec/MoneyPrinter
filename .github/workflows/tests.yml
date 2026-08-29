@@ -19,5 +19,22 @@ jobs:
       # is stdlib-only by design (see run_all.py). yfinance/requests are only
       # needed for the live data-fetch path (fetch_data.py), which this
       # workflow does not exercise - it stays offline and deterministic.
+      # The Excel and GUI suites skip the parts needing openpyxl/tkinter
+      # rather than failing, so this job stays dependency-free. The excel
+      # job below covers what they skip here.
       - name: Run the test suite
-        run: python claude/app/mp_v01/run_all.py
+        run: python run_tests.py
+
+  excel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Only openpyxl. Still offline and deterministic - the export reads the
+      # point-in-time store from disk and never touches the network.
+      - name: Install the Excel writer
+        run: pip install openpyxl
+      - name: Run the Excel export suite
+        run: python tests/test_excel_report.py
