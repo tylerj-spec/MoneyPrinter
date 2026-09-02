@@ -4,7 +4,7 @@
 **Reviewer:** Claude (adversarial review pass, second)
 **Scope:** whole repository at commit `af1a059` — 4,595 lines of Python
 **Prior review:** `CODE_REVIEW_2026-08-13.md`
-**Method:** ten of the eleven findings below were reproduced by executing code, and each carries the actual output. Only **3.1** is reported from reading alone; it is marked **[VERIFY]** because confirming it needs a live fetch from Yahoo, which the review environment's network policy blocks.
+**Method:** all eleven findings below were reproduced by executing code, and each carries the actual output. **3.1** was resolved on 2026-09-02 by a live fetch on Tyler's machine after the review environment's network policy blocked Yahoo; the assumption it questioned holds, and the finding is downgraded rather than closed — see below.
 
 ---
 
@@ -154,16 +154,31 @@ distinct feature inputs ever passed: 1
 
 ## 3. Medium and low severity
 
-### 3.1 Split adjustment is an undocumented, untested assumption **[VERIFY]**
-`src/adapters/yahoo_daily.py` — `fetch_daily_bars_yfinance()`, `daily_total_return()`
+### 3.1 Split adjustment was an undocumented assumption — now verified, still untested
+`src/adapters/yahoo_daily.py` — `daily_total_return()`
 
-The module argues carefully for `auto_adjust=False` and raw closes plus cash dividends, because vendor-adjusted series get silently restated. That reasoning covers **dividends**. It never mentions **splits**, and `daily_total_return()` has no split term.
+**Status: the assumption holds.** Severity downgraded from Medium; the finding stays open on the narrower ground below.
 
-The code is only correct if Yahoo's unadjusted `Close` is nonetheless split-adjusted — which it historically is. That is a load-bearing assumption about a third-party scraper this repository elsewhere describes as breaking regularly, and it is written down nowhere. If it is ever false, a 4:1 split injects a fabricated −75% daily return, and the label contract will faithfully score it as a real catastrophic move.
+The module argues carefully for `auto_adjust=False` and raw closes plus cash dividends, because vendor-adjusted series get silently restated. That reasoning covers **dividends**. It never mentioned **splits**, and `daily_total_return()` has no split term. The code is correct only if Yahoo's unadjusted `Close` is nonetheless split-adjusted.
 
-Not verifiable without network access.
+**Verified 2026-09-02** on Tyler's machine, live fetch with yfinance 1.7.0, against NVDA's 10-for-1 split effective 2024-06-10:
 
-**Fix:** one fetch across a known split (NVDA 2024-06-10, AAPL 2020-08-31). Then add a sanity assertion in `normalize_bars` that marks an implausible single-day move `UNKNOWN` rather than trusting it, and state the assumption in the docstring next to the dividend argument.
+```
+daily_total_return for 2024-06-10 : +0.7461%
+independently reported             : ~0.75%
+had Close been genuinely raw       : ~ -90%
+```
+
+So Yahoo's `Close` is split-adjusted and dividend-unadjusted, which is exactly what this module needs. The assumption is now recorded in the `daily_total_return()` docstring with this evidence.
+
+**What remains.** Documenting an assumption is not testing it. This is still a property of a third-party scraper the repository elsewhere describes as breaking regularly, and if a future change makes `Close` genuinely raw, every split in the history becomes a fabricated ~−90% move that the label contract will faithfully score as real. Nothing in the pipeline would complain.
+
+**Remaining fix — a judgment call, deliberately not made unilaterally.** Two options, with a real tradeoff:
+
+- **Magnitude threshold** in `normalize_bars`: flag any single-day move beyond some bound as `UNKNOWN`. Simple, offline-testable, but blunt — a genuine −40% earnings collapse is a real observation and marking it `UNKNOWN` silently deletes exactly the tail events that matter most to a risk model.
+- **Split cross-check**: fetch `yf.Ticker(t).splits` alongside the dividends this adapter already fetches, and assert no return straddling a split date matches the unadjusted price ratio. Precise, no false positives on real crashes, but it lives in the live-fetch path and cannot be tested offline.
+
+The second is better and is what the hazard actually calls for. It needs a decision about where the threshold sits and a machine with network access to develop against.
 
 ### 3.2 `src/strategy/` is an empty package
 `src/strategy/__init__.py` — 0 lines
@@ -205,7 +220,9 @@ mp_v01/requirements.txt      : yfinance>=0.2.40
 0.2.32 satisfies '>=0.2.40'  : False
 ```
 
-Compounding it: `0.2.32` predates several Yahoo endpoint changes, so the pinned version is a poor candidate for actually working against Yahoo today. Current pip resolves `yfinance` to 1.7.0 — five minor versions past either pin, with a changed `auto_adjust` default, which `yahoo_daily.py` sets explicitly and so survives.
+Compounding it: `0.2.32` predates several Yahoo endpoint changes, so the pinned version is a poor candidate for actually working against Yahoo today. Current pip resolves `yfinance` to **1.7.0** — five minor versions past either pin, with a changed `auto_adjust` default, which `yahoo_daily.py` sets explicitly and so survives.
+
+**Update 2026-09-02:** yfinance 1.7.0 was confirmed working end-to-end on Windows — a live fetch of SPY/QQQ/MSFT/NVDA produced correct bars, and the split check in §3.1 passed against it. So the working version is 1.7.0 and **both pins are wrong**, not just contradictory. Pin both files to a version that has actually fetched.
 
 **Fix:** pick one version, verify it fetches, and pin it in both files — or better, have the root file defer to the package's own requirements rather than restating them. Whichever version wins needs a real fetch behind it before the pin means anything.
 
@@ -230,7 +247,7 @@ Recorded because the findings above are only worth acting on if the foundation i
 1. **Fix the null first (§2.2).** Every result the project will ever produce is read on this instrument. Nothing downstream means anything until it is calibrated.
 2. **Write the failing purge test, then fix the purge (§2.1).** Construct a split spanning Thanksgiving week and assert it is rejected. It will fail, and so will the existing `purge_gap_prevents_label_horizon_bleed`. Do not fix the code first — you want to see both tests fail.
 3. **Close the three fail-closed holes (§1.1, §1.2, §1.3).** A set instead of a dict in the store, `is_usable()` consulting the imputation flag, a type check in `need()`. Small, independent, each with an obvious regression test.
-4. **Verify the split assumption (§3.1).** One fetch, one assertion, one docstring sentence.
+4. **Decide the split guard (§3.1).** The assumption is verified and documented; what remains is choosing between a magnitude threshold and a split cross-check, and pinning `yfinance` to the version that actually fetched (§3.5).
 5. **Then start Phase 3.** Running a deliberately worthless strategy on real bars before step 1 would tell you nothing — a null that cannot price overfitting cannot certify a null result either.
 
 ---

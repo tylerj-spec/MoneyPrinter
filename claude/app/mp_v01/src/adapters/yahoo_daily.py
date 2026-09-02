@@ -64,6 +64,23 @@ def daily_total_return(close_prev: float, close: float, dividend: float = 0.0) -
     closes. Adjusted-close series are silently rewritten whenever a vendor
     restates adjustment factors, which retroactively changes historical
     features - exactly the silent-revision class the project prohibits.
+
+    SPLITS - a load-bearing assumption, stated here because it was previously
+    only implied. There is no split term in this formula. It is correct only
+    because Yahoo's `Close` under auto_adjust=False is nonetheless adjusted for
+    splits (it is unadjusted for DIVIDENDS, which is the part we want, and which
+    is why the dividend is added back explicitly above).
+
+    Verified 2026-09-02 against NVDA's 10-for-1 split effective 2024-06-10,
+    fetched live with yfinance 1.7.0: this function returned +0.7461% for that
+    session, matching the ~0.75% reported independently. Had `Close` been
+    genuinely unadjusted, the same session would have produced roughly -90%,
+    and the label contract would have scored a fabricated crash as a real one.
+
+    This is an assumption about a third-party scraper, not a guarantee. If a
+    future Yahoo or yfinance change makes `Close` truly raw, every split in the
+    history becomes a fake catastrophic move and NOTHING here will complain.
+    Re-verify against a known split after any yfinance upgrade.
     """
     if close_prev <= 0:
         raise ValueError(f"Non-positive prior close {close_prev}")
