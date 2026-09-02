@@ -34,6 +34,7 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ├── tests/                         Tests for the Excel export and the GUI
 ├── excel_out/                     Generated workbooks (gitignored)
 ├── CODE_REVIEW_2026-08-13.md      Complete accounting of MIE issues and remediation
+├── CODE_REVIEW_2026-09-02.md      Follow-up review; 3 new blocking bugs in mp_v01
 ├── claude/                        Claude's work: architecture, orchestration, review
 │   ├── app/mp_v01/                The core codebase (PRODUCTION STANDARD)
 │   ├── market_research/           Data source licensing analysis
