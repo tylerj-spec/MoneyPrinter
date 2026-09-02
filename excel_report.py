@@ -541,7 +541,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not data["benchmark_present"]:
         print(f"\n  WARNING: {BENCHMARK} is not in the store. Excess return vs {BENCHMARK}")
-        print(f"  is undefined without it, so no labels were built for the other tickers.")
+        print("  is undefined without it, so no labels were built for the other tickers.")
         print(f"  Nothing was substituted. Re-fetch including {BENCHMARK}.")
 
     out_path = Path(a.out).expanduser() if a.out else default_out_path(DEFAULT_OUT_DIR)
