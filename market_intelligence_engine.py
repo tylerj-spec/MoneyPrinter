@@ -15,20 +15,14 @@ For forward paper trading: use claude/app/mp_v01/fetch_data.py + gates/risk.py
 """
 
 import argparse
-import os
-import sys
 import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from pathlib import Path
 
 import pandas as pd
 import numpy as np
-import requests
-from bs4 import BeautifulSoup
 import yfinance as yf
-from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 
 # Configure logging
@@ -412,16 +406,13 @@ class PredictionEngine:
             logger.warning(f"NaN in features for {ticker}. Abstaining (HOLD).")
             return {'ticker': ticker, 'prediction': 'HOLD', 'confidence': 0.5}
         
-        prediction = self.model.predict(features)[0]
         probability = self.model.predict_proba(features)[0]
-        
-        # FIX #2.6: Can't emit SELL from binary upside label
-        if probability[1] > 0.65:
-            signal = 'BUY'
-        elif probability[1] > 0.55:
-            signal = 'BUY'
-        else:
-            signal = 'HOLD'  # No SELL
+
+        # FIX #2.6: Can't emit SELL from binary upside label.
+        # One threshold, not two. The 0.65 arm also returned BUY, so it never
+        # changed the outcome - it only read as graded confidence. The model's
+        # own .predict() was called here and discarded; removed with it.
+        signal = 'BUY' if probability[1] > 0.55 else 'HOLD'
         
         return {
             'ticker': ticker,

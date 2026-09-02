@@ -1,7 +1,10 @@
 # Optional. The test suite (run_all.py) needs nothing beyond the Python
 # standard library on Linux/macOS - these are only needed to pull LIVE
 # market data via fetch_data.py.
-yfinance>=0.2.40
+# Pinned, not floored, and kept identical to the root requirements.txt. These
+# two files previously disagreed (==0.2.32 here vs >=0.2.40) and pip resolved it
+# silently by install order. Verified 2026-09-02.
+yfinance==1.7.0
 requests>=2.31
 
 # zoneinfo (stdlib since Python 3.9) needs an IANA timezone database.

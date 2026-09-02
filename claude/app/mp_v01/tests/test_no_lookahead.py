@@ -103,6 +103,37 @@ def original_vintage_is_preserved_not_overwritten():
 
 
 @test
+def two_revisions_of_one_record_are_rejected_not_silently_both_current():
+    """The old store kept _superseded_by as one entry per superseded id, so a
+    second revision overwrote the first. Nothing then marked the first revision
+    superseded, and as_of() returned BOTH as current - which inflates
+    independent_information_events() and, through it, the evidence gate. One
+    macro print read as two independent confirmations."""
+    s = PointInTimeStore()
+    s.add(rec("v1", "2026-03-01T13:30:00Z", value=2.0, cluster="g"))
+    s.add(rec("v2", "2026-03-25T13:30:00Z", value=3.4, cluster="g", supersedes="v1"))
+    assert_raises(ValueError, s.add,
+                  rec("v3", "2026-04-30T13:30:00Z", value=3.9, cluster="g", supersedes="v1"))
+    # Chaining the revision properly is still accepted, and still collapses to one.
+    s.add(rec("v3", "2026-04-30T13:30:00Z", value=3.9, cluster="g", supersedes="v2"))
+    current = s.as_of("2026-05-15T00:00:00Z")
+    assert len(current) == 1, [r.record_id for r in current]
+    assert current[0].numeric_value == 3.9
+
+@test
+def a_chained_revision_still_returns_the_vintage_live_at_the_time():
+    """Rejecting the ambiguous case must not break honest revision chains."""
+    s = PointInTimeStore()
+    s.add(rec("v1", "2026-03-01T13:30:00Z", value=2.0, cluster="g"))
+    s.add(rec("v2", "2026-03-25T13:30:00Z", value=3.4, cluster="g", supersedes="v1"))
+    s.add(rec("v3", "2026-04-30T13:30:00Z", value=3.9, cluster="g", supersedes="v2"))
+    for when, expected in (("2026-03-10T00:00:00Z", 2.0),
+                           ("2026-04-01T00:00:00Z", 3.4),
+                           ("2026-05-01T00:00:00Z", 3.9)):
+        got = s.as_of(when)
+        assert len(got) == 1 and got[0].numeric_value == expected, (when, got)
+
+@test
 def revision_cannot_predate_what_it_supersedes():
     s = PointInTimeStore()
     s.add(rec("v1", "2026-03-28T13:30:00Z", value=2.0))

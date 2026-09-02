@@ -151,6 +151,30 @@ def exact_zero_edge_is_not_good_enough():
     assert "no_edge_after_costs" in r.failed_gates
 
 @test
+def a_non_numeric_field_fails_closed_instead_of_raising():
+    """A candidate from JSON, a model or a spreadsheet can carry "35" for 35.
+    Comparing that to a threshold raised TypeError, and an exception is not a
+    decision - the caller then crashes or catches broadly, and a broad catch
+    around a risk gate is how PASS quietly becomes "skipped"."""
+    for field, bad in (("dte", "35"), ("evidence_confidence", "0.8"),
+                       ("open_interest", None if False else "2500"),
+                       ("position_pct", "0.015")):
+        c = _good()
+        c[field] = bad
+        r = evaluate(c)
+        assert r.decision is Decision.PASS, (field, r.decision)
+        assert f"invalid_type:{field}" in r.failed_gates, (field, r.failed_gates)
+
+@test
+def booleans_are_not_accepted_as_numbers():
+    """bool subclasses int, so True would slide through a naive isinstance
+    check and compare as 1 against every threshold."""
+    c = _good(); c["dte"] = True
+    r = evaluate(c)
+    assert r.decision is Decision.PASS
+    assert "invalid_type:dte" in r.failed_gates, r.failed_gates
+
+@test
 def nan_edge_does_not_silently_pass():
     """NaN comparisons are always False - an unguarded NaN edge would slide
     past `edge <= 0` and reach PAPER_TRADE_CANDIDATE. Must fail closed instead."""

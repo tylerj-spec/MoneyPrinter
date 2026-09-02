@@ -52,6 +52,16 @@ class Label:
     delisting_return_imputed: bool = False
 
     def is_usable(self) -> bool:
+        """Safe to train or score against.
+
+        An imputed delisting return is excluded. When DLRET is unavailable the
+        contract assumes a total loss and flags it - but the status is still set
+        to OK, so without this check an ASSUMPTION enters the training set
+        indistinguishable from an observation. Everywhere else in this module an
+        unresolved condition yields y=None; this keeps that promise.
+        """
+        if self.delisting_return_imputed:
+            return False
         return self.status == LabelStatus.OK and self.y is not None
 
 
