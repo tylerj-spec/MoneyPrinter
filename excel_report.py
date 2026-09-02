@@ -313,6 +313,22 @@ def _finish(ws, columns, n_rows: int) -> None:
             ws[f"{letter}{row}"].number_format = fmt
 
 
+def _text_cell(ws, row: int, col: int, value: Any):
+    """Write a value Excel must treat as text, never as a formula.
+
+    openpyxl infers a formula from a leading "=", so a documentation line that
+    happens to start with one is written as a formula. Excel then cannot parse
+    the prose that follows, strips it on open, and reports "Removed Records:
+    Formula from /xl/worksheets/sheetN.xml part" — which reads like data loss
+    and is not. Prose is never a formula; say so explicitly.
+    """
+    cell = ws.cell(row=row, column=col)
+    cell.value = value
+    if isinstance(value, str) and value.startswith("="):
+        cell.data_type = "s"
+    return cell
+
+
 def _write_readme(ws, data: dict[str, Any]) -> None:
     from openpyxl.styles import Alignment, Font
 
@@ -402,8 +418,8 @@ def _write_readme(ws, data: dict[str, Any]) -> None:
     bold = Font(bold=True)
     wrap = Alignment(vertical="top", wrap_text=True)
     for r, (left, right) in enumerate(lines, start=1):
-        a = ws.cell(row=r, column=1, value=left)
-        b = ws.cell(row=r, column=2, value=right)
+        a = _text_cell(ws, r, 1, left)
+        b = _text_cell(ws, r, 2, right)
         a.alignment = wrap
         b.alignment = wrap
         if left and not right:
@@ -416,15 +432,15 @@ def _write_summary(ws, summaries: list[dict[str, Any]]) -> None:
     _write_header(ws, SUMMARY_COLUMNS)
     for r, row in enumerate(summaries, start=2):
         for c, (name, _w, _f) in enumerate(SUMMARY_COLUMNS, start=1):
-            ws.cell(row=r, column=c, value=row.get(name))
+            _text_cell(ws, r, c, row.get(name))
     _finish(ws, SUMMARY_COLUMNS, len(summaries))
 
 
 def _write_bars(ws, rows: list[dict[str, Any]]) -> None:
     _write_header(ws, BAR_COLUMNS)
     for r, row in enumerate(rows, start=2):
-        ws.cell(row=r, column=1, value=_as_date(row.get("date")))
-        ws.cell(row=r, column=2, value=row.get("status", "UNKNOWN"))
+        _text_cell(ws, r, 1, _as_date(row.get("date")))
+        _text_cell(ws, r, 2, row.get("status", "UNKNOWN"))
         ws.cell(row=r, column=3, value=row.get("open"))
         ws.cell(row=r, column=4, value=row.get("high"))
         ws.cell(row=r, column=5, value=row.get("low"))
@@ -442,8 +458,8 @@ def _write_bars(ws, rows: list[dict[str, Any]]) -> None:
         if r >= 51:
             ws.cell(row=r, column=11,
                     value=f'=IF(COUNT(F{r-49}:F{r})<50,"",AVERAGE(F{r-49}:F{r}))')
-        ws.cell(row=r, column=13, value=row.get("available_time"))
-        ws.cell(row=r, column=14, value=row.get("event_time"))
+        _text_cell(ws, r, 13, row.get("available_time"))
+        _text_cell(ws, r, 14, row.get("event_time"))
     _finish(ws, BAR_COLUMNS, len(rows))
 
 
@@ -457,7 +473,7 @@ def _write_labels(ws, labels: list[dict[str, Any]]) -> None:
         ws.cell(row=r, column=5, value=row["y"])
         ws.cell(row=r, column=6, value=row["excess_log_return"])
         ws.cell(row=r, column=7, value=f'=IF(F{r}="","",EXP(F{r})-1)')
-        ws.cell(row=r, column=8, value=row["status"])
+        _text_cell(ws, r, 8, row["status"])
         ws.cell(row=r, column=9, value=bool(row["usable"]))
         ws.cell(row=r, column=10, value=row["benchmark"])
         ws.cell(row=r, column=11, value=row["contract_version"])

@@ -318,6 +318,59 @@ def label_sheet_carries_a_percent_formula_off_the_log_return():
 
 
 @test
+def only_the_sheets_meant_to_have_formulas_have_them():
+    """Excel reported: "Removed Records: Formula from /xl/worksheets/sheet1.xml".
+
+    sheet1 is README, which has no formulas by design — but one documentation
+    line began with "=" (explaining the excess_return_pct column), so openpyxl
+    wrote the sentence as a formula. Excel could not parse prose as a formula,
+    stripped it on open, and reported what looks like data loss. The data was
+    never involved.
+
+    The invariant is not "README has no formulas" but the stronger one below:
+    a formula cell may exist only where this exporter deliberately writes one.
+    """
+    if not HAVE_OPENPYXL:
+        print("        (skipped: openpyxl not installed)")
+        return
+    import re
+    import zipfile
+
+    # Long enough that the trailing-window formulas actually appear; they start
+    # at row 21 by design, so the 15-row WEEKDAYS fixture would produce none.
+    long_dates = [f"2024-{m:02d}-{d:02d}" for m in (1, 2, 3) for d in range(1, 29)]
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        write_store(tmp, "SPY", long_dates, daily=0.0)
+        write_store(tmp, "MSFT", long_dates, daily=0.01)
+        data = ex.collect(tmp)
+        out = ex.write_workbook(data, tmp / "book.xlsx")
+
+        wb = openpyxl.load_workbook(out)
+        allowed = {"Labels"} | {n for n in wb.sheetnames if n.startswith("Bars_")}
+        for name in wb.sheetnames:
+            found = [c.coordinate for row in wb[name].iter_rows() for c in row
+                     if c.data_type == "f"]
+            if name in allowed:
+                assert found, f"{name} should carry retunable formulas, has none"
+            else:
+                assert not found, f"{name} has unintended formula cells: {found[:5]}"
+
+        # And at the XML level, which is what Excel actually parses.
+        z = zipfile.ZipFile(out)
+        readme_part = z.read("xl/worksheets/sheet1.xml").decode()
+        assert "<f>" not in readme_part, "README part still contains a formula record"
+
+        # The line that caused it must survive intact as readable text.
+        text = "\n".join(str(c.value) for row in wb["README"].iter_rows()
+                          for c in row if c.value)
+        assert "EXP(excess_log_return)-1" in text, "the explanatory line was lost"
+    finally:
+        shutil.rmtree(tmp)
+
+
+@test
 def missing_benchmark_is_written_into_the_readme_not_just_stderr():
     if not HAVE_OPENPYXL:
         print("        (skipped: openpyxl not installed)")
