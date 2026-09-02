@@ -4,7 +4,7 @@
 **Reviewer:** Claude (adversarial review pass, second)
 **Scope:** whole repository at commit `af1a059` — 4,595 lines of Python
 **Prior review:** `CODE_REVIEW_2026-08-13.md`
-**Method:** nine of the ten findings below were reproduced by executing code, and each carries the actual output. Only **3.1** is reported from reading alone; it is marked **[VERIFY]** because confirming it needs a live network call the review environment could not make.
+**Method:** ten of the eleven findings below were reproduced by executing code, and each carries the actual output. Only **3.1** is reported from reading alone; it is marked **[VERIFY]** because confirming it needs a live fetch from Yahoo, which the review environment's network policy blocks.
 
 ---
 
@@ -190,6 +190,24 @@ On the same lines, `prediction = self.model.predict(features)[0]` is computed an
 `market_intelligence_engine.py` lines 18–31
 
 `os`, `sys`, `Path`, `requests`, `BeautifulSoup` and `StandardScaler` are imported and never used. The last three matter: the module cannot be imported without `requests`, `beautifulsoup4` and `scikit-learn` installed, and uses none of them. `bs4` is a leftover from before the scraper became synthetic.
+
+### 3.5 The two requirements files contradict each other on `yfinance`
+
+`requirements.txt` pins `yfinance==0.2.32`. `claude/app/mp_v01/requirements.txt` requires `yfinance>=0.2.40`. **0.2.32 does not satisfy >=0.2.40.** A fresh install that follows the root file produces an environment the pipeline's own requirements declare unsupported, and pip resolves it silently by whichever file was installed last.
+
+This is worse than an ordinary version skew because the root file's comment states the intent explicitly — *"PINNED - yfinance breaks regularly on scraper changes"* — so a reader has every reason to trust the pin. It pins to a version the package it serves rejects.
+
+**Reproduced:**
+
+```
+root requirements.txt        : yfinance==0.2.32
+mp_v01/requirements.txt      : yfinance>=0.2.40
+0.2.32 satisfies '>=0.2.40'  : False
+```
+
+Compounding it: `0.2.32` predates several Yahoo endpoint changes, so the pinned version is a poor candidate for actually working against Yahoo today. Current pip resolves `yfinance` to 1.7.0 — five minor versions past either pin, with a changed `auto_adjust` default, which `yahoo_daily.py` sets explicitly and so survives.
+
+**Fix:** pick one version, verify it fetches, and pin it in both files — or better, have the root file defer to the package's own requirements rather than restating them. Whichever version wins needs a real fetch behind it before the pin means anything.
 
 ---
 
