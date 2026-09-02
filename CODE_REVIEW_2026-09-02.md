@@ -10,6 +10,8 @@
 
 ## 0. Headline
 
+> **Status 2026-09-02.** Six of the eleven findings are fixed (§1.1, §1.2, §1.3, §3.3, §3.4, §3.5) and §3.1 is verified. The two that remain — §2.1 and §2.2, both inherited from the previous review — are architectural, and are deliberately left for a session with the attention they deserve: each changes a public interface, and getting either wrong costs more than leaving it documented and visible.
+
 The 2026-08-13 review was accurate. Three weeks later, its three blocking findings are **still live in `main`** (§2 below). That is the single most important fact in this document: the problem is not that these defects are unknown, it is that knowing about them has not yet changed the code.
 
 Three further defects were found that the prior review did not cover (§1). All three sit in `mp_v01/` — the system of record, the careful one — and all three fail in the same direction: **toward more apparent evidence, more apparent data, and fewer refusals.** That is the expensive direction for a project whose stated default is abstention.
@@ -18,11 +20,11 @@ One new detail sharpens §1.1 of the prior review considerably: **the test suite
 
 ---
 
-## 1. New blocking bugs
+## 1. New blocking bugs — ALL THREE FIXED 2026-09-02
 
-Not covered by the 2026-08-13 review. All three are in `claude/app/mp_v01/`.
+Not covered by the 2026-08-13 review. All three were in `claude/app/mp_v01/`, and all three are now fixed with regression tests verified to fail without their fix. The descriptions are kept in full: the reasoning is the durable part.
 
-### 1.1 Two revisions of one record both survive `as_of()`
+### 1.1 Two revisions of one record both survive `as_of()` — FIXED
 `src/pit/store.py` — `add()` / `as_of()`
 
 `add()` tracks supersession in a plain dict:
@@ -48,9 +50,9 @@ records returned as_of day+5: [('v1', 2.0), ('v2', 3.0)]
 expected exactly one current vintage; got 2
 ```
 
-**Fix:** make `_superseded_by` hold a set and skip a record if *any* superseding revision is available at `t`; or reject a second supersession of an already-superseded record at `add()` time. The second is more in keeping with the rest of the module, which prefers loud rejection over quiet accommodation. Add a regression test with a three-vintage chain and a two-revisions-of-one-original case.
+**Fixed 2026-09-02** by rejecting a second supersession of an already-superseded record at `add()` time, with an error naming the record to chain from. A set would not have been enough: it stops the original being returned, but leaves two sibling revisions both current and neither superseded. Resolving that by guessing (say, latest `available_time` wins) would be inference; rejecting it is not. Two regression tests, both verified to fail without the fix: the ambiguous case raises, and an honest three-vintage chain still returns the vintage live at each decision time.
 
-### 1.2 An assumed −100% delisting return is labelled `OK` and marked usable
+### 1.2 An assumed −100% delisting return is labelled `OK` and marked usable — FIXED
 `src/labels/contract.py` — `build_label()`
 
 When a delisting has no `DLRET`, the contract appends `-1.0` — a total loss it did not observe — and correctly sets `delisting_return_imputed=True`. It then overwrites the status back to `OK`:
@@ -73,9 +75,9 @@ status=OK   y=0   excess=-inf
 imputed=True   is_usable()=True
 ```
 
-**Fix:** either return a distinct status so the imputation is filterable, or have `is_usable()` consult `delisting_return_imputed`. The second is a one-line change and matches the module's existing posture.
+**Fixed 2026-09-02** by having `is_usable()` consult `delisting_return_imputed`. The flag was already set and simply unread. A delisting carrying a real DLRET is an observation and stays usable; only the assumed total loss is excluded.
 
-### 1.3 The risk gate raises instead of failing closed
+### 1.3 The risk gate raises instead of failing closed — FIXED
 `src/gates/risk.py` — `need()` and the threshold comparisons
 
 `need()` handles `None` and NaN carefully — the NaN guard is genuinely good, with a comment explaining that an unguarded NaN slides past every threshold, and there is a test for it. It does **not** handle a value of the wrong type.
@@ -92,7 +94,7 @@ candidate = dict(..., dte="35", ...)   # everything else valid
 RAISED TypeError: '<=' not supported between instances of 'int' and 'str'
 ```
 
-**Fix:** extend `need()` to reject non-numerics the way it rejects NaN — append `invalid_type:{key}` to `failed`, which already routes to `PASS`. Roughly four lines, and it closes the last hole in an otherwise well-built gate.
+**Fixed 2026-09-02** by rejecting non-numerics the way NaN is rejected: `invalid_type:{key}` into `failed`, which routes to `PASS`. Applied to `need()` and to the three optional sizing fields. `bool` is excluded explicitly — it subclasses `int`, so `True` would otherwise compare as 1 against every threshold.
 
 ---
 
@@ -187,7 +189,7 @@ Every other package under `src/` is substantive. This one is empty, and roadmap 
 
 Not a bug. Named because it is the actual blocker between "the machinery is verified" and "Phase 3 can start", and an empty directory appears on no status report.
 
-### 3.3 Dead branch: both confidence thresholds return `BUY`
+### 3.3 Dead branch: both confidence thresholds return `BUY` — FIXED
 `market_intelligence_engine.py` — `PredictionEngine.predict()`
 
 ```python
@@ -201,12 +203,12 @@ The arms are identical, so the 0.65 threshold does nothing and the rule is simpl
 
 On the same lines, `prediction = self.model.predict(features)[0]` is computed and discarded.
 
-### 3.4 Six unused imports, three of them heavy
+### 3.4 Six unused imports, three of them heavy — FIXED
 `market_intelligence_engine.py` lines 18–31
 
 `os`, `sys`, `Path`, `requests`, `BeautifulSoup` and `StandardScaler` are imported and never used. The last three matter: the module cannot be imported without `requests`, `beautifulsoup4` and `scikit-learn` installed, and uses none of them. `bs4` is a leftover from before the scraper became synthetic.
 
-### 3.5 The two requirements files contradict each other on `yfinance`
+### 3.5 The two requirements files contradict each other on `yfinance` — FIXED
 
 `requirements.txt` pins `yfinance==0.2.32`. `claude/app/mp_v01/requirements.txt` requires `yfinance>=0.2.40`. **0.2.32 does not satisfy >=0.2.40.** A fresh install that follows the root file produces an environment the pipeline's own requirements declare unsupported, and pip resolves it silently by whichever file was installed last.
 
@@ -246,7 +248,7 @@ Recorded because the findings above are only worth acting on if the foundation i
 
 1. **Fix the null first (§2.2).** Every result the project will ever produce is read on this instrument. Nothing downstream means anything until it is calibrated.
 2. **Write the failing purge test, then fix the purge (§2.1).** Construct a split spanning Thanksgiving week and assert it is rejected. It will fail, and so will the existing `purge_gap_prevents_label_horizon_bleed`. Do not fix the code first — you want to see both tests fail.
-3. **Close the three fail-closed holes (§1.1, §1.2, §1.3).** A set instead of a dict in the store, `is_usable()` consulting the imputation flag, a type check in `need()`. Small, independent, each with an obvious regression test.
+3. ~~**Close the three fail-closed holes (§1.1, §1.2, §1.3).**~~ **Done 2026-09-02**, along with §3.3, §3.4 and §3.5. Core suite 76 → 81 tests; 105 across the repo.
 4. **Decide the split guard (§3.1).** The assumption is verified and documented; what remains is choosing between a magnitude threshold and a split cross-check, and pinning `yfinance` to the version that actually fetched (§3.5).
 5. **Then start Phase 3.** Running a deliberately worthless strategy on real bars before step 1 would tell you nothing — a null that cannot price overfitting cannot certify a null result either.
 

@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-99 tests passing (`python run_tests.py`): 76 in `claude/app/mp_v01/`, 23 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+105 tests passing (`python run_tests.py`): 81 in `claude/app/mp_v01/`, 24 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
@@ -34,7 +34,7 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ├── tests/                         Tests for the Excel export and the GUI
 ├── excel_out/                     Generated workbooks (gitignored)
 ├── CODE_REVIEW_2026-08-13.md      Complete accounting of MIE issues and remediation
-├── CODE_REVIEW_2026-09-02.md      Follow-up review; 3 new blocking bugs in mp_v01
+├── CODE_REVIEW_2026-09-02.md      Follow-up review; 6 of 11 findings now fixed
 ├── claude/                        Claude's work: architecture, orchestration, review
 │   ├── app/mp_v01/                The core codebase (PRODUCTION STANDARD)
 │   ├── market_research/           Data source licensing analysis
@@ -111,10 +111,10 @@ echoed into the console, so anything the GUI does you can also do from a termina
 
 **Command line**:
 ```bash
-python run_tests.py        # every suite: pipeline, Excel export, GUI (99 tests)
+python run_tests.py        # every suite: pipeline, Excel export, GUI (105 tests)
 
 cd claude/app/mp_v01
-python run_all.py          # just the zero-dependency pipeline suite (76 tests)
+python run_all.py          # just the zero-dependency pipeline suite (81 tests)
 
 pip install yfinance
 python fetch_data.py --tickers SPY,QQQ,MSFT --chains
@@ -273,4 +273,4 @@ Write these numbers down **now** and put in STATE.md:
 ---
 
 **Last Updated**: August 29, 2026  
-**Version**: 2.2.0 (Excel export, rebuilt GUI, 99 tests)
+**Version**: 2.3.0 (Excel export, rebuilt GUI, six review findings fixed, 105 tests)
