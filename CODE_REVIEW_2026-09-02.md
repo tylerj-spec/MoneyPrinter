@@ -200,12 +200,16 @@ So Yahoo's `Close` is split-adjusted and dividend-unadjusted, which is exactly w
 
 The second is better and is what the hazard actually calls for. It needs a decision about where the threshold sits and a machine with network access to develop against.
 
-### 3.2 `src/strategy/` is an empty package
-`src/strategy/__init__.py` — 0 lines
+### 3.2 `src/strategy/` is an empty package — FIXED 2026-09-03
+`src/strategy/__init__.py` — was 0 lines
 
 Every other package under `src/` is substantive. This one is empty, and roadmap Phases 3 through 5 — null run on real bars, component rank IC, post-cost gate — all assume something lives here to be evaluated. The pipeline can measure a strategy but has nowhere to define one, which is why the demos pass functions inline.
 
-Not a bug. Named because it is the actual blocker between "the machinery is verified" and "Phase 3 can start", and an empty directory appears on no status report.
+Not a bug. Named because it was the actual blocker between "the machinery is verified" and "Phase 3 can start", and an empty directory appears on no status report.
+
+**Filled 2026-09-03** with `components.py` (point-in-time score components), `variants.py` (five named weight sets, including a deliberately contradictory reversion tilt and a naive equal-weight control), and `picks.py` (contract selection, pre-registered exit policy, generated rationale, and a SHA-256-frozen pick envelope). Driven by `generate_picks.py` and scored by a separate `resolve_picks.py`, which is the roadmap's Phase 6 shape: frozen hashed predictions, scored later by a program that cannot edit them.
+
+None of the components is validated — that remains Phase 4's job, and every pick says so on its face.
 
 ### 3.3 Dead branch: both confidence thresholds return `BUY` — FIXED
 `market_intelligence_engine.py` — `PredictionEngine.predict()`

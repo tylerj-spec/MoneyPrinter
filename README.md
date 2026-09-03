@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-132 tests passing (`python run_tests.py`): 102 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+148 tests passing (`python run_tests.py`): 118 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
@@ -28,6 +28,9 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ├── market_intelligence_engine.py  DEVELOPMENT ONLY. See CODE_REVIEW_2026-08-13.md
 ├── requirements.txt               Python dependencies
 ├── gui.py                         Desktop GUI - fetch data, build the Excel workbook
+├── generate_picks.py              Frozen, hashed paper picks from the PIT store
+├── resolve_picks.py               Scores an earlier pick file against what happened
+├── picks/                         The forward paper record - COMMIT THESE
 ├── run_gui.bat                    Windows double-click launcher for the GUI
 ├── excel_report.py                Data store -> .xlsx (bars, labels, summary)
 ├── run_tests.py                   Runs every suite in the repo
@@ -111,10 +114,10 @@ echoed into the console, so anything the GUI does you can also do from a termina
 
 **Command line**:
 ```bash
-python run_tests.py        # every suite: pipeline, Excel export, GUI (132 tests)
+python run_tests.py        # every suite: pipeline, Excel export, GUI (148 tests)
 
 cd claude/app/mp_v01
-python run_all.py          # just the zero-dependency pipeline suite (102 tests)
+python run_all.py          # just the zero-dependency pipeline suite (118 tests)
 
 pip install yfinance
 python fetch_data.py --tickers SPY,QQQ,MSFT --chains
@@ -194,6 +197,66 @@ What that means for reading the sheet:
 sequencing in `yahoo_daily.py`, an options overlay cannot rescue a stock-level forecast with
 no demonstrated edge — and none has been demonstrated yet. See `CODE_REVIEW_2026-09-02.md`
 §2.2: the harness that would measure one currently cannot distinguish signal from noise.
+
+---
+
+## Paper picks — the forward record
+
+The roadmap's Phase 6, and the only genuinely out-of-sample evidence this project
+will produce. Requires a fetch **with chains**:
+
+```bash
+python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT --chains
+python generate_picks.py
+```
+
+Five weight variants run against the same snapshot — `momentum`, `trend_quality`,
+`reversion`, `balanced`, `equal_weight_control`. `reversion` deliberately
+contradicts the momentum variants: **if both look good in the forward record, the
+record is noise rather than two edges.** Every variant is logged on every run,
+including the ones that look bad. Quietly dropping a variant that underperformed
+turns the whole record into a selection artefact.
+
+Each proposal carries the contract, the Greeks, execution cost, the breakeven move
+needed just to cover costs, the risk gate's verdict, and a paragraph of rationale
+built from the numbers actually used. Abstentions are recorded with their reason,
+never dropped — "the strategy proposed nothing" and "the data was unusable" are
+different statements.
+
+### Exit rules are pre-registered
+
+Written into the file at generation time, before any outcome is known:
+
+| | |
+|---|---|
+| **Primary** | Mark to market after **5 trading days** and score the directional call. Matches the label contract horizon, so paper results stay comparable with what the model is scored against. |
+| **Secondary** | Close at **+50% / −50%** of premium. Path-dependent, recorded separately — a different question from whether the call was right. |
+| **Hard exit** | Close below **21 DTE**, whatever the P&L. Theta and gamma both accelerate there and the contract stops behaving like the one that was chosen. |
+
+Deciding when to close *after* watching the position is how a loser becomes "still
+developing." Changing these mid-flight invalidates the record.
+
+### Scoring it later
+
+```bash
+python resolve_picks.py picks/picks_2026-09-03_20260903-160000.json
+```
+
+The resolver re-hashes the picks before doing anything else. A mismatch means the
+file was edited after generation and it refuses to score — that check is the whole
+reason a forward log beats a backtest.
+
+Marks are **MARKET** where a later chain snapshot contains the exact contract, and
+**MODELLED** otherwise (Black-Scholes at the later close, assuming IV unchanged —
+the assumption most likely to be wrong after a real move). The two are reported
+separately and never mixed. Fetch daily with `--chains` and you get market marks.
+
+**None of this is gate-approved.** `gate_decision` reads `PASS` — do nothing — on
+every pick, because a chain snapshot plus an unvalidated component score contains
+no independent evidence count and no measured post-cost edge, and the gate fails
+closed on what it is not told. That is the loop working: the forward record is what
+will eventually *produce* the edge estimate the gate needs. The pre-registration
+above asks for **≥200 non-overlapping decisions** before any of it means anything.
 
 ---
 
@@ -309,4 +372,4 @@ Write these numbers down **now** and put in STATE.md:
 ---
 
 **Last Updated**: August 29, 2026  
-**Version**: 2.5.0 (Permutation null fixed, Options Greeks, Excel export, 132 tests)
+**Version**: 2.6.0 (Frozen paper picks, permutation null fixed, Options Greeks, 148 tests)
