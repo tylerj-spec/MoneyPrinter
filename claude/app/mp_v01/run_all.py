@@ -10,6 +10,7 @@ steps = [
     ("Backtest, cost and risk-gate tests", ["tests/test_backtest_and_gates.py"]),
     ("Label contract v1.0",                 ["tests/test_label_contract.py"]),
     ("Yahoo adapter + eval harness",        ["tests/test_adapter_and_eval.py"]),
+    ("Options: Black-Scholes, IV, Greeks",  ["tests/test_options_greeks.py"]),
     ("End-to-end demo (synthetic data)",   ["demo/run_demo.py"]),
     ("Noise-floor harness validation",     ["demo/run_noise_floor.py"]),
 ]

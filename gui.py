@@ -171,8 +171,9 @@ class MoneyPrinterGUI(tk.Tk):
 
         ttk.Label(
             box,
-            text=f"Keep {BENCHMARK} in the list. The label is excess return vs {BENCHMARK}, "
-                 f"so without it no labels can be built for anything else.",
+            text=f"Keep {BENCHMARK} in the list — the label is excess return vs {BENCHMARK}, "
+                 f"so without it no labels can be built for anything else.  Option chains add "
+                 f"the Greeks sheets; Yahoo does not publish Greeks, so they are computed.",
             foreground="#777777",
         ).pack(anchor=tk.W, pady=(6, 0))
 

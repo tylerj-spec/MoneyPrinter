@@ -51,6 +51,19 @@ from labels.contract import (  # noqa: E402
     LABEL_CONTRACT_VERSION,
     build_label,
 )
+from backtest.costs import CostModel  # noqa: E402
+from gates.risk import RiskLimits, evaluate as evaluate_gate  # noqa: E402
+from options.greeks import (  # noqa: E402
+    greeks as bs_greeks,
+    implied_volatility,
+    years_to_expiry,
+)
+
+# The risk-free rate is an ASSUMPTION, not something the bar store contains.
+# Override with --risk-free-rate. It moves the Greeks only slightly at short
+# tenors, but it is an input the reader is entitled to know the value of, so it
+# is printed on the README sheet rather than buried here.
+DEFAULT_RISK_FREE_RATE = 0.04
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +111,188 @@ def dated_rows(doc: dict[str, Any]) -> list[dict[str, Any]]:
     """
     rows = [r for r in doc.get("rows", []) if r.get("date")]
     return sorted(rows, key=lambda r: r["date"])
+
+
+# ---------------------------------------------------------------------------
+# Option chains
+# ---------------------------------------------------------------------------
+
+def find_chain_files(data_dir: Path) -> dict[str, Path]:
+    """Newest chain snapshot per underlying under <data_dir>/chains."""
+    chains_dir = data_dir / "chains"
+    if not chains_dir.is_dir():
+        return {}
+    newest: dict[str, tuple[str, Path]] = {}
+    for path in sorted(chains_dir.glob("*.json")):
+        head, sep, vintage = path.stem.partition("__v")
+        if not sep:
+            continue
+        ticker = head.split("_")[0].upper()
+        if ticker not in newest or vintage > newest[ticker][0]:
+            newest[ticker] = (vintage, path)
+    return {t: p for t, (_, p) in sorted(newest.items())}
+
+
+def underlying_as_of(rows: list[dict[str, Any]], snapshot_date: str):
+    """Last close AVAILABLE at the snapshot, with the date it came from.
+
+    Strictly before the snapshot date, not up to and including it. A daily bar
+    is not consumable at its own close (see yahoo_daily.BAR_AVAILABILITY_LAG_HOURS),
+    so a chain snapshotted during a session can only legitimately see the prior
+    session's close. Using today's close here would be exactly the one-day
+    lookahead the rest of this project exists to prevent - and it would flatter
+    every moneyness and delta in the sheet.
+
+    The cost is that Greeks are computed against a close that may be hours
+    stale. That is why the date is returned alongside and written into the
+    sheet: staleness you can see is not the same problem as staleness you can't.
+    """
+    best = None
+    for r in rows:
+        d = r.get("date")
+        if not d or d >= snapshot_date:
+            continue
+        if r.get("close") is not None:
+            if best is None or d > best[0]:
+                best = (d, float(r["close"]))
+    return best if best else (None, None)
+
+
+def trailing_dividend_yield(rows: list[dict[str, Any]], as_of_date: str) -> float:
+    """Trailing 12-month cash dividends over spot, from observed bars only.
+
+    Better than assuming zero for dividend payers, and it uses data already in
+    the store rather than a new source. It is still backward-looking: a cut or
+    raise inside the horizon is not anticipated.
+    """
+    from datetime import date as _date
+    try:
+        end = _date.fromisoformat(as_of_date[:10])
+    except (ValueError, TypeError):
+        return 0.0
+    start = end.replace(year=end.year - 1) if end.month != 2 or end.day != 29 else end.replace(year=end.year - 1, day=28)
+
+    total, spot = 0.0, None
+    for r in rows:
+        d = r.get("date")
+        if not d:
+            continue
+        try:
+            dd = _date.fromisoformat(d[:10])
+        except ValueError:
+            continue
+        if start <= dd < end:
+            total += float(r.get("dividend") or 0.0)
+        if dd < end and r.get("close") is not None:
+            spot = float(r["close"])
+    if not spot or spot <= 0 or total <= 0:
+        return 0.0
+    return total / spot
+
+
+def build_option_rows(
+    ticker: str,
+    chain_doc: dict[str, Any],
+    bar_rows: list[dict[str, Any]],
+    *,
+    risk_free_rate: float,
+    limits: RiskLimits,
+    costs: CostModel,
+) -> list[dict[str, Any]]:
+    """One row per contract: observed quote, solved IV, Greeks, and screens.
+
+    Fails closed at every step. A contract without a two-sided quote, without an
+    available underlying close, already expired, or whose mid implies no
+    volatility at all gets a model_status and blank Greeks - never a plausible
+    substitute.
+    """
+    snapshot = str(chain_doc.get("snapshot_time_utc") or "")[:10]
+    und_date, spot = underlying_as_of(bar_rows, snapshot) if snapshot else (None, None)
+    q = trailing_dividend_yield(bar_rows, snapshot) if (snapshot and spot) else 0.0
+
+    out: list[dict[str, Any]] = []
+    for c in chain_doc.get("contracts", []):
+        kind = str(c.get("type", "")).upper()
+        strike = c.get("strike")
+        bid, ask = c.get("bid"), c.get("ask")
+        mid = c.get("mid")
+        expiry = c.get("expiration")
+
+        T = years_to_expiry(snapshot, expiry) if snapshot else None
+        dte = round(T * 365) if T else None
+
+        row = {
+            "ticker": ticker, "type": kind, "expiration": expiry, "dte": dte,
+            "strike": strike, "underlying_close": spot, "underlying_close_date": und_date,
+            "pct_from_spot": (strike / spot - 1.0) if (spot and strike) else None,
+            "bid": bid, "ask": ask, "mid": mid,
+            "spread": (ask - bid) if (bid is not None and ask is not None) else None,
+            "relative_spread": ((ask - bid) / mid) if (bid is not None and ask is not None and mid) else None,
+            "volume": c.get("volume"), "open_interest": c.get("open_interest"),
+            "iv_yahoo": c.get("implied_volatility"),
+            "iv_solved": None, "delta": None, "gamma": None,
+            "theta_per_day": None, "vega": None, "rho": None,
+            "round_trip_cost_1x": None, "round_trip_pct_of_notional": None,
+        }
+
+        if c.get("status") != "OK" or mid is None:
+            row["model_status"] = "NO_TWO_SIDED_QUOTE"
+        elif spot is None:
+            row["model_status"] = "NO_AVAILABLE_UNDERLYING_BAR"
+        elif T is None:
+            row["model_status"] = "EXPIRED_OR_BAD_DATE"
+        elif kind not in ("CALL", "PUT"):
+            row["model_status"] = "UNKNOWN_OPTION_TYPE"
+        else:
+            iv = implied_volatility(float(mid), float(spot), float(strike), T,
+                                    risk_free_rate, q, kind)
+            if iv is None:
+                # The mid sits outside what any volatility can produce - a stale
+                # or crossed quote on an illiquid line, not a tradeable price.
+                row["model_status"] = "IV_UNSOLVABLE_FROM_MID"
+            else:
+                g = bs_greeks(float(spot), float(strike), T, risk_free_rate, iv, q, kind)
+                if g is None:
+                    row["model_status"] = "GREEKS_UNAVAILABLE"
+                else:
+                    row.update(iv_solved=iv, **g.as_dict())
+                    row["theta_per_day"] = row.pop("theta")
+                    row["model_status"] = "OK"
+
+        # Execution cost on one contract, from the repo's own cost model.
+        if bid is not None and ask is not None:
+            try:
+                rt = costs.option_round_trip_cost(float(bid), float(ask), 1)
+                row["round_trip_cost_1x"] = rt
+                notional = float(mid) * 100 if mid else None
+                row["round_trip_pct_of_notional"] = (rt / notional) if notional else None
+            except ValueError:
+                pass
+
+        # Liquidity screen, using the project's own RiskLimits constants.
+        row["screen_dte"] = bool(dte is not None and limits.min_dte <= dte <= limits.max_dte)
+        row["screen_spread"] = bool(row["relative_spread"] is not None
+                                    and row["relative_spread"] <= limits.max_relative_spread)
+        row["screen_open_interest"] = bool((row["open_interest"] or 0) >= limits.min_open_interest)
+        row["screen_volume"] = bool((row["volume"] or 0) >= limits.min_daily_volume)
+        row["liquidity_screen"] = "PASS" if all(
+            (row["screen_dte"], row["screen_spread"],
+             row["screen_open_interest"], row["screen_volume"])) else "FAIL"
+
+        # The deterministic gate, fed everything the snapshot actually knows.
+        # It will not approve anything, because a chain snapshot contains no
+        # evidence and no post-cost edge estimate - and the gate fails closed on
+        # what it is not told. That is the point of showing it per row.
+        verdict = evaluate_gate({
+            "dte": dte, "relative_spread": row["relative_spread"],
+            "open_interest": row["open_interest"], "daily_volume": row["volume"],
+            "defined_risk": True,
+        }, limits)
+        row["gate_decision"] = verdict.decision.value
+        row["gate_missing"] = ", ".join(
+            f[len("missing:"):] for f in verdict.failed_gates if f.startswith("missing:"))
+        out.append(row)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +372,8 @@ def summarize(ticker: str, doc: dict[str, Any], rows: list[dict[str, Any]],
     }
 
 
-def collect(data_dir: Path, only: list[str] | None = None) -> dict[str, Any]:
+def collect(data_dir: Path, only: list[str] | None = None, *,
+            risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict[str, Any]:
     """Everything the workbook needs, with no Excel dependency in sight."""
     files = find_bar_files(data_dir)
     if only:
@@ -204,14 +400,55 @@ def collect(data_dir: Path, only: list[str] | None = None) -> dict[str, Any]:
 
     summaries = [summarize(t, docs[t], rows[t], labels[t]) for t in sorted(rows)]
 
+    # Option chains are optional: they exist only if fetch_data.py ran --chains.
+    limits, costs = RiskLimits(), CostModel()
+    chain_files = find_chain_files(data_dir)
+    if only:
+        wanted = {t.strip().upper() for t in only if t.strip()}
+        chain_files = {t: p for t, p in chain_files.items() if t in wanted}
+
+    options: dict[str, list[dict[str, Any]]] = {}
+    chain_docs: dict[str, dict[str, Any]] = {}
+    for ticker, path in chain_files.items():
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["_source_file"] = path.name
+        chain_docs[ticker] = doc
+        options[ticker] = build_option_rows(
+            ticker, doc, rows.get(ticker, []),
+            risk_free_rate=risk_free_rate, limits=limits, costs=costs,
+        )
+
+    option_summaries = []
+    for ticker in sorted(options):
+        rs = options[ticker]
+        modelled = [r for r in rs if r["model_status"] == "OK"]
+        option_summaries.append({
+            "underlying": ticker,
+            "source_file": chain_docs[ticker].get("_source_file", "UNKNOWN"),
+            "snapshot_time_utc": chain_docs[ticker].get("snapshot_time_utc", "UNKNOWN"),
+            "underlying_close": rs[0]["underlying_close"] if rs else None,
+            "underlying_close_date": rs[0]["underlying_close_date"] if rs else None,
+            "contracts": len(rs),
+            "two_sided_quotes": sum(1 for r in rs if r["model_status"] != "NO_TWO_SIDED_QUOTE"),
+            "greeks_modelled": len(modelled),
+            "passed_liquidity_screen": sum(1 for r in rs if r["liquidity_screen"] == "PASS"),
+            "gate_paper_trade_candidates": sum(
+                1 for r in rs if r["gate_decision"] == "PAPER_TRADE_CANDIDATE"),
+        })
+
     return {
         "generated_utc": datetime.now(timezone.utc),
         "data_dir": str(data_dir),
         "files": {t: str(p) for t, p in files.items()},
+        "chain_files": {t: str(p) for t, p in chain_files.items()},
         "docs": docs,
         "rows": rows,
         "labels": labels,
         "summaries": summaries,
+        "options": options,
+        "option_summaries": option_summaries,
+        "risk_free_rate": risk_free_rate,
         "benchmark_present": benchmark_present,
     }
 
@@ -250,6 +487,33 @@ LABEL_COLUMNS = [
     ("usable", 9, None),
     ("benchmark", 19, None),
     ("contract_version", 17, None),
+]
+
+OPTION_COLUMNS = [
+    ("type", 7, None), ("expiration", 12, "yyyy-mm-dd"), ("dte", 6, "0"),
+    ("strike", 10, "#,##0.00"), ("pct_from_spot", 14, "0.0%"),
+    ("underlying_close", 16, "#,##0.00"), ("underlying_close_date", 20, None),
+    ("bid", 9, "#,##0.0000"), ("ask", 9, "#,##0.0000"), ("mid", 9, "#,##0.0000"),
+    ("spread", 9, "#,##0.0000"), ("relative_spread", 15, "0.0%"),
+    ("volume", 10, "#,##0"), ("open_interest", 13, "#,##0"),
+    ("iv_yahoo", 10, "0.0%"), ("iv_solved", 10, "0.0%"),
+    ("delta", 9, "0.0000"), ("gamma", 10, "0.000000"),
+    ("theta_per_day", 14, "0.0000"), ("vega", 9, "0.0000"), ("rho", 9, "0.0000"),
+    ("model_status", 26, None),
+    ("round_trip_cost_1x", 18, "$#,##0.00"),
+    ("round_trip_pct_of_notional", 25, "0.0%"),
+    ("liquidity_screen", 16, None),
+    ("screen_dte", 11, None), ("screen_spread", 14, None),
+    ("screen_open_interest", 20, None), ("screen_volume", 14, None),
+    ("gate_decision", 22, None), ("gate_missing", 46, None),
+]
+
+OPTION_SUMMARY_COLUMNS = [
+    ("underlying", 12, None), ("snapshot_time_utc", 26, None),
+    ("underlying_close", 16, "#,##0.00"), ("underlying_close_date", 20, None),
+    ("contracts", 11, "#,##0"), ("two_sided_quotes", 17, "#,##0"),
+    ("greeks_modelled", 16, "#,##0"), ("passed_liquidity_screen", 23, "#,##0"),
+    ("gate_paper_trade_candidates", 27, "#,##0"), ("source_file", 40, None),
 ]
 
 SUMMARY_COLUMNS = [
@@ -340,6 +604,9 @@ def _write_readme(ws, data: dict[str, Any]) -> None:
         ("Generated (UTC)", data["generated_utc"].isoformat(timespec="seconds")),
         ("Data store", data["data_dir"]),
         ("Label contract", f"v{LABEL_CONTRACT_VERSION}"),
+        ("Risk-free rate used", f"{data.get('risk_free_rate', DEFAULT_RISK_FREE_RATE):.4f} "
+                                f"- an ASSUMPTION, not observed data. Override with "
+                                f"--risk-free-rate. Affects every Greek."),
         ("", ""),
         ("READ THIS FIRST", ""),
         ("Paper/simulation only",
@@ -368,6 +635,39 @@ def _write_readme(ws, data: dict[str, Any]) -> None:
          f"return vs {BENCHMARK}. Decision clock is 15:45 ET on the decision date; the "
          "label is measured from the 16:00 close that follows it. The 15-minute gap is "
          "deliberate - the model cannot consume the price it is scored against."),
+        ("", ""),
+        ("OPTIONS SHEETS", "Present only if you fetched with --chains."),
+        ("Options_Summary", "Per underlying: contracts snapshotted, how many carry a two-sided "
+                            "quote, how many could be modelled, and how many survive the "
+                            "liquidity screen."),
+        ("Options_<TICKER>",
+         "One row per contract: the observed quote, an implied volatility solved from the mid, "
+         "the five Greeks, execution cost from the project's own cost model, and the screens."),
+        ("Observed vs modelled",
+         "OBSERVED: bid, ask, strike, expiration, volume, open interest, and the underlying "
+         "close. MODELLED: iv_solved and every Greek. A Greek is not a measurement - it is "
+         "the output of a model whose assumptions (lognormal returns, constant volatility, "
+         "European exercise) are all false to some degree for a listed US equity option."),
+        ("Why iv_solved, not iv_yahoo",
+         "iv_yahoo is Yahoo's own figure from an undocumented model, rate and dividend "
+         "assumption. Feeding it into these formulas would stack this model on an unknown one "
+         "and call the result a Greek. iv_solved is inverted from the observed mid here, so "
+         "the chain is: quote -> one documented model -> Greeks. Both columns are shown on "
+         "purpose: a large gap between them is a data-quality warning about that contract."),
+        ("The underlying is a prior close",
+         "Greeks are computed against the last bar AVAILABLE at the snapshot - the previous "
+         "session's close, not live spot, because a bar is not consumable at its own close. "
+         "underlying_close_date shows which. A big intraday move makes every delta in the "
+         "sheet stale, and staleness you can see is a different problem from staleness you "
+         "cannot."),
+        ("model_status", "Why a row has no Greeks. Blank Greeks are always explained here and "
+                         "never filled with a plausible substitute."),
+        ("gate_decision", "gates/risk.py run per contract on what a chain snapshot actually "
+                          "contains. It returns PASS - meaning DO NOTHING - on every row, "
+                          "because the snapshot carries no evidence count, no confidence, and "
+                          "no post-cost edge estimate, and the gate fails closed on what it is "
+                          "not told. gate_missing names exactly what is absent. The liquidity "
+                          "screen narrows the chain; it does not make a pick."),
         ("", ""),
         ("COLUMNS YOU CAN RETUNE", ""),
         ("sma_20 / sma_50",
@@ -403,6 +703,12 @@ def _write_readme(ws, data: dict[str, Any]) -> None:
         lines.append((ticker, path))
     if not data["files"]:
         lines.append(("(none)", "The data store was empty. Fetch data first."))
+    for os_ in data.get("option_summaries", []):
+        print(f"  {os_['underlying']:<8} {os_['contracts']:>6} contracts   "
+              f"{os_['greeks_modelled']:>5} with Greeks   "
+              f"{os_['passed_liquidity_screen']:>4} pass liquidity screen   "
+              f"{os_['gate_paper_trade_candidates']} gate candidates")
+
     if not data["benchmark_present"]:
         lines.append(("", ""))
         lines.append(
@@ -480,6 +786,23 @@ def _write_labels(ws, labels: list[dict[str, Any]]) -> None:
     _finish(ws, LABEL_COLUMNS, len(labels))
 
 
+def _write_options(ws, rows: list[dict[str, Any]]) -> None:
+    _write_header(ws, OPTION_COLUMNS)
+    for r, row in enumerate(rows, start=2):
+        for c, (name, _w, fmt) in enumerate(OPTION_COLUMNS, start=1):
+            v = row.get(name)
+            _text_cell(ws, r, c, _as_date(v) if fmt == "yyyy-mm-dd" else v)
+    _finish(ws, OPTION_COLUMNS, len(rows))
+
+
+def _write_options_summary(ws, summaries: list[dict[str, Any]]) -> None:
+    _write_header(ws, OPTION_SUMMARY_COLUMNS)
+    for r, row in enumerate(summaries, start=2):
+        for c, (name, _w, _f) in enumerate(OPTION_SUMMARY_COLUMNS, start=1):
+            _text_cell(ws, r, c, row.get(name))
+    _finish(ws, OPTION_SUMMARY_COLUMNS, len(summaries))
+
+
 def write_workbook(data: dict[str, Any], out_path: Path) -> Path:
     """Render collected data to .xlsx. Requires openpyxl; nothing else does."""
     try:
@@ -505,6 +828,13 @@ def write_workbook(data: dict[str, Any], out_path: Path) -> Path:
         all_labels.extend(data["labels"][ticker])
     _write_labels(wb.create_sheet("Labels"), all_labels)
 
+    if data.get("options"):
+        _write_options_summary(wb.create_sheet("Options_Summary"),
+                               data.get("option_summaries", []))
+        for ticker in sorted(data["options"]):
+            _write_options(wb.create_sheet(_sheet_name("Options_", ticker)),
+                           data["options"][ticker])
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
     return out_path
@@ -527,6 +857,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="output .xlsx path (default: excel_out/moneyprinter_<timestamp>.xlsx)")
     ap.add_argument("--tickers", default=None,
                     help="comma-separated subset; default is everything in the store")
+    ap.add_argument("--risk-free-rate", type=float, default=DEFAULT_RISK_FREE_RATE,
+                    help=f"annualised, for option pricing (default {DEFAULT_RISK_FREE_RATE}). "
+                         f"An assumption, not observed data.")
     a = ap.parse_args(argv)
 
     data_dir = Path(a.data_dir).expanduser().resolve()
@@ -543,7 +876,7 @@ def main(argv: list[str] | None = None) -> int:
         print("    python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT")
         return 1
 
-    data = collect(data_dir, only)
+    data = collect(data_dir, only, risk_free_rate=a.risk_free_rate)
     if not data["rows"]:
         print("\nThe data store has no bar files matching that selection.")
         print("Fetch some data first:")

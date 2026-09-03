@@ -70,6 +70,24 @@ def write_store(tmp: Path, ticker: str, dates, daily=0.0, vintage="20240101T0000
     return path
 
 
+def write_chain(tmp: Path, ticker: str, snapshot: str, contracts, vintage="20260302T160000Z"):
+    d = tmp / "chains"; d.mkdir(parents=True, exist_ok=True)
+    (d / f"{ticker}__v{vintage}.json").write_text(json.dumps({
+        "underlying": ticker, "snapshot_time_utc": f"{snapshot}T16:05:00+00:00",
+        "vintage_id": vintage, "contract_count": len(contracts),
+        "contracts": contracts}))
+
+
+def contract(kind="CALL", strike=100.0, expiration="2026-04-06", bid=4.0, ask=4.2,
+             volume=900, oi=4200, iv=0.30, status="OK"):
+    mid = round((bid + ask) / 2, 4) if status == "OK" else None
+    return {"type": kind, "expiration": expiration, "strike": strike,
+            "bid": bid if status == "OK" else None,
+            "ask": ask if status == "OK" else None, "mid": mid,
+            "volume": volume, "open_interest": oi,
+            "implied_volatility": iv, "status": status}
+
+
 def labels_by_date(labels):
     return {l["decision_date"]: l for l in labels}
 
@@ -385,6 +403,133 @@ def missing_benchmark_is_written_into_the_readme_not_just_stderr():
             for c in row if c.value
         )
         assert "BENCHMARK MISSING" in text, text[:400]
+    finally:
+        shutil.rmtree(tmp)
+
+
+# --- option chains ----------------------------------------------------------
+
+@test
+def option_sheets_appear_only_when_a_chain_was_fetched():
+    if not HAVE_OPENPYXL:
+        print("        (skipped: openpyxl not installed)")
+        return
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        write_store(tmp, "SPY", WEEKDAYS, daily=0.0)
+        assert "Options_Summary" not in openpyxl.load_workbook(
+            ex.write_workbook(ex.collect(tmp), tmp / "a.xlsx")).sheetnames
+        write_chain(tmp, "SPY", "2024-01-12", [contract(strike=100.0)])
+        names = openpyxl.load_workbook(
+            ex.write_workbook(ex.collect(tmp), tmp / "b.xlsx")).sheetnames
+        assert "Options_Summary" in names and "Options_SPY" in names, names
+    finally:
+        shutil.rmtree(tmp)
+
+
+@test
+def greeks_are_modelled_from_the_quote_and_obey_put_call_relations():
+    """delta_call - delta_put == e^-qT, and gamma/vega are shared. If these
+    drift the sheet is reporting something that is not Black-Scholes."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        write_store(tmp, "SPY", WEEKDAYS, daily=0.0)   # flat, close == 100
+        write_chain(tmp, "SPY", "2024-01-12", [
+            contract("CALL", 100.0, "2024-02-16", 4.0, 4.2),
+            contract("PUT", 100.0, "2024-02-16", 3.6, 3.8),
+        ])
+        rows = ex.collect(tmp)["options"]["SPY"]
+        call = next(r for r in rows if r["type"] == "CALL")
+        put = next(r for r in rows if r["type"] == "PUT")
+        for r in (call, put):
+            assert r["model_status"] == "OK", r["model_status"]
+            assert r["iv_solved"] is not None and 0 < r["iv_solved"] < 5
+            assert r["gamma"] > 0 and r["vega"] > 0
+            assert r["theta_per_day"] < 0
+        assert 0 < call["delta"] < 1 and -1 < put["delta"] < 0
+        assert abs((call["delta"] - put["delta"]) - 1.0) < 0.01, (call["delta"], put["delta"])
+    finally:
+        shutil.rmtree(tmp)
+
+
+@test
+def the_underlying_is_the_last_bar_available_before_the_snapshot():
+    """A bar is not consumable at its own close, so a chain snapshotted during
+    a session may only see the PRIOR session. Using the snapshot day's own
+    close would be a full day of lookahead in every delta."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        write_store(tmp, "SPY", WEEKDAYS, daily=0.01)
+        write_chain(tmp, "SPY", "2024-01-10", [contract(strike=100.0)])
+        row = ex.collect(tmp)["options"]["SPY"][0]
+        assert row["underlying_close_date"] == "2024-01-09", row["underlying_close_date"]
+        assert row["underlying_close_date"] < "2024-01-10"
+    finally:
+        shutil.rmtree(tmp)
+
+
+@test
+def unmodellable_contracts_get_a_status_and_no_greeks():
+    """Blank Greeks must always be explained, never filled with a substitute."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        write_store(tmp, "SPY", WEEKDAYS, daily=0.0)
+        write_chain(tmp, "SPY", "2024-01-12", [
+            contract(strike=100.0, status="UNKNOWN"),                     # no quote
+            contract(strike=100.0, expiration="2024-01-12"),              # expires today
+            contract(strike=100.0, expiration="2023-12-01"),              # already expired
+            contract(strike=100.0, expiration="2024-02-16", bid=140.0, ask=141.0),  # above spot
+        ])
+        rows = ex.collect(tmp)["options"]["SPY"]
+        got = {r["model_status"] for r in rows}
+        assert "NO_TWO_SIDED_QUOTE" in got and "EXPIRED_OR_BAD_DATE" in got, got
+        assert "IV_UNSOLVABLE_FROM_MID" in got, got
+        for r in rows:
+            assert r["model_status"] != "OK"
+            for g in ("delta", "gamma", "theta_per_day", "vega", "rho", "iv_solved"):
+                assert r[g] is None, (r["model_status"], g, r[g])
+    finally:
+        shutil.rmtree(tmp)
+
+
+@test
+def the_liquidity_screen_uses_the_projects_own_risk_limits():
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        from gates.risk import RiskLimits
+        lim = RiskLimits()
+        write_store(tmp, "SPY", WEEKDAYS, daily=0.0)
+        write_chain(tmp, "SPY", "2024-01-12", [
+            contract(strike=100.0, expiration="2024-02-16", oi=lim.min_open_interest + 1,
+                     volume=lim.min_daily_volume + 1),
+            contract(strike=100.0, expiration="2024-02-16", oi=lim.min_open_interest - 1,
+                     volume=lim.min_daily_volume + 1),
+            contract(strike=100.0, expiration="2024-01-15"),   # inside min_dte
+        ])
+        rows = ex.collect(tmp)["options"]["SPY"]
+        assert rows[0]["liquidity_screen"] == "PASS", rows[0]
+        assert rows[1]["liquidity_screen"] == "FAIL" and not rows[1]["screen_open_interest"]
+        assert rows[2]["liquidity_screen"] == "FAIL" and not rows[2]["screen_dte"]
+    finally:
+        shutil.rmtree(tmp)
+
+
+@test
+def the_gate_refuses_every_contract_because_a_snapshot_has_no_edge():
+    """The screen narrows the chain; it does not make a pick. gates/risk.py
+    fails closed on what a chain snapshot cannot contain, and the sheet must
+    show that rather than implying the survivors are picks."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        write_store(tmp, "SPY", WEEKDAYS, daily=0.0)
+        write_chain(tmp, "SPY", "2024-01-12", [
+            contract(strike=100.0, expiration="2024-02-16", oi=9999, volume=9999)])
+        row = ex.collect(tmp)["options"]["SPY"][0]
+        assert row["liquidity_screen"] == "PASS"
+        assert row["gate_decision"] == "PASS", row["gate_decision"]
+        for missing in ("independent_events", "evidence_confidence",
+                        "expected_edge_after_costs"):
+            assert missing in row["gate_missing"], row["gate_missing"]
     finally:
         shutil.rmtree(tmp)
 

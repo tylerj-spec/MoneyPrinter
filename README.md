@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-105 tests passing (`python run_tests.py`): 81 in `claude/app/mp_v01/`, 24 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+124 tests passing (`python run_tests.py`): 94 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
@@ -111,10 +111,10 @@ echoed into the console, so anything the GUI does you can also do from a termina
 
 **Command line**:
 ```bash
-python run_tests.py        # every suite: pipeline, Excel export, GUI (105 tests)
+python run_tests.py        # every suite: pipeline, Excel export, GUI (124 tests)
 
 cd claude/app/mp_v01
-python run_all.py          # just the zero-dependency pipeline suite (81 tests)
+python run_all.py          # just the zero-dependency pipeline suite (94 tests)
 
 pip install yfinance
 python fetch_data.py --tickers SPY,QQQ,MSFT --chains
@@ -139,6 +139,8 @@ python excel_report.py --tickers SPY,MSFT   # a subset
 | `Summary` | One row per ticker: coverage, gap count, label base rate |
 | `Bars_<TICKER>` | OHLCV, dividends, daily total return, both PIT timestamps, plus **live formulas** for `sma_20`, `sma_50`, `vol_20d_annualised` |
 | `Labels` | The label contract v1.0 target: 5-day forward log excess total return vs SPY, its sign, and the fail-closed status |
+| `Options_Summary` | Per underlying: contracts snapshotted, how many carry a two-sided quote, how many could be modelled, how many survive the liquidity screen |
+| `Options_<TICKER>` | One row per contract — quote, solved IV, the five Greeks, execution cost, and the screens. Only present if you fetched with `--chains` |
 
 The SMA and volatility columns are real Excel formulas, not pasted values — widen
 the `AVERAGE()` range and the column recalculates, so windows can be retuned in
@@ -158,6 +160,40 @@ Three things worth knowing before you trust a cell:
 
 Each export writes a new timestamped file under `excel_out/`, so a workbook you have
 edited by hand is never overwritten.
+
+### Options and the Greeks
+
+Yahoo publishes a two-sided quote, volume, open interest and its own IV figure — **not**
+Greeks. So the Greeks are computed, by `src/options/greeks.py` (Black-Scholes, standard
+library only, 13 tests against published reference values and put-call parity).
+
+What that means for reading the sheet:
+
+| | |
+|---|---|
+| **Observed** | bid, ask, strike, expiration, volume, open interest, underlying close |
+| **Modelled** | `iv_solved` and every Greek |
+
+- **`iv_solved`, not `iv_yahoo`, drives the Greeks.** Yahoo's IV comes from an undocumented
+  model with an undocumented rate and dividend assumption; feeding it into these formulas
+  would stack this model on an unknown one. IV is inverted from the observed mid instead, so
+  the chain is quote → one documented model → Greeks. Both columns are shown: a wide gap
+  between them is a data-quality warning about that contract.
+- **The underlying is the prior session's close**, not live spot — a bar is not consumable at
+  its own close, and using the snapshot day's own close would be a full day of lookahead in
+  every delta. `underlying_close_date` shows which bar was used.
+- **`model_status` explains every blank.** No two-sided quote, expired, IV unsolvable from the
+  mid. Nothing is ever filled with a plausible substitute.
+- **The risk-free rate is an assumption**, not data. Default 4%, override with
+  `--risk-free-rate`, and it is printed on the README sheet.
+- **`gate_decision` returns `PASS` — meaning do nothing — on every row.** `gates/risk.py` runs
+  per contract on what a snapshot actually contains, and a snapshot has no evidence count, no
+  confidence, and no post-cost edge. `gate_missing` names exactly what is absent.
+
+**The liquidity screen narrows the chain. It does not make a pick.** Per this project's own
+sequencing in `yahoo_daily.py`, an options overlay cannot rescue a stock-level forecast with
+no demonstrated edge — and none has been demonstrated yet. See `CODE_REVIEW_2026-09-02.md`
+§2.2: the harness that would measure one currently cannot distinguish signal from noise.
 
 ---
 
@@ -273,4 +309,4 @@ Write these numbers down **now** and put in STATE.md:
 ---
 
 **Last Updated**: August 29, 2026  
-**Version**: 2.3.0 (Excel export, rebuilt GUI, six review findings fixed, 105 tests)
+**Version**: 2.4.0 (Options Greeks, Excel export, rebuilt GUI, 124 tests)
