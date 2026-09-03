@@ -32,6 +32,8 @@ FETCH_SCRIPT = MP_V01_DIR / "fetch_data.py"
 EXPORT_SCRIPT = HERE / "excel_report.py"
 MIE_SCRIPT = HERE / "market_intelligence_engine.py"
 TEST_SCRIPT = HERE / "run_tests.py"
+PICKS_SCRIPT = HERE / "generate_picks.py"
+PICKS_DIR = HERE / "picks"
 DEFAULT_OUT_DIR = HERE / "excel_out"
 SETTINGS_FILE = Path.home() / ".moneyprinter_gui.json"
 
@@ -184,7 +186,10 @@ class MoneyPrinterGUI(tk.Tk):
         self.fetch_btn.pack(side=tk.LEFT)
         self.export_btn = ttk.Button(steps, text="2 · Build Excel workbook", command=self.export_excel)
         self.export_btn.pack(side=tk.LEFT, padx=6)
-        ttk.Button(steps, text="3 · Open output folder", command=self.open_output).pack(side=tk.LEFT)
+        self.picks_btn = ttk.Button(steps, text="3 · Generate paper picks",
+                                    command=self.generate_picks)
+        self.picks_btn.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(steps, text="4 · Open output folder", command=self.open_output).pack(side=tk.LEFT)
 
         out_row = ttk.Frame(self, padding=(12, 8))
         out_row.pack(fill=tk.X)
@@ -205,7 +210,8 @@ class MoneyPrinterGUI(tk.Tk):
         self.stop_btn = ttk.Button(adv, text="Stop", command=self.stop_running, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.RIGHT)
 
-        self._job_buttons = (self.fetch_btn, self.export_btn, self.tests_btn, self.mie_btn)
+        self._job_buttons = (self.fetch_btn, self.export_btn, self.picks_btn,
+                             self.tests_btn, self.mie_btn)
 
         # --- console --------------------------------------------------------
         con = ttk.Frame(self, padding=(12, 0))
@@ -350,7 +356,7 @@ class MoneyPrinterGUI(tk.Tk):
         if code == 0 and self._pending_workbook is not None:
             self._last_workbook = self._pending_workbook
             self._set_status(f"Workbook ready — {self._last_workbook.name}", "#0B7A28")
-            self._log(f"\nOpen it with '3 · Open output folder', or double-click:\n"
+            self._log(f"\nOpen it with '4 · Open output folder', or double-click:\n"
                       f"  {self._last_workbook}\n", "success")
         elif code == 0:
             self._set_status("Finished", "#0B7A28")
@@ -407,6 +413,39 @@ class MoneyPrinterGUI(tk.Tk):
                   "  pip install openpyxl\n\n", "info")
         self._pending_workbook = target
         if not self._start([EXPORT_SCRIPT, "--out", target], "excel_report.py", HERE):
+            self._pending_workbook = None
+
+    def generate_picks(self) -> None:
+        """Freeze a paper-pick list and render it to Excel.
+
+        Two outputs on purpose: the JSON in picks/ is the hashed record and is
+        what makes the forward log worth anything, and the workbook is the
+        readable view of it. The workbook is rendered FROM the frozen file
+        rather than derived alongside it, so the two cannot disagree.
+        """
+        out_dir = self.out_dir()
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Output folder", f"Cannot create {out_dir}:\n{e}")
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = out_dir / f"moneyprinter_{stamp}.xlsx"
+
+        self._banner("Generating paper picks")
+        self._log(
+            "Needs a fetch WITH option chains — tick the box in step 1 if you have not.\n\n"
+            "Writes the hashed JSON record under picks\\, then rebuilds the workbook so\n"
+            "Pick_History shows this run alongside every earlier one. That history comes\n"
+            "from the files in picks\\, so commit them — they are the record, and unlike\n"
+            "the data store they are not regenerable.\n\n"
+            "These are hypotheses for forward measurement, not recommendations. The risk\n"
+            "gate declines to approve any of them, and the workbook says why.\n\n", "info")
+        self._pending_workbook = target
+        args = [PICKS_SCRIPT, "--out-dir", PICKS_DIR, "--excel", target,
+                "--decision-date", datetime.now().strftime("%Y-%m-%d")]
+        if not self._start(args, "generate_picks.py", HERE):
             self._pending_workbook = None
 
     def run_tests(self) -> None:

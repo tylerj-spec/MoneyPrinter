@@ -36,98 +36,10 @@ DEFAULT_DATA_DIR = MP_V01_DIR / "data_store"
 sys.path.insert(0, str(MP_V01_DIR / "src"))
 
 from backtest.costs import CostModel                      # noqa: E402
-from options.greeks import black_scholes_price, years_to_expiry  # noqa: E402
 from strategy.picks import verify                          # noqa: E402
+from strategy.resolve import resolve_pick, summarise       # noqa: E402
 
 import excel_report as ex                                  # noqa: E402
-
-
-def bars_after(rows, decision_date):
-    return [r for r in sorted(rows, key=lambda r: r.get("date") or "")
-            if r.get("date") and r["date"] > decision_date and r.get("close") is not None]
-
-
-def market_mark(chain_doc, contract):
-    """Exact contract in a later snapshot, if one was captured."""
-    if not chain_doc:
-        return None
-    for c in chain_doc.get("contracts", []):
-        if (c.get("type") == contract["type"]
-                and str(c.get("expiration")) == str(contract["expiration"])
-                and abs(float(c.get("strike") or -1) - float(contract["strike"])) < 1e-9
-                and c.get("status") == "OK" and c.get("bid") is not None):
-            return c
-    return None
-
-
-def resolve_one(pick, bars, later_chain, costs):
-    """Mark one pick. Returns a row with the mark method stated."""
-    c = pick["contract"]
-    horizon = pick["exit_policy"]["horizon_trading_days"]
-    forward = bars_after(bars, pick["decision_date"])
-    out = {"variant": pick["variant"], "ticker": pick["ticker"],
-           "action": pick["action"], "direction": pick["direction"],
-           "composite_score": pick["composite_score"],
-           "contract": f"{c['expiration']} {c['strike']:g} {c['type']}",
-           "entry": pick["entry_fill_estimate"]}
-
-    if len(forward) < horizon:
-        out.update(status="NOT_YET_RESOLVABLE",
-                   detail=f"{len(forward)} of {horizon} trading days elapsed")
-        return out
-
-    assess = forward[horizon - 1]
-    entry_spot = c["underlying_close"]
-    exit_spot = assess["close"]
-    out["assessment_date"] = assess["date"]
-    out["underlying_move_pct"] = exit_spot / entry_spot - 1.0 if entry_spot else None
-
-    # Was the DIRECTIONAL call right? Independent of option mechanics, and the
-    # thing the label contract would score.
-    if out["underlying_move_pct"] is not None:
-        up = out["underlying_move_pct"] > 0
-        out["direction_correct"] = (up and pick["direction"] == "BULLISH") or \
-                                   ((not up) and pick["direction"] == "BEARISH")
-
-    quote = market_mark(later_chain, c)
-    if quote is not None:
-        exit_price = costs.option_fill_price(float(quote["bid"]), float(quote["ask"]), "SELL")
-        out["mark_method"] = "MARKET"
-    else:
-        T = years_to_expiry(assess["date"], c["expiration"])
-        if T is None or not c.get("iv_solved"):
-            out.update(status="UNMARKABLE",
-                       detail="no later snapshot with this contract, and it cannot be "
-                              "re-priced (expired, or no entry IV)")
-            return out
-        theo = black_scholes_price(float(exit_spot), float(c["strike"]), T,
-                                   0.04, float(c["iv_solved"]), 0.0, c["type"])
-        if theo is None:
-            out.update(status="UNMARKABLE", detail="Black-Scholes re-mark failed")
-            return out
-        exit_price = theo
-        out["mark_method"] = "MODELLED"
-        out["mark_caveat"] = "assumes IV unchanged since entry"
-
-    entry = float(pick["entry_fill_estimate"])
-    out["exit_price"] = round(exit_price, 4)
-    gross = (exit_price - entry) * 100.0
-    fees = 2 * (costs.option_commission_per_contract + costs.option_exchange_fees_per_contract)
-    out["pnl_per_contract"] = round(gross - fees, 2)
-    out["return_on_premium"] = round((gross - fees) / (entry * 100.0), 4) if entry else None
-    out["status"] = "RESOLVED"
-
-    # Did the pre-registered secondary rules trigger before the time stop?
-    rp = out["return_on_premium"]
-    pol = pick["exit_policy"]
-    if rp is not None:
-        if rp >= pol["profit_target_pct"]:
-            out["secondary_rule_at_horizon"] = "PROFIT_TARGET_MET"
-        elif rp <= pol["stop_loss_pct"]:
-            out["secondary_rule_at_horizon"] = "STOP_LOSS_HIT"
-        else:
-            out["secondary_rule_at_horizon"] = "NEITHER"
-    return out
 
 
 def main(argv=None) -> int:
@@ -163,53 +75,46 @@ def main(argv=None) -> int:
         print("\nNo proposals in this file - every variant abstained.")
         return 0
 
-    results = []
-    for p in proposed:
-        bars = data["rows"].get(p["ticker"], [])
-        chain = None
-        cf = data.get("chain_files", {}).get(p["ticker"])
-        if cf:
-            doc = json.loads(Path(cf).read_text(encoding="utf-8"))
-            if str(doc.get("snapshot_time_utc", ""))[:10] > p["decision_date"]:
-                chain = doc
-        results.append(resolve_one(p, bars, chain, costs))
+    results = [resolve_pick(p, data["rows"].get(p["ticker"], []),
+                            ex.load_chains_by_date(Path(a.data_dir).expanduser().resolve(),
+                                                   p["ticker"]),
+                            costs)
+               for p in proposed]
 
     print("\n" + "-" * 78)
-    print(f"{'variant':<22}{'tkr':<6}{'dir':<9}{'move':>8}{'ok':>4}{'ret':>9}{'mark':>10}")
+    print(f"{'variant':<20}{'tkr':<6}{'exit':>14}{'held':>5}{'move':>8}{'ok':>4}"
+          f"{'ret':>9}{'mark':>10}")
     print("-" * 78)
     for r in results:
         if r["status"] != "RESOLVED":
-            print(f"{r['variant']:<22}{r['ticker']:<6}{r['direction']:<9}"
-                  f"{'—':>8}{'—':>4}{'—':>9}{r['status']:>10}   {r.get('detail','')}")
+            print(f"{r['variant']:<20}{r['ticker']:<6}{r['status']:>14}"
+                  f"   {r.get('detail','')}")
             continue
-        print(f"{r['variant']:<22}{r['ticker']:<6}{r['direction']:<9}"
-              f"{r['underlying_move_pct']:>+8.2%}"
-              f"{('Y' if r['direction_correct'] else 'n'):>4}"
-              f"{r['return_on_premium']:>+9.1%}{r['mark_method']:>10}")
+        move = f"{r['underlying_move_pct']:+.2%}" if r["underlying_move_pct"] is not None else "—"
+        ok = "—" if r["direction_correct"] is None else ("Y" if r["direction_correct"] else "n")
+        print(f"{r['variant']:<20}{r['ticker']:<6}{r['exit_trigger']:>14}"
+              f"{r['days_held']:>5}{move:>8}{ok:>4}"
+              f"{r['exit_return_on_premium']:>+9.1%}{r['exit_mark_method']:>10}")
 
     resolved = [r for r in results if r["status"] == "RESOLVED"]
     if resolved:
-        hits = sum(1 for r in resolved if r["direction_correct"])
-        avg = sum(r["return_on_premium"] for r in resolved) / len(resolved)
         print("-" * 78)
-        print(f"Resolved {len(resolved)} of {len(results)}   "
-              f"direction correct {hits}/{len(resolved)} ({hits/len(resolved):.0%})   "
-              f"mean return on premium {avg:+.1%}")
-        by_variant = {}
-        for r in resolved:
-            by_variant.setdefault(r["variant"], []).append(r)
-        print("\nBy variant:")
-        for v, rs in sorted(by_variant.items()):
-            h = sum(1 for r in rs if r["direction_correct"])
-            m = sum(r["return_on_premium"] for r in rs) / len(rs)
-            print(f"  {v:<22} {h}/{len(rs)} correct   mean {m:+.1%}")
+        print(f"{'variant':<20}{'n':>4}{'dir ok':>9}{'mean':>9}{'best':>9}{'worst':>9}"
+              f"   exit triggers")
+        for row in summarise(results):
+            hr = f"{row['direction_hit_rate']:.0%}" if row["direction_hit_rate"] is not None else "—"
+            mean = f"{row['mean_return_on_premium']:+.1%}" if row["mean_return_on_premium"] is not None else "—"
+            best = f"{row['best_return']:+.0%}" if row["best_return"] is not None else "—"
+            worst = f"{row['worst_return']:+.0%}" if row["worst_return"] is not None else "—"
+            print(f"{row['variant']:<20}{row['resolved']:>4}{hr:>9}{mean:>9}{best:>9}"
+                  f"{worst:>9}   {row['exit_triggers']}")
 
-        modelled = sum(1 for r in resolved if r["mark_method"] == "MODELLED")
+        modelled = sum(1 for r in resolved if r["exit_mark_method"] == "MODELLED")
         if modelled:
-            print(f"\n  NOTE: {modelled} of {len(resolved)} marks are MODELLED, not observed "
-                  f"quotes.\n  They assume IV was unchanged since entry, which after a real "
-                  f"move is\n  the assumption most likely to be wrong. Fetch daily with "
-                  f"--chains to\n  get market marks instead.")
+            print(f"\n  NOTE: {modelled} of {len(resolved)} exit marks are MODELLED, not "
+                  f"observed quotes.\n  They assume IV was unchanged since entry, which after "
+                  f"a real move is\n  the assumption most likely to be wrong. Fetch daily "
+                  f"with --chains to\n  accumulate the snapshots that give market marks.")
 
     print("\n" + "=" * 78)
     print(f"{len(resolved)} resolved observation(s). The pre-registration in README.md asks")

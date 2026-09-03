@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-148 tests passing (`python run_tests.py`): 118 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+161 tests passing (`python run_tests.py`): 131 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
@@ -114,10 +114,10 @@ echoed into the console, so anything the GUI does you can also do from a termina
 
 **Command line**:
 ```bash
-python run_tests.py        # every suite: pipeline, Excel export, GUI (148 tests)
+python run_tests.py        # every suite: pipeline, Excel export, GUI (161 tests)
 
 cd claude/app/mp_v01
-python run_all.py          # just the zero-dependency pipeline suite (118 tests)
+python run_all.py          # just the zero-dependency pipeline suite (131 tests)
 
 pip install yfinance
 python fetch_data.py --tickers SPY,QQQ,MSFT --chains
@@ -144,6 +144,10 @@ python excel_report.py --tickers SPY,MSFT   # a subset
 | `Labels` | The label contract v1.0 target: 5-day forward log excess total return vs SPY, its sign, and the fail-closed status |
 | `Options_Summary` | Per underlying: contracts snapshotted, how many carry a two-sided quote, how many could be modelled, how many survive the liquidity screen |
 | `Options_<TICKER>` | One row per contract — quote, solved IV, the five Greeks, execution cost, and the screens. Only present if you fetched with `--chains` |
+| `Pick_History` | **Every pick ever made**, accumulating across runs, with the outcome and which exit rule closed it |
+| `Pick_Justifications` | The same picks with the full paragraph of reasoning for each |
+| `Pick_Performance` | Per variant over resolved picks: direction hit rate, mean return, which rules fired |
+| `Pick_Abstentions` | Every variant/ticker that proposed nothing, and why |
 
 The SMA and volatility columns are real Excel formulas, not pasted values — widen
 the `AVERAGE()` range and the column recalculates, so windows can be retuned in
@@ -235,6 +239,43 @@ Written into the file at generation time, before any outcome is known:
 
 Deciding when to close *after* watching the position is how a loser becomes "still
 developing." Changing these mid-flight invalidates the record.
+
+### The history accumulates in Excel
+
+`Pick_History` is a **view over every frozen file in `picks/`**, not something the
+workbook remembers. So rebuilding the workbook never loses history, and committing
+`picks/` is what preserves it. Regenerate any time:
+
+```bash
+python excel_report.py          # rebuilds every sheet, history included
+```
+
+Or click **3 · Generate paper picks** in the GUI, which freezes today's run and then
+rebuilds the workbook so the new picks appear alongside every earlier one.
+
+Each row carries the outcome and **which pre-registered rule closed the position** —
+found by walking the path day by day, not by checking only the horizon:
+
+| `exit_trigger` | Meaning |
+|---|---|
+| `PROFIT_TARGET` | Return on premium reached +50% |
+| `STOP_LOSS` | Return on premium reached −50% |
+| `DTE_FLOOR` | Days-to-expiry fell below 21 |
+| `TIME_STOP` | None of the above fired before the 5-day horizon |
+
+Checking only the horizon would convert every stop-out into a round trip — reporting
+losses a disciplined trader would never have taken, and worse, reporting gains on
+positions already stopped out.
+
+Two column families, deliberately never merged:
+
+- **`exit_*`** — what following the rules would have returned. Path dependent.
+- **`horizon_*`** — whether the directional call was right, measured at the label
+  horizon regardless of how the position closed. This is what the label contract
+  scores. A stop-out does not erase the directional answer.
+
+`integrity` reads `VOID` if a file's picks no longer hash to their recorded digest.
+Those rows are still shown, but excluded from `Pick_Performance`.
 
 ### Scoring it later
 
@@ -372,4 +413,4 @@ Write these numbers down **now** and put in STATE.md:
 ---
 
 **Last Updated**: August 29, 2026  
-**Version**: 2.6.0 (Frozen paper picks, permutation null fixed, Options Greeks, 148 tests)
+**Version**: 2.7.0 (Accumulating pick history in Excel, frozen picks, 161 tests)

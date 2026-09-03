@@ -8,6 +8,11 @@ tomorrow produces tomorrow's picks, not today's. The forward record is the only
 genuinely out-of-sample evidence this project will ever have, and it exists only
 if the files survive.
 
+These files are also the source of the `Pick_History`, `Pick_Justifications`,
+`Pick_Performance` and `Pick_Abstentions` tabs in the Excel workbook. That history is
+a view over this directory — rebuild the workbook whenever you like and nothing is
+lost, but delete a file here and its picks leave the record.
+
 Score one with:
 
 ```

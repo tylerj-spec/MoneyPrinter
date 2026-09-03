@@ -9,6 +9,7 @@ from strategy.picks import (
     ExitPolicy, approximate_assessment_date, breakeven_move_pct, freeze,
     generate_picks, select_contract, verify,
 )
+from strategy.resolve import bars_after, market_quote, resolve_pick, summarise
 from strategy.variants import BY_NAME, VARIANTS, score
 
 
@@ -214,6 +215,155 @@ def the_assessment_date_skips_weekends_and_is_labelled_approximate():
     # Monday 2026-03-02 + 5 trading days -> Monday 2026-03-09.
     assert approximate_assessment_date("2026-03-02", 5) == "2026-03-09"
     assert approximate_assessment_date("garbage", 5) is None
+
+
+# --- resolution -------------------------------------------------------------
+
+def _pick(entry=4.2, spot=100.0, strike=100.0, kind="CALL", direction="BULLISH",
+          dte=35, expiration="2026-04-17", iv=0.25, target=0.50, stop=-0.50,
+          min_dte=21, horizon=5, decision="2026-03-02"):
+    return {"decision_date": decision, "variant": "v", "ticker": "AAA",
+            "direction": direction, "action": f"PAPER_LONG_{kind}",
+            "composite_score": 0.5, "entry_fill_estimate": entry,
+            "contract": {"type": kind, "expiration": expiration, "strike": strike,
+                         "dte": dte, "iv_solved": iv, "underlying_close": spot,
+                         "delta": 0.35, "bid": 4.0, "ask": entry, "mid": 4.1},
+            "exit_policy": {"horizon_trading_days": horizon, "profit_target_pct": target,
+                            "stop_loss_pct": stop, "min_dte_exit": min_dte}}
+
+
+def _fwd(closes, start="2026-03-03"):
+    from datetime import date, timedelta
+    d, out = date.fromisoformat(start), []
+    for cl in closes:
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        out.append({"date": d.isoformat(), "close": cl})
+        d += timedelta(days=1)
+    return out
+
+
+@test
+def bars_after_excludes_the_decision_day_itself():
+    rows = _fwd([100, 101], start="2026-03-02")
+    assert [b["date"] for b in bars_after(rows, "2026-03-02")] == ["2026-03-03"]
+
+
+@test
+def a_position_with_no_sessions_yet_is_open_not_zero():
+    o = resolve_pick(_pick(), [])
+    assert o["status"] == "OPEN" and o["exit_trigger"] is None
+    assert "no sessions" in o["detail"]
+
+
+@test
+def the_time_stop_closes_at_the_horizon_when_nothing_else_fires():
+    o = resolve_pick(_pick(), _fwd([100.2, 100.3, 100.1, 100.4, 100.5]))
+    assert o["status"] == "RESOLVED", o
+    assert o["exit_trigger"] == "TIME_STOP" and o["days_held"] == 5
+
+
+@test
+def a_profit_target_closes_early_and_records_the_day_it_hit():
+    """Checking only the horizon would miss this and report whatever the
+    position happened to be worth five days later instead."""
+    o = resolve_pick(_pick(), _fwd([101, 118, 125, 100, 99]))
+    assert o["exit_trigger"] == "PROFIT_TARGET", o
+    assert o["days_held"] < 5
+    assert o["exit_return_on_premium"] >= 0.50
+
+
+@test
+def a_stop_loss_closes_early_rather_than_riding_to_the_horizon():
+    o = resolve_pick(_pick(), _fwd([99, 92, 88, 130, 140]))
+    assert o["exit_trigger"] == "STOP_LOSS", o
+    assert o["days_held"] < 5
+    assert o["exit_return_on_premium"] <= -0.50
+
+
+@test
+def the_dte_floor_closes_a_contract_that_has_decayed_too_far():
+    """DTE is recomputed from each bar's own date. Decrementing the entry DTE by
+    elapsed trading days would drift a day every weekend and move this exit."""
+    o = resolve_pick(_pick(expiration="2026-03-20", dte=18, min_dte=21),
+                     _fwd([100.1, 100.2, 100.3, 100.4, 100.5]))
+    assert o["exit_trigger"] == "DTE_FLOOR", o
+    assert o["days_held"] == 1
+
+
+@test
+def the_horizon_measurement_is_kept_separate_from_how_the_position_closed():
+    """'Was the call right' and 'did the trade make money' are different
+    questions. A stop-out must not erase the directional answer."""
+    o = resolve_pick(_pick(), _fwd([99, 90, 85, 96, 130]))
+    assert o["exit_trigger"] == "STOP_LOSS"
+    assert o["horizon_date"] == _fwd([1, 2, 3, 4, 5])[4]["date"]
+    # Underlying finished up, so a BULLISH call was directionally right even
+    # though the pre-registered stop had already closed it at a loss.
+    assert o["underlying_move_pct"] > 0 and o["direction_correct"] is True
+    assert o["exit_return_on_premium"] <= -0.50
+    assert o["horizon_return_on_premium"] > o["exit_return_on_premium"]
+
+
+@test
+def a_bearish_pick_is_scored_against_a_falling_underlying():
+    o = resolve_pick(_pick(kind="PUT", direction="BEARISH"),
+                     _fwd([99, 98, 97, 96, 95]))
+    assert o["underlying_move_pct"] < 0 and o["direction_correct"] is True
+
+
+@test
+def an_observed_quote_is_preferred_over_a_modelled_mark():
+    chain_day = _fwd([100.5] * 5)[4]["date"]
+    chain = {chain_day: {"contracts": [
+        {"type": "CALL", "expiration": "2026-04-17", "strike": 100.0,
+         "bid": 9.0, "ask": 9.4, "status": "OK"}]}}
+    o = resolve_pick(_pick(), _fwd([100.1, 100.2, 100.3, 100.4, 100.5]), chain)
+    assert o["exit_mark_method"] == "MARKET", o
+    # A modelled mark on the same path is a different number.
+    m = resolve_pick(_pick(), _fwd([100.1, 100.2, 100.3, 100.4, 100.5]))
+    assert m["exit_mark_method"] == "MODELLED"
+    assert o["exit_price"] != m["exit_price"]
+
+
+@test
+def market_quote_matching_requires_type_expiry_and_strike_to_agree():
+    c = {"type": "CALL", "expiration": "2026-04-17", "strike": 100.0}
+    good = {"contracts": [{"type": "CALL", "expiration": "2026-04-17", "strike": 100.0,
+                           "bid": 1.0, "ask": 1.2, "status": "OK"}]}
+    assert market_quote(good, c) is not None
+    for bad in ({"type": "PUT"}, {"expiration": "2026-05-15"}, {"strike": 105.0},
+                {"status": "UNKNOWN"}):
+        doc = {"contracts": [{**good["contracts"][0], **bad}]}
+        assert market_quote(doc, c) is None, bad
+    assert market_quote(None, c) is None
+
+
+@test
+def an_unmarkable_contract_says_so_instead_of_guessing():
+    o = resolve_pick(_pick(expiration="2026-03-01"), _fwd([100.1] * 5))
+    assert o["status"] == "UNMARKABLE" and "could not mark" in o["detail"]
+
+
+@test
+def the_summary_excludes_open_positions_rather_than_counting_them_flat():
+    """Averaging an unresolved position in as zero drags every variant toward
+    the middle and understates both winners and losers."""
+    resolved = resolve_pick(_pick(), _fwd([100.2, 100.3, 100.1, 100.4, 100.5]))
+    open_ = resolve_pick(_pick(), [])
+    rows = summarise([resolved, open_])
+    assert len(rows) == 1 and rows[0]["resolved"] == 1, rows
+    assert summarise([open_]) == []
+
+
+@test
+def the_summary_reports_which_exit_rules_fired():
+    picks = [resolve_pick(_pick(), _fwd([101, 118, 125, 100, 99])),
+             resolve_pick(_pick(), _fwd([100.2, 100.3, 100.1, 100.4, 100.5]))]
+    row = summarise(picks)[0]
+    assert "PROFIT_TARGET:1" in row["exit_triggers"], row
+    assert "TIME_STOP:1" in row["exit_triggers"], row
+    assert row["wins"] + row["losses"] == 2
 
 
 if __name__ == "__main__":

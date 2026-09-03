@@ -61,6 +61,9 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"comma-separated subset of: {', '.join(BY_NAME)}")
     ap.add_argument("--decision-date", default=datetime.now().strftime("%Y-%m-%d"))
     ap.add_argument("--risk-free-rate", type=float, default=ex.DEFAULT_RISK_FREE_RATE)
+    ap.add_argument("--excel", default=None, metavar="PATH",
+                    help="rebuild the full workbook afterwards so the Pick_History tab "
+                         "includes this run (needs openpyxl)")
     a = ap.parse_args(argv)
 
     data_dir = Path(a.data_dir).expanduser().resolve()
@@ -89,6 +92,23 @@ def main(argv: list[str] | None = None) -> int:
         print("Picks need a chain. Re-fetch with --chains:")
         print("    python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT --chains")
         return 1
+
+    # A chain snapshot older than the decision date makes every quote, DTE and
+    # Greek in the picks stale. It still generates - a day-old chain is often the
+    # best available - but silently pricing yesterday's contracts as today's is
+    # how a pick list stops describing anything real.
+    stale = []
+    for ticker, doc_path in data.get("chain_files", {}).items():
+        snap = json.loads(Path(doc_path).read_text(encoding="utf-8"))
+        day = str(snap.get("snapshot_time_utc") or "")[:10]
+        if day and day < a.decision_date:
+            stale.append((ticker, day))
+    if stale:
+        print("\n  WARNING: the newest option chain predates the decision date.")
+        for ticker, day in sorted(stale):
+            print(f"    {ticker}: snapshot {day}, deciding for {a.decision_date}")
+        print("  Quotes, DTE and Greeks below are as of those snapshots, not today.")
+        print("  Re-fetch with --chains for a current chain.")
 
     per_ticker = {}
     for ticker, rows in data["rows"].items():
@@ -153,8 +173,19 @@ def main(argv: list[str] | None = None) -> int:
     path = out_dir / f"picks_{a.decision_date}_{stamp}.json"
     path.write_text(json.dumps(frozen, indent=2, default=str), encoding="utf-8")
 
+    excel_path = None
+    if a.excel:
+        # Rebuild the whole workbook rather than a picks-only one, so Pick_History
+        # shows this run alongside every earlier one. Re-collecting picks up the
+        # file just written.
+        refreshed = ex.collect(data_dir, only, risk_free_rate=a.risk_free_rate,
+                               picks_dir=out_dir)
+        excel_path = ex.write_workbook(refreshed, Path(a.excel).expanduser().resolve())
+
     print("\n" + "=" * 78)
     print(f"Frozen to : {path}")
+    if excel_path:
+        print(f"Workbook  : {excel_path}")
     print(f"SHA-256   : {frozen['picks_sha256']}")
     print("\nCommit this file. It is the record, and unlike the data store it is not")
     print("regenerable - re-running tomorrow produces tomorrow's picks, not today's.")

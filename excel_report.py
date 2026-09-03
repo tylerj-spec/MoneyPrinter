@@ -41,6 +41,7 @@ HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
 DEFAULT_DATA_DIR = MP_V01_DIR / "data_store"
 DEFAULT_OUT_DIR = HERE / "excel_out"
+DEFAULT_PICKS_DIR = HERE / "picks"
 
 # The label contract is imported, never re-derived here. If the definition of
 # the target changes in the codebase, this workbook changes with it.
@@ -373,7 +374,8 @@ def summarize(ticker: str, doc: dict[str, Any], rows: list[dict[str, Any]],
 
 
 def collect(data_dir: Path, only: list[str] | None = None, *,
-            risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict[str, Any]:
+            risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+            picks_dir: Path | None = None) -> dict[str, Any]:
     """Everything the workbook needs, with no Excel dependency in sight."""
     files = find_bar_files(data_dir)
     if only:
@@ -437,7 +439,7 @@ def collect(data_dir: Path, only: list[str] | None = None, *,
                 1 for r in rs if r["gate_decision"] == "PAPER_TRADE_CANDIDATE"),
         })
 
-    return {
+    result = {
         "generated_utc": datetime.now(timezone.utc),
         "data_dir": str(data_dir),
         "files": {t: str(p) for t, p in files.items()},
@@ -450,7 +452,16 @@ def collect(data_dir: Path, only: list[str] | None = None, *,
         "option_summaries": option_summaries,
         "risk_free_rate": risk_free_rate,
         "benchmark_present": benchmark_present,
+        "pick_history": {},
     }
+
+    # The pick history is a VIEW over the frozen files, resolved against the
+    # bars just loaded. It grows by accumulating files on disk, not by anything
+    # the workbook remembers, so regenerating is always safe.
+    pd_ = picks_dir if picks_dir is not None else DEFAULT_PICKS_DIR
+    result["picks_dir"] = str(pd_)
+    result["pick_history"] = load_pick_history(Path(pd_), result, data_dir)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +647,34 @@ def _write_readme(ws, data: dict[str, Any]) -> None:
          "label is measured from the 16:00 close that follows it. The 15-minute gap is "
          "deliberate - the model cannot consume the price it is scored against."),
         ("", ""),
+        ("PICK SHEETS", "Present once picks/ contains at least one frozen run."),
+        ("Pick_History",
+         "Every pick ever made, accumulating across runs. Sourced from the frozen files in "
+         "picks/, not from anything this workbook remembers - so regenerating never loses "
+         "history, and committing picks/ is what preserves it."),
+        ("Pick_Justifications", "The same picks with the full rationale for each."),
+        ("Pick_Performance", "Per variant over RESOLVED picks only. Open positions are "
+                             "excluded rather than counted as flat - a position with no "
+                             "outcome yet is not a zero."),
+        ("Pick_Abstentions", "Every variant/ticker that proposed nothing, and why."),
+        ("exit_trigger",
+         "Which pre-registered rule closed the position, found by walking the path day by "
+         "day rather than only checking the horizon: DTE_FLOOR, PROFIT_TARGET, STOP_LOSS, "
+         "or TIME_STOP if none fired first."),
+        ("exit_ vs horizon_ columns",
+         "Two different questions, never merged. exit_* is what following the rules would "
+         "have returned - path dependent. horizon_* is whether the directional call was "
+         "right, measured at the label horizon regardless of how the position closed."),
+        ("exit_mark_method",
+         "MARKET where a chain snapshot for that date holds the exact contract - a real "
+         "observed quote. MODELLED otherwise: Black-Scholes at that close using the entry "
+         "IV, which assumes volatility never moved. Fetch daily with --chains to accumulate "
+         "the snapshots that turn modelled marks into market ones."),
+        ("integrity",
+         "VOID means that file's picks no longer hash to the digest recorded when they were "
+         "frozen - it was edited after generation. Those rows are shown but excluded from "
+         "Pick_Performance."),
+        ("", ""),
         ("OPTIONS SHEETS", "Present only if you fetched with --chains."),
         ("Options_Summary", "Per underlying: contracts snapshotted, how many carry a two-sided "
                             "quote, how many could be modelled, and how many survive the "
@@ -708,6 +747,18 @@ def _write_readme(ws, data: dict[str, Any]) -> None:
               f"{os_['greeks_modelled']:>5} with Greeks   "
               f"{os_['passed_liquidity_screen']:>4} pass liquidity screen   "
               f"{os_['gate_paper_trade_candidates']} gate candidates")
+
+    hist = data.get("pick_history") or {}
+    if hist.get("outcomes"):
+        res = sum(1 for o in hist["outcomes"] if o["status"] == "RESOLVED")
+        op = sum(1 for o in hist["outcomes"] if o["status"] == "OPEN")
+        print(f"\n  Pick history: {len(hist['outcomes'])} picks across "
+              f"{len(hist['files'])} run(s) — {res} resolved, {op} still open")
+        for row in hist.get("performance", []):
+            hr = f"{row['direction_hit_rate']:.0%}" if row["direction_hit_rate"] is not None else "n/a"
+            mr = f"{row['mean_return_on_premium']:+.1%}" if row["mean_return_on_premium"] is not None else "n/a"
+            print(f"    {row['variant']:<22} {row['resolved']:>3} resolved   "
+                  f"direction {hr:>5}   mean {mr:>7}")
 
     if not data["benchmark_present"]:
         lines.append(("", ""))
@@ -803,6 +854,173 @@ def _write_options_summary(ws, summaries: list[dict[str, Any]]) -> None:
     _finish(ws, OPTION_SUMMARY_COLUMNS, len(summaries))
 
 
+PICK_HISTORY_COLUMNS = [
+    ("decision_date", 14, "yyyy-mm-dd"), ("variant", 21, None), ("ticker", 8, None),
+    ("direction", 10, None), ("composite_score", 15, "0.000"),
+    ("contract", 24, None), ("dte_at_entry", 13, "0"),
+    ("delta_at_entry", 14, "0.0000"), ("iv_at_entry", 12, "0.0%"),
+    ("entry_fill", 11, "#,##0.0000"),
+    ("status", 13, None), ("exit_trigger", 15, None),
+    ("exit_date", 12, "yyyy-mm-dd"), ("days_held", 10, "0"),
+    ("exit_price", 11, "#,##0.0000"), ("exit_mark_method", 17, None),
+    ("exit_return_on_premium", 21, "0.0%"),
+    ("exit_pnl_per_contract", 21, "$#,##0.00"),
+    ("horizon_date", 13, "yyyy-mm-dd"), ("underlying_move_pct", 19, "0.00%"),
+    ("direction_correct", 17, None), ("horizon_return_on_premium", 24, "0.0%"),
+    ("horizon_mark_method", 20, None),
+    ("horizon_trading_days", 20, "0"), ("profit_target_pct", 17, "0%"),
+    ("stop_loss_pct", 14, "0%"), ("min_dte_exit", 13, "0"),
+    ("integrity", 11, None), ("source_file", 42, None), ("detail", 52, None),
+]
+
+PICK_PERF_COLUMNS = [
+    ("variant", 21, None), ("resolved", 10, "0"), ("direction_scored", 17, "0"),
+    ("direction_correct", 18, "0"), ("direction_hit_rate", 19, "0.0%"),
+    ("mean_return_on_premium", 23, "0.0%"), ("best_return", 12, "0.0%"),
+    ("worst_return", 13, "0.0%"), ("wins", 7, "0"), ("losses", 8, "0"),
+    ("modelled_marks", 15, "0"), ("exit_triggers", 44, None),
+]
+
+PICK_ABSTENTION_COLUMNS = [
+    ("decision_date", 14, "yyyy-mm-dd"), ("variant", 21, None), ("ticker", 8, None),
+    ("composite_score", 15, "0.000"), ("reason", 70, None),
+]
+
+
+def load_chains_by_date(data_dir: Path, ticker: str) -> dict[str, dict[str, Any]]:
+    """EVERY chain vintage for one ticker, keyed by snapshot date.
+
+    find_chain_files() returns only the newest, which is right for pricing today
+    but useless for marking a position along a path that closed last week. Daily
+    snapshots are the whole reason the fetcher writes immutable vintages, and
+    this is what makes them pay off.
+    """
+    chains_dir = data_dir / "chains"
+    if not chains_dir.is_dir():
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for path in sorted(chains_dir.glob(f"{ticker}__v*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        day = str(doc.get("snapshot_time_utc") or "")[:10]
+        if day:
+            out[day] = doc           # later vintage for a day supersedes earlier
+    return out
+
+
+def load_pick_history(picks_dir: Path, data: dict[str, Any],
+                      data_dir: Path) -> dict[str, Any]:
+    """Every frozen pick file, resolved against the bars now in the store.
+
+    The pick FILES are the durable record; this is only a view over them. So the
+    history grows by accumulating files, not by anything this function
+    remembers - which is what makes it safe to regenerate the workbook at will.
+
+    A file whose picks no longer hash to their recorded digest is loaded but
+    marked integrity=VOID on every row, and excluded from the performance
+    summary. Reporting a tampered record silently would be worse than not
+    reporting it, because the numbers would look real.
+    """
+    from backtest.costs import CostModel
+    from strategy.picks import verify
+    from strategy.resolve import resolve_pick, summarise
+
+    if not picks_dir.is_dir():
+        return {"outcomes": [], "abstentions": [], "performance": [],
+                "files": [], "rationales": []}
+
+    costs = CostModel()
+    chain_cache: dict[str, dict[str, Any]] = {}
+    outcomes, abstentions, rationales, files = [], [], [], []
+
+    for path in sorted(picks_dir.glob("picks_*.json")):
+        try:
+            frozen = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        ok = verify(frozen)
+        files.append({"file": path.name, "decision_date": frozen.get("decision_date"),
+                      "generated_utc": frozen.get("generated_utc"),
+                      "n_picks": frozen.get("n_picks"),
+                      "integrity": "OK" if ok else "VOID"})
+
+        for pick in frozen.get("picks", []):
+            if pick.get("action") == "ABSTAIN":
+                abstentions.append({
+                    "decision_date": pick.get("decision_date"),
+                    "variant": pick.get("variant"), "ticker": pick.get("ticker"),
+                    "composite_score": pick.get("composite_score"),
+                    "reason": pick.get("reason"),
+                })
+                continue
+            ticker = pick.get("ticker")
+            if ticker not in chain_cache:
+                chain_cache[ticker] = load_chains_by_date(data_dir, ticker)
+            o = resolve_pick(pick, data["rows"].get(ticker, []), chain_cache[ticker], costs)
+            o["integrity"] = "OK" if ok else "VOID"
+            o["source_file"] = path.name
+            outcomes.append(o)
+            rationales.append({
+                "decision_date": pick.get("decision_date"),
+                "variant": pick.get("variant"), "ticker": pick.get("ticker"),
+                "action": pick.get("action"), "contract": o.get("contract"),
+                "status": o.get("status"), "exit_trigger": o.get("exit_trigger"),
+                "rationale": pick.get("rationale"),
+            })
+
+    trusted = [o for o in outcomes if o.get("integrity") == "OK"]
+    return {"outcomes": outcomes, "abstentions": abstentions,
+            "performance": summarise(trusted), "files": files,
+            "rationales": rationales}
+
+
+def _write_pick_history(ws, outcomes: list[dict[str, Any]]) -> None:
+    _write_header(ws, PICK_HISTORY_COLUMNS)
+    for r, o in enumerate(outcomes, start=2):
+        for c, (name, _w, fmt) in enumerate(PICK_HISTORY_COLUMNS, start=1):
+            v = o.get(name)
+            _text_cell(ws, r, c, _as_date(v) if fmt == "yyyy-mm-dd" else v)
+    _finish(ws, PICK_HISTORY_COLUMNS, len(outcomes))
+
+
+def _write_pick_justifications(ws, rationales: list[dict[str, Any]]) -> None:
+    """Prose gets its own sheet.
+
+    A 1,500-character paragraph beside numeric columns makes every row tall
+    enough to hide the table. Same records, different grain.
+    """
+    from openpyxl.styles import Alignment, Font
+
+    cols = [("decision_date", 14), ("variant", 21), ("ticker", 8),
+            ("contract", 24), ("status", 12), ("exit_trigger", 15),
+            ("why this contract", 112)]
+    _write_header(ws, [(n, w, None) for n, w in cols])
+    for r, j in enumerate(rationales, start=2):
+        vals = [_as_date(j.get("decision_date")), j.get("variant"), j.get("ticker"),
+                j.get("contract"), j.get("status"), j.get("exit_trigger"),
+                j.get("rationale")]
+        for c, v in enumerate(vals, start=1):
+            cell = _text_cell(ws, r, c, v)
+            cell.alignment = Alignment(wrap_text=(c == len(vals)), vertical="top")
+        ws.cell(row=r, column=1).number_format = "yyyy-mm-dd"
+        ws.cell(row=r, column=2).font = Font(bold=True)
+        ws.row_dimensions[r].height = max(58, 13 * (len(j.get("rationale") or "") // 105 + 2))
+    if rationales:
+        ws.auto_filter.ref = f"A1:G{len(rationales) + 1}"
+
+
+def _write_simple(ws, columns, rows) -> None:
+    _write_header(ws, columns)
+    for r, row in enumerate(rows, start=2):
+        for c, (name, _w, fmt) in enumerate(columns, start=1):
+            v = row.get(name)
+            _text_cell(ws, r, c, _as_date(v) if fmt == "yyyy-mm-dd" else v)
+    _finish(ws, columns, len(rows))
+
+
 def write_workbook(data: dict[str, Any], out_path: Path) -> Path:
     """Render collected data to .xlsx. Requires openpyxl; nothing else does."""
     try:
@@ -835,6 +1053,16 @@ def write_workbook(data: dict[str, Any], out_path: Path) -> Path:
             _write_options(wb.create_sheet(_sheet_name("Options_", ticker)),
                            data["options"][ticker])
 
+    hist = data.get("pick_history") or {}
+    if hist.get("outcomes") or hist.get("abstentions"):
+        _write_pick_history(wb.create_sheet("Pick_History"), hist.get("outcomes", []))
+        _write_pick_justifications(wb.create_sheet("Pick_Justifications"),
+                                   hist.get("rationales", []))
+        _write_simple(wb.create_sheet("Pick_Performance"), PICK_PERF_COLUMNS,
+                      hist.get("performance", []))
+        _write_simple(wb.create_sheet("Pick_Abstentions"), PICK_ABSTENTION_COLUMNS,
+                      hist.get("abstentions", []))
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
     return out_path
@@ -857,6 +1085,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="output .xlsx path (default: excel_out/moneyprinter_<timestamp>.xlsx)")
     ap.add_argument("--tickers", default=None,
                     help="comma-separated subset; default is everything in the store")
+    ap.add_argument("--picks-dir", default=str(DEFAULT_PICKS_DIR),
+                    help="frozen pick files to build the history sheets from")
     ap.add_argument("--risk-free-rate", type=float, default=DEFAULT_RISK_FREE_RATE,
                     help=f"annualised, for option pricing (default {DEFAULT_RISK_FREE_RATE}). "
                          f"An assumption, not observed data.")
@@ -876,7 +1106,8 @@ def main(argv: list[str] | None = None) -> int:
         print("    python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT")
         return 1
 
-    data = collect(data_dir, only, risk_free_rate=a.risk_free_rate)
+    data = collect(data_dir, only, risk_free_rate=a.risk_free_rate,
+                   picks_dir=Path(a.picks_dir).expanduser())
     if not data["rows"]:
         print("\nThe data store has no bar files matching that selection.")
         print("Fetch some data first:")
