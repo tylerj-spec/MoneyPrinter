@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-124 tests passing (`python run_tests.py`): 94 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+132 tests passing (`python run_tests.py`): 102 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
@@ -93,7 +93,7 @@ A point-in-time-correct research pipeline, built to make hindsight structurally 
 | `labels/contract.py` | Label = binary sign of 5-trading-day forward log excess total return vs. SPY. Decision clock (15:45 ET) precedes the close it's scored against. Fails closed on unknown data. |
 | `backtest/costs.py` | Spread/slippage/fee modeling; stale and wide quotes are rejected, not used. |
 | `backtest/walkforward.py` | Chronological train/test splits with purge gap tied to label horizon, plus embargo. |
-| `backtest/evaluate.py` | Noise floor via permutation test — distinguishes real edge from chance. Validated to read `NO_EDGE` on pure random data. |
+| `backtest/evaluate.py` | Noise floor via permutation test, with the model **refit under permutation** and the permutation done in **blocks** so overlapping labels keep their autocorrelation. Validated to read `NO_EDGE` on pure random data, including for a genuinely fitted strategy. |
 | `gates/risk.py` | Deterministic `PASS` / `WATCH` / `PAPER_TRADE_CANDIDATE` decision gate, outside model judgment. Unknown/invalid inputs fail closed. |
 | `adapters/yahoo_daily.py` | Free daily equity bars with realistic publication lag. |
 | `adapters/eodhd_options.py` | Paid options chain adapter; token read from env only. |
@@ -111,10 +111,10 @@ echoed into the console, so anything the GUI does you can also do from a termina
 
 **Command line**:
 ```bash
-python run_tests.py        # every suite: pipeline, Excel export, GUI (124 tests)
+python run_tests.py        # every suite: pipeline, Excel export, GUI (132 tests)
 
 cd claude/app/mp_v01
-python run_all.py          # just the zero-dependency pipeline suite (94 tests)
+python run_all.py          # just the zero-dependency pipeline suite (102 tests)
 
 pip install yfinance
 python fetch_data.py --tickers SPY,QQQ,MSFT --chains
@@ -309,4 +309,4 @@ Write these numbers down **now** and put in STATE.md:
 ---
 
 **Last Updated**: August 29, 2026  
-**Version**: 2.4.0 (Options Greeks, Excel export, rebuilt GUI, 124 tests)
+**Version**: 2.5.0 (Permutation null fixed, Options Greeks, Excel export, 132 tests)

@@ -10,7 +10,7 @@
 
 ## 0. Headline
 
-> **Status 2026-09-02.** Six of the eleven findings are fixed (§1.1, §1.2, §1.3, §3.3, §3.4, §3.5) and §3.1 is verified. The two that remain — §2.1 and §2.2, both inherited from the previous review — are architectural, and are deliberately left for a session with the attention they deserve: each changes a public interface, and getting either wrong costs more than leaving it documented and visible.
+> **Status 2026-09-03.** Eight of the eleven findings are fixed (§1.1, §1.2, §1.3, §2.2, §2.3, §3.3, §3.4, §3.5) and §3.1 is verified. **§2.1 — the purge gap — is the last blocking one**, and it is the only remaining obstacle to a Phase 3 null run on real bars. §3.2 (`src/strategy/` is empty) is not a bug but is now the binding constraint on producing anything to evaluate.
 
 The 2026-08-13 review was accurate. Three weeks later, its three blocking findings are **still live in `main`** (§2 below). That is the single most important fact in this document: the problem is not that these defects are unknown, it is that knowing about them has not yet changed the code.
 
@@ -131,8 +131,8 @@ LEAK: True
 
 **Fix:** as the prior review prescribes — purge in bar-index space. But write the Thanksgiving-week regression test **first** and watch `purge_gap_prevents_label_horizon_bleed` fail alongside it. That existing test is part of the defect and must be rewritten, not preserved.
 
-### 2.2 The permutation null never refits
-`src/backtest/evaluate.py` — see prior review §1.2(b)
+### 2.2 The permutation null never refits — FIXED 2026-09-03
+`src/backtest/evaluate.py` — see prior review §1.2(a) and §1.2(b)
 
 `predict_fn(feats)` sits inside the permutation loop but takes no labels, so it returns the identical prediction vector on all 200 iterations.
 
@@ -145,12 +145,30 @@ predict_fn calls: 204   (4 scoring + 4×50 permutation)
 distinct feature inputs ever passed: 1
 ```
 
-**Fix:** as prescribed — change the interface to `fit_predict_fn(train_X, train_y, test_X)` and refit inside each permutation. This is the highest-leverage fix in the repository, because it is the instrument every later result is read on. Phase 4's component rank IC means nothing until the null is right.
+**Fixed 2026-09-03**, and the prior review's §1.2(a) with it — the two were one defect wearing two hats.
 
-### 2.3 The leakage guard is still not in the path
-`src/backtest/walkforward.py` — see prior review §1.3
+**(b) The fit is now in the null.** The interface is `fit_predict_fn(train_X, train_y, test_X)` and folds are `Fold` objects carrying train and test data. Under permutation the model is refit on permuted *training* labels, so whatever a procedure can wring out of noise is priced into the noise floor. A regression test spies on the labels the callback receives and asserts they actually change across permutations.
 
-`assert_no_future_features` remains defined, tested, and never called by `evaluate_walk_forward`. Confirmed unchanged.
+**(a) The permutation now preserves autocorrelation.** This was the more dangerous half and was still open. Labels are 5-day forward returns computed daily, so consecutive labels share four of five days. An IID shuffle destroys that dependence and makes the null *too tight* — smaller `permutation_std`, larger `z`, smaller `p` — biasing the harness toward reporting edge. Permutation is now over contiguous blocks of `2 × label_horizon`. `block_size=1` still reaches the old behaviour, kept only so the bias can be demonstrated rather than asserted.
+
+`demo/run_noise_floor.py` now measures the distortion on overlapping labels — same strategy, same data, only the null differing:
+
+```
+                              null std        z        p
+  IID shuffle (the old null)    0.0156    -0.20   0.5572
+  block permutation             0.0204    -0.10   0.5622
+
+  The IID null is 23% tighter than the honest one.
+```
+
+The demo also gained a genuinely *fitted* strategy — a momentum threshold searched on the training labels — because a fixed rule cannot exercise the refit path at all. All three strategies still read `NO_EDGE` on a random walk, which is the property that makes the harness trustworthy.
+
+### 2.3 The leakage guard is still not in the path — FIXED 2026-09-03
+`src/backtest/walkforward.py`, `src/backtest/evaluate.py` — see prior review §1.3
+
+`assert_no_future_features` was defined, tested, and never called by `evaluate_walk_forward`, because folds were bare `(features, labels)` tuples carrying no timestamps to check.
+
+**Fixed** as a consequence of the §2.2 interface change: `Fold` now optionally carries `train_times` and `test_times`, and when present `evaluate_walk_forward` checks them itself — test data strictly after training data, with a purge gap of at least the label horizon. It cannot invent timestamps that were never supplied, but it will no longer let a fold through that trains on the future. A guard you have to remember to call is a guard that eventually doesn't get called.
 
 ---
 
@@ -246,11 +264,11 @@ Recorded because the findings above are only worth acting on if the foundation i
 
 ## 5. Recommended order of work
 
-1. **Fix the null first (§2.2).** Every result the project will ever produce is read on this instrument. Nothing downstream means anything until it is calibrated.
-2. **Write the failing purge test, then fix the purge (§2.1).** Construct a split spanning Thanksgiving week and assert it is rejected. It will fail, and so will the existing `purge_gap_prevents_label_horizon_bleed`. Do not fix the code first — you want to see both tests fail.
+1. ~~**Fix the null first (§2.2).**~~ **Done 2026-09-03**, along with §2.3. The instrument is now calibrated: the fit is inside the null, and the permutation respects label overlap.
+2. **Write the failing purge test, then fix the purge (§2.1).** ← **now the top of the list.** Construct a split spanning Thanksgiving week and assert it is rejected. It will fail, and so will the existing `purge_gap_prevents_label_horizon_bleed`. Do not fix the code first — you want to see both tests fail.
 3. ~~**Close the three fail-closed holes (§1.1, §1.2, §1.3).**~~ **Done 2026-09-02**, along with §3.3, §3.4 and §3.5. Core suite 76 → 81 tests; 105 across the repo.
 4. **Decide the split guard (§3.1).** The assumption is verified and documented; what remains is choosing between a magnitude threshold and a split cross-check, and pinning `yfinance` to the version that actually fetched (§3.5).
-5. **Then start Phase 3.** Running a deliberately worthless strategy on real bars before step 1 would tell you nothing — a null that cannot price overfitting cannot certify a null result either.
+5. **Then start Phase 3.** With the null fixed this is now genuinely informative: run a deliberately worthless strategy on real bars and confirm `NO_EDGE`. It needs §2.1 closed first — a leaky split would flatter even a worthless strategy — and something in `src/strategy/` to run (§3.2).
 
 ---
 
