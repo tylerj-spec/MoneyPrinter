@@ -53,9 +53,9 @@ import math
 import random
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
-from .walkforward import LeakageError
+from .walkforward import LeakageError, TradingCalendar
 
 # Default label horizon, in observations. Blocks are twice this so a block
 # spans more than one label's worth of overlap.
@@ -93,11 +93,21 @@ class Fold:
                 f"{len(self.test_y)} test labels")
 
 
-def _assert_fold_is_chronological(fold: Fold, label_horizon: int) -> None:
+def _assert_fold_is_chronological(fold: Fold, label_horizon: int,
+                                  calendar: TradingCalendar | None) -> None:
     """Test data must come strictly after training data, with a purge gap.
 
     Only runs when decision times were supplied. It cannot invent them, but
     when they exist it will not let a fold through that trains on the future.
+
+    The purge is counted in SESSIONS. This function used to count
+    `(first_test - last_train).days`, which is the same defect walkforward.py
+    carried: a five-calendar-day gap over Thanksgiving week is one session, and
+    the guard would pass a fold whose training labels resolve three sessions
+    into the test window. A fold cannot supply the missing calendar itself —
+    the purged sessions are, by construction, the ones absent from both halves —
+    so it has to be handed in, and a fold carrying times but no calendar is
+    refused rather than approximated.
     """
     if not fold.train_times or not fold.test_times:
         return
@@ -106,12 +116,23 @@ def _assert_fold_is_chronological(fold: Fold, label_horizon: int) -> None:
         raise LeakageError(
             f"fold {fold.index}: last training decision {last_train} is not "
             f"before the first test decision {first_test}")
-    gap_days = (first_test - last_train).days
-    if gap_days < label_horizon:
+    if label_horizon <= 0:
+        return
+    if calendar is None:
         raise LeakageError(
-            f"fold {fold.index}: purge gap {gap_days}d < label horizon "
-            f"{label_horizon}. The last training labels resolve after the test "
-            f"window opens, leaking the future into training.")
+            f"fold {fold.index}: decision times were supplied but no trading "
+            f"calendar was. The label horizon is {label_horizon} TRADING days "
+            f"and calendar arithmetic cannot count those, so the purge gap "
+            f"cannot be verified. Pass sessions=<the dates of your bars> to "
+            f"evaluate_walk_forward.")
+    gap = calendar.sessions_strictly_between(last_train, first_test)
+    if gap < label_horizon:
+        raise LeakageError(
+            f"fold {fold.index}: purge gap {gap} session(s) < label horizon "
+            f"{label_horizon}. {last_train.date()} -> {first_test.date()} is "
+            f"{(first_test - last_train).days} calendar day(s) but only {gap} "
+            f"of them were sessions, so the last training labels resolve at or "
+            f"after the test window opens, leaking the future into training.")
 
 
 def block_permute(labels: Sequence[int], block_size: int, rng: random.Random) -> list[int]:
@@ -214,10 +235,16 @@ def evaluate_walk_forward(
     seed: int = 7,
     label_horizon: int = DEFAULT_LABEL_HORIZON,
     block_size: int | None = None,
+    sessions: TradingCalendar | Iterable[Any] | None = None,
 ) -> EvalReport:
     """
     folds          : chronological Fold objects carrying train AND test data
     fit_predict_fn : (train_X, train_y, test_X) -> predicted 0/1 for test_X
+    sessions       : the trading calendar the folds were cut from, as a
+                     TradingCalendar or any iterable of session dates. Required
+                     only when folds carry decision times, and required in that
+                     case: the purge gap is measured in trading days, and
+                     nothing else here can count them.
 
     The function is called once per fold to score the strategy, then
     n_permutations more times per fold with permuted training labels to build
@@ -226,13 +253,15 @@ def evaluate_walk_forward(
     """
     if block_size is None:
         block_size = max(1, 2 * label_horizon)
+    calendar = sessions if isinstance(sessions, TradingCalendar) or sessions is None \
+        else TradingCalendar.from_dates(sessions)
 
     rep = EvalReport(strategy_name=strategy_name, n_permutations=n_permutations,
                      block_size=block_size)
 
     all_labels: list[int] = []
     for fold in folds:
-        _assert_fold_is_chronological(fold, label_horizon)
+        _assert_fold_is_chronological(fold, label_horizon, calendar)
         preds = fit_predict_fn(fold.train_X, fold.train_y, fold.test_X)
         if len(preds) != len(fold.test_y):
             raise ValueError(

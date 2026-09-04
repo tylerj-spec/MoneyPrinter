@@ -10,7 +10,7 @@
 
 ## 0. Headline
 
-> **Status 2026-09-03.** Eight of the eleven findings are fixed (§1.1, §1.2, §1.3, §2.2, §2.3, §3.3, §3.4, §3.5) and §3.1 is verified. **§2.1 — the purge gap — is the last blocking one**, and it is the only remaining obstacle to a Phase 3 null run on real bars. §3.2 (`src/strategy/` is empty) is not a bug but is now the binding constraint on producing anything to evaluate.
+> **Status 2026-09-04.** All eleven findings are now fixed or resolved. §2.1 — the purge gap, the last blocking one — is closed: the purge is counted in trading sessions against a trading-day horizon, and the test that certified the old behaviour has been rewritten. §3.1 is closed too, with a split cross-check that is pure and runs offline. **Nothing blocks a Phase 3 null run on real bars.**
 
 The 2026-08-13 review was accurate. Three weeks later, its three blocking findings are **still live in `main`** (§2 below). That is the single most important fact in this document: the problem is not that these defects are unknown, it is that knowing about them has not yet changed the code.
 
@@ -102,7 +102,7 @@ RAISED TypeError: '<=' not supported between instances of 'int' and 'str'
 
 These restate the 2026-08-13 review. They are repeated here with reproductions because a reproduction is more actionable than a description, and because three weeks have passed.
 
-### 2.1 Purge gap counts calendar days — and the test certifies the bug
+### 2.1 Purge gap counts calendar days — and the test certifies the bug — FIXED 2026-09-04
 `src/backtest/walkforward.py` — see prior review §1.1
 
 The prior review is correct. What it does not say is that **the test suite asserts the buggy behaviour is right**:
@@ -129,7 +129,19 @@ i.e. 2024-07-05 — which is 1 day INSIDE the test window.
 LEAK: True
 ```
 
-**Fix:** as the prior review prescribes — purge in bar-index space. But write the Thanksgiving-week regression test **first** and watch `purge_gap_prevents_label_horizon_bleed` fail alongside it. That existing test is part of the defect and must be rewritten, not preserved.
+**Fixed 2026-09-04.** The purge is now counted in trading sessions, in two places — `Split.validate` and `evaluate._assert_fold_is_chronological` carried the same defect, and fixing one would have left the other certifying leaks.
+
+A new `TradingCalendar` holds the sessions that actually happened. It is built from the dates of the bars you have, because this repository has no holiday table and adding a hand-typed one would be an assumption wearing the costume of data. A consequence worth stating: a gap in your data is indistinguishable from a closure, so the purge over-drops rather than under-drops, which is the safe direction.
+
+**The rule, stated precisely.** A label decided on session `i` resolves at session `i + H`, so the test window may open no earlier than `i + H + 1` — H whole sessions strictly between the last training session and the first test session. Opening *on* `i + H` is already a leak: that session's close determines the training label's outcome and is not known at the 15:45 ET decision on the same day.
+
+**`calendar` is a required argument, not an optional one.** A guard that cannot count what it claims to check should refuse rather than approximate, so `validate(5)` is now a `TypeError` at the call site and a fold carrying decision times but no calendar raises `LeakageError`. The old code's failure mode was worse than being wrong: it was *confidently* wrong, reporting a verified purge it had no way to verify.
+
+**The second symptom is gone too.** `make_splits` now lays splits out in session-index space, so every boundary is a real session by construction. It previously ended training on Saturday 2024-06-29 and opened testing on 2024-07-04, a market holiday, because it only ever added timedeltas. Its size parameters are now counts of sessions, not calendar days — `train_sessions=180` is roughly nine months, not six.
+
+Five new tests, and the reviewer's prescription was followed: the arithmetic was reverted afterwards to confirm `purge_gap_is_counted_in_sessions_not_calendar_days` and `thanksgiving_week_purge_that_calendar_arithmetic_called_safe` both fail without the fix and pass with it. `purge_gap_prevents_label_horizon_bleed` was rewritten rather than preserved, as instructed. Its replacement needs no holiday at all to make the point — Fri 2024-03-15 to Fri 2024-03-22 is 7 calendar days and 4 sessions, so an ordinary weekend was always enough to defeat the old rule.
+
+One thing the fix surfaced that the review did not anticipate: a UTC-midnight datetime is the *previous* session in New York, so `2024-11-28T00:00:00Z` names the 27th. Real timestamps in this codebase (16:00 ET closes, 15:45 ET decisions) round-trip correctly, but the old tests used UTC midnight as a stand-in for a day. Session dates are now read in ET, and a test pins that.
 
 ### 2.2 The permutation null never refits — FIXED 2026-09-03
 `src/backtest/evaluate.py` — see prior review §1.2(a) and §1.2(b)
@@ -174,7 +186,7 @@ The demo also gained a genuinely *fitted* strategy — a momentum threshold sear
 
 ## 3. Medium and low severity
 
-### 3.1 Split adjustment was an undocumented assumption — now verified, still untested
+### 3.1 Split adjustment was an undocumented assumption — FIXED 2026-09-04
 `src/adapters/yahoo_daily.py` — `daily_total_return()`
 
 **Status: the assumption holds.** Severity downgraded from Medium; the finding stays open on the narrower ground below.
@@ -193,12 +205,17 @@ So Yahoo's `Close` is split-adjusted and dividend-unadjusted, which is exactly w
 
 **What remains.** Documenting an assumption is not testing it. This is still a property of a third-party scraper the repository elsewhere describes as breaking regularly, and if a future change makes `Close` genuinely raw, every split in the history becomes a fabricated ~−90% move that the label contract will faithfully score as real. Nothing in the pipeline would complain.
 
-**Remaining fix — a judgment call, deliberately not made unilaterally.** Two options, with a real tradeoff:
+**Fixed 2026-09-04 — the cross-check, with the review's objection to it removed.** The choice was between a magnitude threshold (simple, offline-testable, but blunt: a genuine −40% earnings collapse is a real observation, and marking it `UNKNOWN` silently deletes exactly the tail events a risk model exists to see) and a split cross-check (precise, no false positives on real crashes, but the review believed it had to live in the live-fetch path and so could not be tested offline).
 
-- **Magnitude threshold** in `normalize_bars`: flag any single-day move beyond some bound as `UNKNOWN`. Simple, offline-testable, but blunt — a genuine −40% earnings collapse is a real observation and marking it `UNKNOWN` silently deletes exactly the tail events that matter most to a risk model.
-- **Split cross-check**: fetch `yf.Ticker(t).splits` alongside the dividends this adapter already fetches, and assert no return straddling a split date matches the unadjusted price ratio. Precise, no false positives on real crashes, but it lives in the live-fetch path and cannot be tested offline.
+That last clause turned out not to be true, and it was the only thing making this a tradeoff. **`check_split_adjustment()` is pure** — it takes rows and split ratios and touches no network. Only the *fetching* of `yf.Ticker(t).splits` is live; the judgment is offline and has eight tests behind it. So the precision of the cross-check comes with the testability of the threshold, and there is nothing left to trade.
 
-The second is better and is what the hazard actually calls for. It needs a decision about where the threshold sits and a machine with network access to develop against.
+**How it discriminates.** On the effective date of an r-for-1 split, an adjusted `Close` moves an ordinary amount and a raw one moves by almost exactly `1/r`. For NVDA's 10-for-1 that is +0.75% versus −90% — not a close call. The check fires on the *arithmetic signature* of an unadjusted series, not on the size of a move, which is precisely why a real −40% day on a split date is left alone. There is a test asserting exactly that.
+
+**The repair is surgical, which was not obvious going in.** In a raw series only the return that *straddles* the split is wrong; every other day is priced within one consistent regime and is fine. So a flagged date loses its return and keeps its prices, and the chain continues into the new regime rather than being broken. Dropping the whole series, or even the following day, would be over-correction.
+
+**What it deliberately does not cover.** Splits smaller than 2-for-1 are reported `IMMATERIAL` rather than checked: a 5-for-4's unadjusted signature is a −20% day, which a real session can produce, so flagging it would cost false positives on real moves. That is an acceptable hole because the hazard is a *vendor-wide* change in behaviour, and a vendor that starts serving raw closes serves them for the big splits too. Reporting `IMMATERIAL` rather than skipping silently is the difference between a known hole and an invisible one.
+
+`fetch_data.py` prints the verdict on every fetch — a loud multi-line warning on failure, one line of confirmation otherwise — and writes every check into the vintage file, so a future upgrade that breaks the assumption is caught by the run that breaks it rather than by a −90% move in a workbook months later.
 
 ### 3.2 `src/strategy/` is an empty package — FIXED 2026-09-03
 `src/strategy/__init__.py` — was 0 lines
@@ -269,10 +286,10 @@ Recorded because the findings above are only worth acting on if the foundation i
 ## 5. Recommended order of work
 
 1. ~~**Fix the null first (§2.2).**~~ **Done 2026-09-03**, along with §2.3. The instrument is now calibrated: the fit is inside the null, and the permutation respects label overlap.
-2. **Write the failing purge test, then fix the purge (§2.1).** ← **now the top of the list.** Construct a split spanning Thanksgiving week and assert it is rejected. It will fail, and so will the existing `purge_gap_prevents_label_horizon_bleed`. Do not fix the code first — you want to see both tests fail.
+2. ~~**Write the failing purge test, then fix the purge (§2.1).**~~ **Done 2026-09-04.** Both purge tests were confirmed to fail against the old arithmetic before the fix was kept.
 3. ~~**Close the three fail-closed holes (§1.1, §1.2, §1.3).**~~ **Done 2026-09-02**, along with §3.3, §3.4 and §3.5. Core suite 76 → 81 tests; 105 across the repo.
-4. **Decide the split guard (§3.1).** The assumption is verified and documented; what remains is choosing between a magnitude threshold and a split cross-check, and pinning `yfinance` to the version that actually fetched (§3.5).
-5. **Then start Phase 3.** With the null fixed this is now genuinely informative: run a deliberately worthless strategy on real bars and confirm `NO_EDGE`. It needs §2.1 closed first — a leaky split would flatter even a worthless strategy — and something in `src/strategy/` to run (§3.2).
+4. ~~**Decide the split guard (§3.1).**~~ **Done 2026-09-04** — the cross-check, made pure so it tests offline. `yfinance` is pinned to 1.7.0 in both files (§3.5).
+5. **Then start Phase 3.** ← **now the top of the list, and unblocked.** With the null fixed and the purge honest this is genuinely informative: run a deliberately worthless strategy on real bars and confirm `NO_EDGE`. Both preconditions are met — §2.1 is closed (a leaky split would have flattered even a worthless strategy) and `src/strategy/` has five variants to run (§3.2).
 
 ---
 

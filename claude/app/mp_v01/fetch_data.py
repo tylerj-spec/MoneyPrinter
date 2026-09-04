@@ -28,7 +28,8 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from adapters.yahoo_daily import normalize_bars, fetch_daily_bars_yfinance  # noqa: E402
+from adapters.yahoo_daily import (normalize_bars, fetch_daily_bars_yfinance,  # noqa: E402
+                                  check_split_adjustment)
 
 UNIVERSE = ["SPY", "QQQ", "MSFT"]          # approved first slice (INDEX_PLUS_ONE)
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_store")
@@ -63,6 +64,12 @@ def fetch_bars(start: str, end: str, tickers: list[str]) -> int:
         ok = sum(1 for r in norm if r["status"] == "OK")
         unknown = sum(1 for r in norm if r["status"] == "UNKNOWN")
 
+        # The split-adjustment guard. daily_total_return() has no split term and
+        # is correct only while Yahoo's Close stays split-adjusted; this is where
+        # that assumption gets checked rather than assumed.
+        checks = check_split_adjustment(raw)
+        broken = [c for c in checks if c.failed]
+
         path = os.path.join(DATA_DIR, "bars", f"{t}_{start}_{end}__v{vintage}.json")
         with open(path, "w") as f:
             json.dump({
@@ -73,10 +80,22 @@ def fetch_bars(start: str, end: str, tickers: list[str]) -> int:
                 "row_count": len(norm),
                 "usable_returns": ok,
                 "unknown_rows": unknown,
+                "split_checks": [c.__dict__ for c in checks],
                 "rows": norm,
             }, f, indent=2, default=_iso)
 
         print(f"{len(norm)} bars, {ok} usable returns, {unknown} UNKNOWN -> {os.path.basename(path)}")
+        if broken:
+            print(f"    *** SPLIT ADJUSTMENT CHECK FAILED on {len(broken)} split(s) for {t}.")
+            for c in broken:
+                print(f"        {c.date}: {c.detail}")
+            print(f"        Those returns are marked SPLIT_UNADJUSTED and excluded.")
+            print(f"        This means Yahoo's Close may no longer be split-adjusted, which")
+            print(f"        would make daily_total_return() wrong across EVERY split. Verify")
+            print(f"        before trusting any history built from this fetch.")
+        elif any(c.verdict == "ADJUSTED" for c in checks):
+            n = sum(1 for c in checks if c.verdict == "ADJUSTED")
+            print(f"    split adjustment verified against {n} split(s)")
         total += len(norm)
     return total
 
