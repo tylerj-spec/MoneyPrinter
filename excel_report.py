@@ -742,24 +742,6 @@ def _write_readme(ws, data: dict[str, Any]) -> None:
         lines.append((ticker, path))
     if not data["files"]:
         lines.append(("(none)", "The data store was empty. Fetch data first."))
-    for os_ in data.get("option_summaries", []):
-        print(f"  {os_['underlying']:<8} {os_['contracts']:>6} contracts   "
-              f"{os_['greeks_modelled']:>5} with Greeks   "
-              f"{os_['passed_liquidity_screen']:>4} pass liquidity screen   "
-              f"{os_['gate_paper_trade_candidates']} gate candidates")
-
-    hist = data.get("pick_history") or {}
-    if hist.get("outcomes"):
-        res = sum(1 for o in hist["outcomes"] if o["status"] == "RESOLVED")
-        op = sum(1 for o in hist["outcomes"] if o["status"] == "OPEN")
-        print(f"\n  Pick history: {len(hist['outcomes'])} picks across "
-              f"{len(hist['files'])} run(s) — {res} resolved, {op} still open")
-        for row in hist.get("performance", []):
-            hr = f"{row['direction_hit_rate']:.0%}" if row["direction_hit_rate"] is not None else "n/a"
-            mr = f"{row['mean_return_on_premium']:+.1%}" if row["mean_return_on_premium"] is not None else "n/a"
-            print(f"    {row['variant']:<22} {row['resolved']:>3} resolved   "
-                  f"direction {hr:>5}   mean {mr:>7}")
-
     if not data["benchmark_present"]:
         lines.append(("", ""))
         lines.append(
@@ -1118,6 +1100,24 @@ def main(argv: list[str] | None = None) -> int:
         base = f"{s['base_rate_y1']:.1%}" if s["base_rate_y1"] is not None else "n/a"
         print(f"  {s['ticker']:<8} {s['bars']:>6} bars  {s['first_date']} -> {s['last_date']}"
               f"   labels {s['labels_usable']}/{s['labels_total']} usable   base rate {base}")
+
+    for os_ in data.get("option_summaries", []):
+        print(f"  {os_['underlying']:<8} {os_['contracts']:>6} contracts   "
+              f"{os_['greeks_modelled']:>5} with Greeks   "
+              f"{os_['passed_liquidity_screen']:>4} pass liquidity screen   "
+              f"{os_['gate_paper_trade_candidates']} gate candidates")
+
+    hist = data.get("pick_history") or {}
+    if hist.get("outcomes"):
+        res = sum(1 for o in hist["outcomes"] if o["status"] == "RESOLVED")
+        op = sum(1 for o in hist["outcomes"] if o["status"] == "OPEN")
+        print(f"\n  Pick history: {len(hist['outcomes'])} picks across "
+              f"{len(hist['files'])} run(s) — {res} resolved, {op} still open")
+        for row in hist.get("performance", []):
+            hr = f"{row['direction_hit_rate']:.0%}" if row["direction_hit_rate"] is not None else "n/a"
+            mr = f"{row['mean_return_on_premium']:+.1%}" if row["mean_return_on_premium"] is not None else "n/a"
+            print(f"    {row['variant']:<22} {row['resolved']:>3} resolved   "
+                  f"direction {hr:>5}   mean {mr:>7}")
 
     if not data["benchmark_present"]:
         print(f"\n  WARNING: {BENCHMARK} is not in the store. Excess return vs {BENCHMARK}")
