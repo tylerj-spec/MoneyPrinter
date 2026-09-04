@@ -165,7 +165,14 @@ def check_workbooks() -> None:
                 first = z.read("xl/worksheets/sheet1.xml").decode(errors="replace")
                 bad = first.count("<f>")
             import openpyxl
-            names = openpyxl.load_workbook(p, read_only=True).sheetnames
+            # read_only mode holds the file open until close() is called. Left
+            # dangling it locks the workbook on Windows, so a later export or a
+            # tidy-up cannot touch it.
+            _wb = openpyxl.load_workbook(p, read_only=True)
+            try:
+                names = _wb.sheetnames
+            finally:
+                _wb.close()
             print(f"      {len(parts)} sheets: {', '.join(names)}")
             has_opt = any(n.startswith("Options_") for n in names)
             has_pick = any(n.startswith("Pick_") for n in names)
