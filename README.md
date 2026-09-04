@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-161 tests passing (`python run_tests.py`): 131 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+163 tests passing (Run → Run the test suite, or `python run_tests.py`): 131 in `claude/app/mp_v01/`, 32 covering the Excel export and GUI. CI runs on Linux **and Windows**. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
@@ -32,6 +32,7 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ├── resolve_picks.py               Scores an earlier pick file against what happened
 ├── picks/                         The forward paper record - COMMIT THESE
 ├── run_gui.bat                    Windows double-click launcher for the GUI
+├── diagnose.py                    Setup report - what this copy is and what it produced
 ├── excel_report.py                Data store -> .xlsx (bars, labels, summary)
 ├── run_tests.py                   Runs every suite in the repo
 ├── tests/                         Tests for the Excel export and the GUI
@@ -101,106 +102,58 @@ A point-in-time-correct research pipeline, built to make hindsight structurally 
 | `adapters/yahoo_daily.py` | Free daily equity bars with realistic publication lag. |
 | `adapters/eodhd_options.py` | Paid options chain adapter; token read from env only. |
 
-### Running the production system:
+### Running it
 
-**GUI** (from repo root):
-```bash
-python gui.py               # or double-click run_gui.bat on Windows
-```
+Everything is a button. There are no commands to type.
 
-Three buttons, in order: fetch data, build the Excel workbook, open the folder.
-The test suite and the dev-only MIE sit under Advanced. Every command it runs is
-echoed into the console, so anything the GUI does you can also do from a terminal.
+**Windows:** double-click `run_gui.bat`.
+**macOS / Linux:** `python gui.py`.
 
-**Command line**:
-```bash
-python run_tests.py        # every suite: pipeline, Excel export, GUI (161 tests)
+First time only, inside the app: **Install required packages**, then **Check setup**.
+That installs `yfinance`, `openpyxl` and `tzdata` into the right interpreter and
+confirms the install worked. If anything ever looks wrong, **Check setup** is the
+first thing to press — it reports which commit you are on, what data you have, and
+whether a workbook was built by older code.
 
-cd claude/app/mp_v01
-python run_all.py          # just the zero-dependency pipeline suite (131 tests)
+### What the buttons do
 
-pip install yfinance
-python fetch_data.py --tickers SPY,QQQ,MSFT --chains
-```
-
----
-
-## Working in Excel
-
-`excel_report.py` turns the point-in-time store into one workbook. It imports
-`labels/contract.py` rather than re-deriving the target, so the spreadsheet and
-the codebase cannot drift apart on what `y` means.
-
-```bash
-python excel_report.py                      # everything in the store
-python excel_report.py --tickers SPY,MSFT   # a subset
-```
-
-| Sheet | What's in it |
-|-------|--------------|
-| `README` | Generated timestamp, source vintage files, label definition, what every status value means |
-| `Summary` | One row per ticker: coverage, gap count, label base rate |
-| `Bars_<TICKER>` | OHLCV, dividends, daily total return, both PIT timestamps, plus **live formulas** for `sma_20`, `sma_50`, `vol_20d_annualised` |
-| `Labels` | The label contract v1.0 target: 5-day forward log excess total return vs SPY, its sign, and the fail-closed status |
-| `Options_Summary` | Per underlying: contracts snapshotted, how many carry a two-sided quote, how many could be modelled, how many survive the liquidity screen |
-| `Options_<TICKER>` | One row per contract — quote, solved IV, the five Greeks, execution cost, and the screens. Only present if you fetched with `--chains` |
-| `Pick_History` | **Every pick ever made**, accumulating across runs, with the outcome and which exit rule closed it |
-| `Pick_Justifications` | The same picks with the full paragraph of reasoning for each |
-| `Pick_Performance` | Per variant over resolved picks: direction hit rate, mean return, which rules fired |
-| `Pick_Abstentions` | Every variant/ticker that proposed nothing, and why |
-
-The SMA and volatility columns are real Excel formulas, not pasted values — widen
-the `AVERAGE()` range and the column recalculates, so windows can be retuned in
-the sheet without touching Python. All three look backwards only.
-
-Three things worth knowing before you trust a cell:
-
-- **Blank means missing.** Nothing is interpolated or forward-filled. A gap breaks
-  the return chain and turns the affected labels `RETURN_GAP_UNRESOLVED`.
-- **`available_time_utc` is the only timestamp a backtest may filter on.** It is the
-  morning *after* the session, not that session's own close.
-- **The `Labels` sheet is the answer key.** Forward-looking by construction: correct
-  for fitting and scoring, never as an input feature.
-- **SPY must be in the store.** Excess return vs SPY is undefined without it, so no
-  labels are built for other tickers and the workbook says so rather than
-  substituting a different benchmark.
-
-Each export writes a new timestamped file under `excel_out/`, so a workbook you have
-edited by hand is never overwritten.
-
-### Options and the Greeks
-
-Yahoo publishes a two-sided quote, volume, open interest and its own IV figure — **not**
-Greeks. So the Greeks are computed, by `src/options/greeks.py` (Black-Scholes, standard
-library only, 13 tests against published reference values and put-call parity).
-
-What that means for reading the sheet:
-
-| | |
+| Button | What it does |
 |---|---|
-| **Observed** | bid, ask, strike, expiration, volume, open interest, underlying close |
-| **Modelled** | `iv_solved` and every Greek |
+| **Install required packages** | Installs the three packages a first run needs, into the interpreter the app is running on. Safe to repeat. |
+| **Check setup** | Read-only report: commit, features present, data store contents, pick files, and whether any workbook is stale. |
+| **1 · Fetch market data** | Downloads daily bars from Yahoo. Every run writes a new immutable file and overwrites nothing. |
+| **2 · Build Excel workbook** | Turns the data store into a workbook — bars, labels, option chain with Greeks, and the accumulated pick history. |
+| **3 · Generate paper picks** | Scores every ticker under five weight variants, proposes a contract for each, freezes the result with a SHA-256, and rebuilds the workbook. |
+| **4 · Score past picks** | Takes the newest frozen file and works out what happened: was the direction right, and what would the pre-registered exits have returned. |
+| **Open output folder** | Opens where the workbooks are, with the newest selected. |
 
-- **`iv_solved`, not `iv_yahoo`, drives the Greeks.** Yahoo's IV comes from an undocumented
-  model with an undocumented rate and dividend assumption; feeding it into these formulas
-  would stack this model on an unknown one. IV is inverted from the observed mid instead, so
-  the chain is quote → one documented model → Greeks. Both columns are shown: a wide gap
-  between them is a data-quality warning about that contract.
-- **The underlying is the prior session's close**, not live spot — a bar is not consumable at
-  its own close, and using the snapshot day's own close would be a full day of lookahead in
-  every delta. `underlying_close_date` shows which bar was used.
-- **`model_status` explains every blank.** No two-sided quote, expired, IV unsolvable from the
-  mid. Nothing is ever filled with a plausible substitute.
-- **The risk-free rate is an assumption**, not data. Default 4%, override with
-  `--risk-free-rate`, and it is printed on the README sheet.
-- **`gate_decision` returns `PASS` — meaning do nothing — on every row.** `gates/risk.py` runs
-  per contract on what a snapshot actually contains, and a snapshot has no evidence count, no
-  confidence, and no post-cost edge. `gate_missing` names exactly what is absent.
+Tick **"also snapshot option chains"** before fetching if you want Greeks or picks.
+Yahoo publishes no historical chains, so a daily snapshot is the only way to build
+options history — and without a chain there is nothing to compute Greeks from or
+choose a contract out of.
 
-**The liquidity screen narrows the chain. It does not make a pick.** Per this project's own
-sequencing in `yahoo_daily.py`, an options overlay cannot rescue a stock-level forecast with
-no demonstrated edge — and none has been demonstrated yet. See `CODE_REVIEW_2026-09-02.md`
-§2.2: the harness that would measure one currently cannot distinguish signal from noise.
+### In the menu
+
+| Menu item | |
+|---|---|
+| File → Open the picks folder | The forward record. Commit this folder — unlike the data store it cannot be regenerated. |
+| Run → Score a specific pick file… | Score an older file rather than the newest. |
+| Run → Run the test suite | 161 tests, no network, no market data. |
+| Run → Market Intelligence Engine | Development only. Unvalidated, not point-in-time correct, synthetic news input. |
+| Help → What each button does | The same reference, inside the app. |
+
+### If you prefer a terminal
+
+Every button just runs a script, and the exact command is echoed in the console:
+
+```bash
+python run_tests.py                                  # the full suite
+python diagnose.py                                   # the setup report
+python claude/app/mp_v01/fetch_data.py --chains      # fetch
+python excel_report.py                               # build the workbook
+python generate_picks.py                             # freeze picks
+python resolve_picks.py picks/<file>.json            # score them
+```
 
 ---
 
@@ -301,102 +254,28 @@ above asks for **≥200 non-overlapping decisions** before any of it means anyth
 
 ---
 
-## Local setup (Windows)
+## Installation
 
-```bat
-pip install yfinance openpyxl tzdata
-```
+1. **Python 3.10 or newer.** On Windows install from python.org with
+   **"Add python.exe to PATH"** ticked. Verified working on 3.10 through 3.14.
+2. **Clone or download this repository.**
+3. **Start the app** — `run_gui.bat` on Windows, `python gui.py` elsewhere.
+4. **Press "Install required packages"** inside the app.
 
-That is everything the GUI and the Excel export need — the heavy pins in
-`requirements.txt` (pandas, scikit-learn, backtrader) are only for the
-development-only Market Intelligence Engine.
+That is the whole setup. The three packages it installs:
 
-Then double-click `run_gui.bat`, or:
+| | |
+|---|---|
+| `yfinance` | fetches the market data |
+| `openpyxl` | writes the Excel workbooks |
+| `tzdata` | the IANA timezone database. **Not optional on Windows** — Windows ships no such database, so `zoneinfo` cannot resolve `America/New_York` and the label contract's 15:45 ET decision clock cannot be built at all. |
 
-```bat
-python gui.py
-```
+The heavy pins in `requirements.txt` — pandas, scikit-learn, backtrader — are only
+for the development-only Market Intelligence Engine. The main app does not need them.
 
-If Python is not found, reinstall from python.org with **"Add python.exe to PATH"**
-ticked. `tzdata` is required on Windows: `zoneinfo` has no IANA database there, and
-the label's 15:45 ET decision clock would otherwise be an hour off for half the year.
-
-### Test results (76 passing):
-
-```
-NO-LOOKAHEAD / POINT-IN-TIME CORRECTNESS
-  ✓ future_records_are_invisible
-  ✓ boundary_is_inclusive_and_exact_to_the_second
-  ✓ publication_lag_is_respected
-  ✓ revision_does_not_leak_backwards
-  ... (14 passed)
-
-BACKTEST / COSTS / RISK GATES
-  ✓ splits_are_chronological_and_non_overlapping
-  ✓ overlapping_train_test_rejected
-  ✓ future_features_rejected
-  ✓ option_buy_pays_up_and_sell_receives_less
-  ✓ round_trip_cost_is_material_on_wide_spreads
-  ✓ negative_edge_after_costs_is_hard_fail
-  ✓ confidence_cannot_override_a_hard_gate
-  ... (24 passed)
-
-NOISE FLOOR CHECK
-  ✓ Strategy on pure random data: NO_EDGE (correct null)
-```
-
----
-
-## Project Organization
-
-- **Claude** — architecture, orchestration, adversarial code review, QC
-- **Codex** — local execution, data ingestion, build
-- **Specialist Personas** — domain analysis (sector intelligence, options research, bear-case evidence)
-
-Deterministic risk gates sit outside every model's judgment. A model may only *propose*; `gates/risk.py` *decides*.
-
-See `claude/scheduled_state/STATE.md` for current work list and decision log.
-
----
-
-## Development Roadmap (from CODE_REVIEW_2026-08-13.md)
-
-### Phase 1 — Ingest for real
-Run `fetch_data.py` on real SPY/QQQ/MSFT over the longest free history. Build the JSON→PIT loader.
-**Exit:** records in store, `as_of()` returns sane counts, no `UNKNOWN` above threshold.
-
-### Phase 2 — Fix blocking bugs
-Purge in bar-index space, block permutation, refit-under-permutation, leak guard wired into eval path.
-**Exit:** planted-leak test fires, noise floor still reads `NO_EDGE`.
-
-### Phase 3 — Null run on real bars
-Run deliberately worthless strategy (coin flip, always-long, trailing momentum) on real data.
-**Exit:** `NO_EDGE`. If a coin flip shows edge, harness is still broken.
-
-### Phase 4 — Component rank IC
-Compute walk-forward rank information coefficient of each score component vs forward excess return.
-**Exit:** a number for each component. Most likely all near zero (honest result, saves money).
-
-### Phase 5 — Post-cost gate
-Feed any surviving signal through `costs.py` and `gates/risk.py`.
-**Exit:** `expected_edge_after_costs` figure. If negative (base rate), stop.
-
-### Phase 6 — Forward paper log
-Scheduled runs producing frozen, hashed predictions; separate resolver scoring after 5 days.
-**Exit:** this is the only genuinely out-of-sample evidence. Worth more than all backtests combined.
-
----
-
-## Pre-registration (must be decided before seeing results)
-
-Write these numbers down **now** and put in STATE.md:
-
-- **Minimum forward paper predictions before real capital:** ≥ 200 non-overlapping decisions (~4 years weekly on 3 tickers)
-- **Required post-cost expectancy:** stated as a number
-- **Required calibration:** predicted 70% buckets must resolve within stated band of 70%
-- **Maximum acceptable paper drawdown:** stated value
-- **Strategy lock:** any change resets the clock. No exceptions, no "small tweaks."
-- **Failure condition:** what result makes you abandon the project? (Must exist, or project can't fail/succeed.)
+**If the app will not start:** Python is probably not on PATH. On Windows, if typing
+`python` opens the Microsoft Store, use the `py` launcher instead, or reinstall with
+the PATH box ticked.
 
 ---
 
@@ -413,4 +292,4 @@ Write these numbers down **now** and put in STATE.md:
 ---
 
 **Last Updated**: August 29, 2026  
-**Version**: 2.7.0 (Accumulating pick history in Excel, frozen picks, 161 tests)
+**Version**: 2.8.0 (Every step behind a button, Windows CI, 163 tests)

@@ -34,6 +34,12 @@ MIE_SCRIPT = HERE / "market_intelligence_engine.py"
 TEST_SCRIPT = HERE / "run_tests.py"
 PICKS_SCRIPT = HERE / "generate_picks.py"
 PICKS_DIR = HERE / "picks"
+DIAGNOSE_SCRIPT = HERE / "diagnose.py"
+RESOLVE_SCRIPT = HERE / "resolve_picks.py"
+
+# Everything a first run needs. Kept here rather than in a document so the
+# "Install required packages" button and the docs cannot drift apart.
+REQUIRED_PACKAGES = ["yfinance", "openpyxl", "tzdata"]
 DEFAULT_OUT_DIR = HERE / "excel_out"
 SETTINGS_FILE = Path.home() / ".moneyprinter_gui.json"
 
@@ -143,23 +149,32 @@ class MoneyPrinterGUI(tk.Tk):
 
     def _build_ui(self) -> None:
         self._setup_tags()
+        self._build_menu()
 
         head = ttk.Frame(self, padding=(12, 10, 12, 0))
         head.pack(fill=tk.X)
         ttk.Label(head, text="MoneyPrinter", font=("Segoe UI", 16, "bold")).pack(anchor=tk.W)
         ttk.Label(
             head,
-            text="Fetch point-in-time market data, then export it to a workbook you "
-                 "can work in. Paper/simulation research only — nothing here places an order.",
-            foreground="#555555",
-            wraplength=960,
-            justify=tk.LEFT,
+            text="Fetch point-in-time market data, price the option chain, and log frozen "
+                 "paper picks. Paper/simulation research only — nothing here places an order.",
+            foreground="#555555", wraplength=980, justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(2, 8))
 
-        # --- step 1 inputs -------------------------------------------------
+        # --- setup: the two things that used to require a terminal ----------
+        setup = ttk.LabelFrame(self, text=" Setup ", padding=8)
+        setup.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self.install_btn = ttk.Button(setup, text="Install required packages",
+                                      command=self.install_packages)
+        self.install_btn.pack(side=tk.LEFT)
+        self.diag_btn = ttk.Button(setup, text="Check setup", command=self.check_setup)
+        self.diag_btn.pack(side=tk.LEFT, padx=6)
+        ttk.Label(setup, text="Run these once, or any time something looks wrong.",
+                  foreground="#777777").pack(side=tk.LEFT, padx=8)
+
+        # --- what to fetch --------------------------------------------------
         box = ttk.LabelFrame(self, text=" What to fetch ", padding=10)
         box.pack(fill=tk.X, padx=12, pady=(0, 8))
-
         row = ttk.Frame(box)
         row.pack(fill=tk.X)
         ttk.Label(row, text="Tickers").pack(side=tk.LEFT)
@@ -168,28 +183,34 @@ class MoneyPrinterGUI(tk.Tk):
         ttk.Entry(row, textvariable=self.start_var, width=12).pack(side=tk.LEFT, padx=(6, 16))
         ttk.Label(row, text="End").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.end_var, width=12).pack(side=tk.LEFT, padx=(6, 16))
-        ttk.Checkbutton(row, text="also snapshot today's option chains",
+        ttk.Checkbutton(row, text="also snapshot option chains (needed for Greeks and picks)",
                         variable=self.chains_var).pack(side=tk.LEFT)
 
         ttk.Label(
             box,
             text=f"Keep {BENCHMARK} in the list — the label is excess return vs {BENCHMARK}, "
-                 f"so without it no labels can be built for anything else.  Option chains add "
-                 f"the Greeks sheets; Yahoo does not publish Greeks, so they are computed.",
+                 f"so without it no labels can be built for anything else.",
             foreground="#777777",
         ).pack(anchor=tk.W, pady=(6, 0))
 
-        # --- the three steps ----------------------------------------------
+        # --- the workflow, in order -----------------------------------------
         steps = ttk.Frame(self, padding=(12, 0))
         steps.pack(fill=tk.X)
         self.fetch_btn = ttk.Button(steps, text="1 · Fetch market data", command=self.fetch_data)
         self.fetch_btn.pack(side=tk.LEFT)
-        self.export_btn = ttk.Button(steps, text="2 · Build Excel workbook", command=self.export_excel)
+        self.export_btn = ttk.Button(steps, text="2 · Build Excel workbook",
+                                     command=self.export_excel)
         self.export_btn.pack(side=tk.LEFT, padx=6)
         self.picks_btn = ttk.Button(steps, text="3 · Generate paper picks",
                                     command=self.generate_picks)
         self.picks_btn.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(steps, text="4 · Open output folder", command=self.open_output).pack(side=tk.LEFT)
+        self.score_btn = ttk.Button(steps, text="4 · Score past picks",
+                                    command=self.score_picks)
+        self.score_btn.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(steps, text="Open output folder", command=self.open_output).pack(side=tk.LEFT)
+        self.stop_btn = ttk.Button(steps, text="Stop", command=self.stop_running,
+                                   state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.RIGHT)
 
         out_row = ttk.Frame(self, padding=(12, 8))
         out_row.pack(fill=tk.X)
@@ -198,20 +219,8 @@ class MoneyPrinterGUI(tk.Tk):
             side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         ttk.Button(out_row, text="Change…", command=self.choose_output).pack(side=tk.LEFT)
 
-        # --- advanced -------------------------------------------------------
-        adv = ttk.LabelFrame(self, text=" Advanced ", padding=8)
-        adv.pack(fill=tk.X, padx=12, pady=(0, 8))
-        self.tests_btn = ttk.Button(adv, text="Run test suite", command=self.run_tests)
-        self.tests_btn.pack(side=tk.LEFT)
-        ttk.Label(adv, text="   MIE tickers").pack(side=tk.LEFT)
-        ttk.Entry(adv, textvariable=self.mie_tickers_var, width=20).pack(side=tk.LEFT, padx=6)
-        self.mie_btn = ttk.Button(adv, text="Run MIE (dev only)", command=self.run_mie)
-        self.mie_btn.pack(side=tk.LEFT)
-        self.stop_btn = ttk.Button(adv, text="Stop", command=self.stop_running, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.RIGHT)
-
-        self._job_buttons = (self.fetch_btn, self.export_btn, self.picks_btn,
-                             self.tests_btn, self.mie_btn)
+        self._job_buttons = (self.install_btn, self.diag_btn, self.fetch_btn,
+                             self.export_btn, self.picks_btn, self.score_btn)
 
         # --- console --------------------------------------------------------
         con = ttk.Frame(self, padding=(12, 0))
@@ -219,12 +228,14 @@ class MoneyPrinterGUI(tk.Tk):
         bar = ttk.Frame(con)
         bar.pack(fill=tk.X)
         ttk.Label(bar, text="Console", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Label(bar, text="   every command this app runs is echoed here",
+                  foreground="#777777").pack(side=tk.LEFT)
         self.elapsed_label = ttk.Label(bar, text="", foreground="#777777")
         self.elapsed_label.pack(side=tk.RIGHT)
         ttk.Button(bar, text="Clear", command=self.clear_console).pack(side=tk.RIGHT, padx=6)
 
         self.text = scrolledtext.ScrolledText(con, wrap=tk.WORD, font=("Consolas", 9),
-                                              height=18, background="#FBFBFB")
+                                              height=16, background="#FBFBFB")
         self.text.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
         self.text.configure(state=tk.DISABLED)
         for tag, cfg in self._tag_styles.items():
@@ -237,6 +248,45 @@ class MoneyPrinterGUI(tk.Tk):
         self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.progress = ttk.Progressbar(status, mode="indeterminate", length=120)
         self.progress.pack(side=tk.RIGHT, padx=8, pady=4)
+
+    def _build_menu(self) -> None:
+        """Menu bar carrying everything, including the rarely-used items.
+
+        The buttons cover the ordinary path; this is where the occasional and
+        the development-only things live, so the main window stays legible.
+        """
+        menubar = tk.Menu(self)
+
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="Open output folder", command=self.open_output)
+        m_file.add_command(label="Change output folder…", command=self.choose_output)
+        m_file.add_separator()
+        m_file.add_command(label="Open the picks folder", command=self.open_picks)
+        m_file.add_separator()
+        m_file.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=m_file)
+
+        m_run = tk.Menu(menubar, tearoff=0)
+        m_run.add_command(label="Install required packages", command=self.install_packages)
+        m_run.add_command(label="Check setup", command=self.check_setup)
+        m_run.add_separator()
+        m_run.add_command(label="1 · Fetch market data", command=self.fetch_data)
+        m_run.add_command(label="2 · Build Excel workbook", command=self.export_excel)
+        m_run.add_command(label="3 · Generate paper picks", command=self.generate_picks)
+        m_run.add_command(label="4 · Score past picks", command=self.score_picks)
+        m_run.add_separator()
+        m_run.add_command(label="Score a specific pick file…", command=self.score_picks_choose)
+        m_run.add_command(label="Run the test suite", command=self.run_tests)
+        m_run.add_separator()
+        m_run.add_command(label="Market Intelligence Engine (development only)",
+                          command=self.run_mie)
+        menubar.add_cascade(label="Run", menu=m_run)
+
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="What each button does", command=self.show_help)
+        menubar.add_cascade(label="Help", menu=m_help)
+
+        self.config(menu=menubar)
 
     def _setup_tags(self) -> None:
         self._tag_styles = {
@@ -448,6 +498,149 @@ class MoneyPrinterGUI(tk.Tk):
         if not self._start(args, "generate_picks.py", HERE):
             self._pending_workbook = None
 
+    def install_packages(self) -> None:
+        """Install what a first run needs, so no terminal is required.
+
+        Uses `python -m pip` rather than a bare `pip`: on Windows those two can
+        be different installs, and a package landing in the wrong interpreter
+        looks exactly like a package that never installed.
+        """
+        self._banner("Installing required packages")
+        self._log(
+            f"Installing into the interpreter running this app:\n  {sys.executable}\n\n"
+            f"  {', '.join(REQUIRED_PACKAGES)}\n\n"
+            "yfinance fetches the data. openpyxl writes the workbooks. tzdata carries the\n"
+            "timezone database Windows does not ship - without it the label's 15:45 ET\n"
+            "decision clock cannot be built at all.\n\n"
+            "Safe to run more than once; already-installed packages are left alone.\n\n",
+            "info")
+        self._start(["-m", "pip", "install", *REQUIRED_PACKAGES], "pip install", HERE)
+
+    def check_setup(self) -> None:
+        self._banner("Checking setup")
+        self._log("Read-only. Reports which commit this copy is on, what the data store\n"
+                  "holds, which pick files exist, and whether any workbook in the output\n"
+                  "folder was built by older code.\n\n", "info")
+        self._start([DIAGNOSE_SCRIPT], "diagnose.py", HERE)
+
+    def _newest_pick_file(self) -> Path | None:
+        try:
+            files = sorted(PICKS_DIR.glob("picks_*.json"))
+        except OSError:
+            return None
+        return files[-1] if files else None
+
+    def score_picks(self) -> None:
+        """Score the most recent frozen pick file."""
+        newest = self._newest_pick_file()
+        if newest is None:
+            messagebox.showinfo(
+                "No picks yet",
+                "There are no frozen pick files to score.\n\n"
+                "Run '3 · Generate paper picks' first. Scoring reads a file that was "
+                "frozen earlier and checks what actually happened since.")
+            return
+        self._run_resolver(newest)
+
+    def score_picks_choose(self) -> None:
+        """Score a pick file the user chooses, rather than the newest."""
+        try:
+            PICKS_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        chosen = filedialog.askopenfilename(
+            initialdir=str(PICKS_DIR), title="Which frozen pick file?",
+            filetypes=[("Frozen picks", "picks_*.json"), ("All files", "*.*")])
+        if chosen:
+            self._run_resolver(Path(chosen))
+
+    def _run_resolver(self, pick_file: Path) -> None:
+        self._banner(f"Scoring {pick_file.name}")
+        self._log(
+            "Re-hashes the picks before anything else. If the file was edited after it\n"
+            "was frozen the digest will not match and scoring stops - that check is why\n"
+            "a forward record is worth more than a backtest.\n\n"
+            "Positions are walked day by day and closed on the first pre-registered rule\n"
+            "that fires: profit target, stop loss, the 21-DTE floor, or the 5-day time\n"
+            "stop if none did.\n\n", "info")
+        self._start([RESOLVE_SCRIPT, pick_file], "resolve_picks.py", HERE)
+
+    def show_help(self) -> None:
+        """What every control does, in the app rather than in a document."""
+        win = tk.Toplevel(self)
+        win.title("What each button does")
+        win.geometry("760x620")
+        win.transient(self)
+
+        txt = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Segoe UI", 10),
+                                        padx=14, pady=12)
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.tag_configure("h", font=("Segoe UI", 11, "bold"), spacing1=10, spacing3=4)
+        txt.tag_configure("note", foreground="#8A5A00")
+
+        for tag, body in [
+            ("h", "SETUP — run once"),
+            (None, "Install required packages — installs yfinance, openpyxl and tzdata into "
+                   "the interpreter this app is running on. Safe to repeat. tzdata is not "
+                   "optional on Windows: it carries the timezone database Windows omits, and "
+                   "without it the label's 15:45 ET decision clock cannot be built.\n\n"
+                   "Check setup — a read-only report: which commit this copy is on, whether "
+                   "each feature is present, what the data store holds, which pick files "
+                   "exist, and whether any workbook in the output folder was built by older "
+                   "code. Start here whenever something looks wrong."),
+
+            ("h", "THE WORKFLOW"),
+            (None, "1 · Fetch market data — downloads daily bars from Yahoo for the tickers "
+                   "listed above. Every run writes a new immutable file and overwrites "
+                   "nothing.\n\n"
+                   "Tick 'also snapshot option chains' before fetching if you want Greeks or "
+                   "picks. Yahoo has no historical chains, so a daily snapshot is the only "
+                   "way to accumulate options history — and without a chain there is nothing "
+                   "to compute Greeks from or choose a contract out of.\n\n"
+                   "2 · Build Excel workbook — turns whatever is in the data store into a "
+                   "workbook: bars, the label target, the option chain with Greeks, and the "
+                   "accumulated pick history.\n\n"
+                   "3 · Generate paper picks — scores every ticker under five weight "
+                   "variants, proposes a contract for each that clears its conviction floor, "
+                   "and freezes the result with a SHA-256 so it cannot be edited later. Then "
+                   "rebuilds the workbook so the new picks join the history.\n\n"
+                   "4 · Score past picks — takes the most recent frozen file and works out "
+                   "what actually happened: whether the direction was right, and what "
+                   "following the pre-registered exit rules would have returned."),
+
+            ("h", "WHERE THINGS GO"),
+            (None, "Workbooks go to the folder shown above; every export is a new timestamped "
+                   "file, so nothing you have edited is ever overwritten. Open the newest.\n\n"
+                   "Frozen picks go to the picks folder. Commit that folder to git — it is "
+                   "the forward record, and unlike the data store it cannot be regenerated. "
+                   "The workbook's pick history is only a view over those files."),
+
+            ("h", "IN THE MENU"),
+            (None, "Run → Score a specific pick file… — score an older file instead of the "
+                   "newest.\n\n"
+                   "Run → Run the test suite — 161 tests, no network and no market data. "
+                   "Worth running after an update.\n\n"
+                   "Run → Market Intelligence Engine — development only. Its output is "
+                   "unvalidated, it is not point-in-time correct, and its news input is "
+                   "synthetic. Do not read anything into what it prints."),
+
+            ("h", "WHAT THIS IS NOT"),
+            ("note", "Paper and simulation only. No part of this project places an order, and "
+                     "there is no code path that could.\n\n"
+                     "No component in use has a measured relationship to future returns. The "
+                     "risk gate therefore refuses every pick — it reads PASS, meaning do "
+                     "nothing — and each pick records exactly what the gate was not told. "
+                     "The picks are hypotheses being logged so they can eventually be "
+                     "measured. They are not recommendations, and a run of good ones would "
+                     "not yet be evidence of anything."),
+        ]:
+            txt.insert(tk.END, body + "\n", tag or "")
+        txt.configure(state=tk.DISABLED)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+
+    def open_picks(self) -> None:
+        self._reveal(PICKS_DIR)
+
     def run_tests(self) -> None:
         self._banner("Running every test suite (no network, no market data)")
         self._start([TEST_SCRIPT], "run_tests.py", HERE)
@@ -474,14 +667,15 @@ class MoneyPrinterGUI(tk.Tk):
             self._save_settings()
 
     def open_output(self) -> None:
-        out_dir = self.out_dir()
+        self._reveal(self.out_dir(), self._last_workbook)
+
+    def _reveal(self, out_dir: Path, select: Path | None = None) -> None:
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             messagebox.showerror("Open folder", f"Cannot create {out_dir}:\n{e}")
             return
-        target = self._last_workbook if (
-            self._last_workbook and self._last_workbook.exists()) else None
+        target = select if (select and select.exists()) else None
         try:
             if sys.platform.startswith("win"):
                 if target:
