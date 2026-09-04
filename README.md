@@ -6,7 +6,7 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-99 tests passing (`python run_tests.py`): 76 in `claude/app/mp_v01/`, 23 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+161 tests passing (`python run_tests.py`): 131 in `claude/app/mp_v01/`, 30 covering the Excel export and GUI. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
 
@@ -28,13 +28,16 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ├── market_intelligence_engine.py  DEVELOPMENT ONLY. See CODE_REVIEW_2026-08-13.md
 ├── requirements.txt               Python dependencies
 ├── gui.py                         Desktop GUI - fetch data, build the Excel workbook
+├── generate_picks.py              Frozen, hashed paper picks from the PIT store
+├── resolve_picks.py               Scores an earlier pick file against what happened
+├── picks/                         The forward paper record - COMMIT THESE
 ├── run_gui.bat                    Windows double-click launcher for the GUI
 ├── excel_report.py                Data store -> .xlsx (bars, labels, summary)
 ├── run_tests.py                   Runs every suite in the repo
 ├── tests/                         Tests for the Excel export and the GUI
 ├── excel_out/                     Generated workbooks (gitignored)
 ├── CODE_REVIEW_2026-08-13.md      Complete accounting of MIE issues and remediation
-├── CODE_REVIEW_2026-09-02.md      Follow-up review; 3 new blocking bugs in mp_v01
+├── CODE_REVIEW_2026-09-02.md      Follow-up review; 6 of 11 findings now fixed
 ├── claude/                        Claude's work: architecture, orchestration, review
 │   ├── app/mp_v01/                The core codebase (PRODUCTION STANDARD)
 │   ├── market_research/           Data source licensing analysis
@@ -93,7 +96,7 @@ A point-in-time-correct research pipeline, built to make hindsight structurally 
 | `labels/contract.py` | Label = binary sign of 5-trading-day forward log excess total return vs. SPY. Decision clock (15:45 ET) precedes the close it's scored against. Fails closed on unknown data. |
 | `backtest/costs.py` | Spread/slippage/fee modeling; stale and wide quotes are rejected, not used. |
 | `backtest/walkforward.py` | Chronological train/test splits with purge gap tied to label horizon, plus embargo. |
-| `backtest/evaluate.py` | Noise floor via permutation test — distinguishes real edge from chance. Validated to read `NO_EDGE` on pure random data. |
+| `backtest/evaluate.py` | Noise floor via permutation test, with the model **refit under permutation** and the permutation done in **blocks** so overlapping labels keep their autocorrelation. Validated to read `NO_EDGE` on pure random data, including for a genuinely fitted strategy. |
 | `gates/risk.py` | Deterministic `PASS` / `WATCH` / `PAPER_TRADE_CANDIDATE` decision gate, outside model judgment. Unknown/invalid inputs fail closed. |
 | `adapters/yahoo_daily.py` | Free daily equity bars with realistic publication lag. |
 | `adapters/eodhd_options.py` | Paid options chain adapter; token read from env only. |
@@ -111,10 +114,10 @@ echoed into the console, so anything the GUI does you can also do from a termina
 
 **Command line**:
 ```bash
-python run_tests.py        # every suite: pipeline, Excel export, GUI (99 tests)
+python run_tests.py        # every suite: pipeline, Excel export, GUI (161 tests)
 
 cd claude/app/mp_v01
-python run_all.py          # just the zero-dependency pipeline suite (76 tests)
+python run_all.py          # just the zero-dependency pipeline suite (131 tests)
 
 pip install yfinance
 python fetch_data.py --tickers SPY,QQQ,MSFT --chains
@@ -139,6 +142,12 @@ python excel_report.py --tickers SPY,MSFT   # a subset
 | `Summary` | One row per ticker: coverage, gap count, label base rate |
 | `Bars_<TICKER>` | OHLCV, dividends, daily total return, both PIT timestamps, plus **live formulas** for `sma_20`, `sma_50`, `vol_20d_annualised` |
 | `Labels` | The label contract v1.0 target: 5-day forward log excess total return vs SPY, its sign, and the fail-closed status |
+| `Options_Summary` | Per underlying: contracts snapshotted, how many carry a two-sided quote, how many could be modelled, how many survive the liquidity screen |
+| `Options_<TICKER>` | One row per contract — quote, solved IV, the five Greeks, execution cost, and the screens. Only present if you fetched with `--chains` |
+| `Pick_History` | **Every pick ever made**, accumulating across runs, with the outcome and which exit rule closed it |
+| `Pick_Justifications` | The same picks with the full paragraph of reasoning for each |
+| `Pick_Performance` | Per variant over resolved picks: direction hit rate, mean return, which rules fired |
+| `Pick_Abstentions` | Every variant/ticker that proposed nothing, and why |
 
 The SMA and volatility columns are real Excel formulas, not pasted values — widen
 the `AVERAGE()` range and the column recalculates, so windows can be retuned in
@@ -158,6 +167,137 @@ Three things worth knowing before you trust a cell:
 
 Each export writes a new timestamped file under `excel_out/`, so a workbook you have
 edited by hand is never overwritten.
+
+### Options and the Greeks
+
+Yahoo publishes a two-sided quote, volume, open interest and its own IV figure — **not**
+Greeks. So the Greeks are computed, by `src/options/greeks.py` (Black-Scholes, standard
+library only, 13 tests against published reference values and put-call parity).
+
+What that means for reading the sheet:
+
+| | |
+|---|---|
+| **Observed** | bid, ask, strike, expiration, volume, open interest, underlying close |
+| **Modelled** | `iv_solved` and every Greek |
+
+- **`iv_solved`, not `iv_yahoo`, drives the Greeks.** Yahoo's IV comes from an undocumented
+  model with an undocumented rate and dividend assumption; feeding it into these formulas
+  would stack this model on an unknown one. IV is inverted from the observed mid instead, so
+  the chain is quote → one documented model → Greeks. Both columns are shown: a wide gap
+  between them is a data-quality warning about that contract.
+- **The underlying is the prior session's close**, not live spot — a bar is not consumable at
+  its own close, and using the snapshot day's own close would be a full day of lookahead in
+  every delta. `underlying_close_date` shows which bar was used.
+- **`model_status` explains every blank.** No two-sided quote, expired, IV unsolvable from the
+  mid. Nothing is ever filled with a plausible substitute.
+- **The risk-free rate is an assumption**, not data. Default 4%, override with
+  `--risk-free-rate`, and it is printed on the README sheet.
+- **`gate_decision` returns `PASS` — meaning do nothing — on every row.** `gates/risk.py` runs
+  per contract on what a snapshot actually contains, and a snapshot has no evidence count, no
+  confidence, and no post-cost edge. `gate_missing` names exactly what is absent.
+
+**The liquidity screen narrows the chain. It does not make a pick.** Per this project's own
+sequencing in `yahoo_daily.py`, an options overlay cannot rescue a stock-level forecast with
+no demonstrated edge — and none has been demonstrated yet. See `CODE_REVIEW_2026-09-02.md`
+§2.2: the harness that would measure one currently cannot distinguish signal from noise.
+
+---
+
+## Paper picks — the forward record
+
+The roadmap's Phase 6, and the only genuinely out-of-sample evidence this project
+will produce. Requires a fetch **with chains**:
+
+```bash
+python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT --chains
+python generate_picks.py
+```
+
+Five weight variants run against the same snapshot — `momentum`, `trend_quality`,
+`reversion`, `balanced`, `equal_weight_control`. `reversion` deliberately
+contradicts the momentum variants: **if both look good in the forward record, the
+record is noise rather than two edges.** Every variant is logged on every run,
+including the ones that look bad. Quietly dropping a variant that underperformed
+turns the whole record into a selection artefact.
+
+Each proposal carries the contract, the Greeks, execution cost, the breakeven move
+needed just to cover costs, the risk gate's verdict, and a paragraph of rationale
+built from the numbers actually used. Abstentions are recorded with their reason,
+never dropped — "the strategy proposed nothing" and "the data was unusable" are
+different statements.
+
+### Exit rules are pre-registered
+
+Written into the file at generation time, before any outcome is known:
+
+| | |
+|---|---|
+| **Primary** | Mark to market after **5 trading days** and score the directional call. Matches the label contract horizon, so paper results stay comparable with what the model is scored against. |
+| **Secondary** | Close at **+50% / −50%** of premium. Path-dependent, recorded separately — a different question from whether the call was right. |
+| **Hard exit** | Close below **21 DTE**, whatever the P&L. Theta and gamma both accelerate there and the contract stops behaving like the one that was chosen. |
+
+Deciding when to close *after* watching the position is how a loser becomes "still
+developing." Changing these mid-flight invalidates the record.
+
+### The history accumulates in Excel
+
+`Pick_History` is a **view over every frozen file in `picks/`**, not something the
+workbook remembers. So rebuilding the workbook never loses history, and committing
+`picks/` is what preserves it. Regenerate any time:
+
+```bash
+python excel_report.py          # rebuilds every sheet, history included
+```
+
+Or click **3 · Generate paper picks** in the GUI, which freezes today's run and then
+rebuilds the workbook so the new picks appear alongside every earlier one.
+
+Each row carries the outcome and **which pre-registered rule closed the position** —
+found by walking the path day by day, not by checking only the horizon:
+
+| `exit_trigger` | Meaning |
+|---|---|
+| `PROFIT_TARGET` | Return on premium reached +50% |
+| `STOP_LOSS` | Return on premium reached −50% |
+| `DTE_FLOOR` | Days-to-expiry fell below 21 |
+| `TIME_STOP` | None of the above fired before the 5-day horizon |
+
+Checking only the horizon would convert every stop-out into a round trip — reporting
+losses a disciplined trader would never have taken, and worse, reporting gains on
+positions already stopped out.
+
+Two column families, deliberately never merged:
+
+- **`exit_*`** — what following the rules would have returned. Path dependent.
+- **`horizon_*`** — whether the directional call was right, measured at the label
+  horizon regardless of how the position closed. This is what the label contract
+  scores. A stop-out does not erase the directional answer.
+
+`integrity` reads `VOID` if a file's picks no longer hash to their recorded digest.
+Those rows are still shown, but excluded from `Pick_Performance`.
+
+### Scoring it later
+
+```bash
+python resolve_picks.py picks/picks_2026-09-03_20260903-160000.json
+```
+
+The resolver re-hashes the picks before doing anything else. A mismatch means the
+file was edited after generation and it refuses to score — that check is the whole
+reason a forward log beats a backtest.
+
+Marks are **MARKET** where a later chain snapshot contains the exact contract, and
+**MODELLED** otherwise (Black-Scholes at the later close, assuming IV unchanged —
+the assumption most likely to be wrong after a real move). The two are reported
+separately and never mixed. Fetch daily with `--chains` and you get market marks.
+
+**None of this is gate-approved.** `gate_decision` reads `PASS` — do nothing — on
+every pick, because a chain snapshot plus an unvalidated component score contains
+no independent evidence count and no measured post-cost edge, and the gate fails
+closed on what it is not told. That is the loop working: the forward record is what
+will eventually *produce* the edge estimate the gate needs. The pre-registration
+above asks for **≥200 non-overlapping decisions** before any of it means anything.
 
 ---
 
@@ -273,4 +413,4 @@ Write these numbers down **now** and put in STATE.md:
 ---
 
 **Last Updated**: August 29, 2026  
-**Version**: 2.2.0 (Excel export, rebuilt GUI, 99 tests)
+**Version**: 2.7.0 (Accumulating pick history in Excel, frozen picks, 161 tests)

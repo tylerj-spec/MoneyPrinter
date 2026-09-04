@@ -69,10 +69,28 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
         # below instead of failing the gate. Caught here so it can never do that.
         return isinstance(v, float) and (v != v or math.isinf(v))
 
+    def _is_number(v) -> bool:
+        # A candidate arriving from JSON, a model response or a spreadsheet can
+        # carry "35" instead of 35. Comparing that to a threshold raises
+        # TypeError, and an exception is not a decision - whatever called this
+        # gate then either crashes or catches broadly, and a broad catch around
+        # a risk gate is how PASS quietly becomes "skipped".
+        # bool is an int subclass; True as a DTE or a position size is nonsense.
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    def _reject_type(key, v) -> None:
+        failed.append(f"invalid_type:{key}")
+        reasons.append(
+            f"{key} is {type(v).__name__}, not a number — treated as failing, fail-closed"
+        )
+
     def need(key):
         v = candidate.get(key)
         if v is None:
             failed.append(f"missing:{key}")
+            return None
+        if not _is_number(v):
+            _reject_type(key, v)
             return None
         if _bad_numeric(v):
             failed.append(f"invalid_numeric:{key}")
@@ -138,7 +156,9 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
     # --- Sizing ----------------------------------------------------------
     size = candidate.get("position_pct")
     if size is not None:
-        if _bad_numeric(size):
+        if not _is_number(size):
+            _reject_type("position_pct", size)
+        elif _bad_numeric(size):
             failed.append("invalid_numeric:position_pct")
             reasons.append("position_pct is NaN or infinite — treated as failing, fail-closed")
         elif size > limits.max_position_pct:
@@ -147,7 +167,9 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
 
     heat = candidate.get("portfolio_heat_pct")
     if heat is not None:
-        if _bad_numeric(heat):
+        if not _is_number(heat):
+            _reject_type("portfolio_heat_pct", heat)
+        elif _bad_numeric(heat):
             failed.append("invalid_numeric:portfolio_heat_pct")
             reasons.append("portfolio_heat_pct is NaN or infinite — treated as failing, fail-closed")
         elif heat > limits.max_portfolio_heat_pct:
@@ -156,7 +178,9 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
 
     open_n = candidate.get("open_positions")
     if open_n is not None:
-        if _bad_numeric(open_n):
+        if not _is_number(open_n):
+            _reject_type("open_positions", open_n)
+        elif _bad_numeric(open_n):
             failed.append("invalid_numeric:open_positions")
             reasons.append("open_positions is NaN or infinite — treated as failing, fail-closed")
         elif open_n >= limits.max_open_positions:
@@ -170,7 +194,8 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
 
     hard = {"cutoff_violation", "no_edge_after_costs", "undefined_risk_structure",
             "position_too_large", "portfolio_heat_exceeded", "max_positions_reached"}
-    if any(f in hard or f.startswith("missing:") or f.startswith("invalid_numeric:") for f in failed):
+    if any(f in hard or f.startswith("missing:") or f.startswith("invalid_numeric:")
+           or f.startswith("invalid_type:") for f in failed):
         return GateResult(Decision.PASS, reasons, failed)
 
     return GateResult(Decision.WATCH, reasons, failed)

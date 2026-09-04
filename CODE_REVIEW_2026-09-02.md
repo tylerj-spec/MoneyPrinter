@@ -4,11 +4,13 @@
 **Reviewer:** Claude (adversarial review pass, second)
 **Scope:** whole repository at commit `af1a059` — 4,595 lines of Python
 **Prior review:** `CODE_REVIEW_2026-08-13.md`
-**Method:** ten of the eleven findings below were reproduced by executing code, and each carries the actual output. Only **3.1** is reported from reading alone; it is marked **[VERIFY]** because confirming it needs a live fetch from Yahoo, which the review environment's network policy blocks.
+**Method:** all eleven findings below were reproduced by executing code, and each carries the actual output. **3.1** was resolved on 2026-09-02 by a live fetch on Tyler's machine after the review environment's network policy blocked Yahoo; the assumption it questioned holds, and the finding is downgraded rather than closed — see below.
 
 ---
 
 ## 0. Headline
+
+> **Status 2026-09-03.** Eight of the eleven findings are fixed (§1.1, §1.2, §1.3, §2.2, §2.3, §3.3, §3.4, §3.5) and §3.1 is verified. **§2.1 — the purge gap — is the last blocking one**, and it is the only remaining obstacle to a Phase 3 null run on real bars. §3.2 (`src/strategy/` is empty) is not a bug but is now the binding constraint on producing anything to evaluate.
 
 The 2026-08-13 review was accurate. Three weeks later, its three blocking findings are **still live in `main`** (§2 below). That is the single most important fact in this document: the problem is not that these defects are unknown, it is that knowing about them has not yet changed the code.
 
@@ -18,11 +20,11 @@ One new detail sharpens §1.1 of the prior review considerably: **the test suite
 
 ---
 
-## 1. New blocking bugs
+## 1. New blocking bugs — ALL THREE FIXED 2026-09-02
 
-Not covered by the 2026-08-13 review. All three are in `claude/app/mp_v01/`.
+Not covered by the 2026-08-13 review. All three were in `claude/app/mp_v01/`, and all three are now fixed with regression tests verified to fail without their fix. The descriptions are kept in full: the reasoning is the durable part.
 
-### 1.1 Two revisions of one record both survive `as_of()`
+### 1.1 Two revisions of one record both survive `as_of()` — FIXED
 `src/pit/store.py` — `add()` / `as_of()`
 
 `add()` tracks supersession in a plain dict:
@@ -48,9 +50,9 @@ records returned as_of day+5: [('v1', 2.0), ('v2', 3.0)]
 expected exactly one current vintage; got 2
 ```
 
-**Fix:** make `_superseded_by` hold a set and skip a record if *any* superseding revision is available at `t`; or reject a second supersession of an already-superseded record at `add()` time. The second is more in keeping with the rest of the module, which prefers loud rejection over quiet accommodation. Add a regression test with a three-vintage chain and a two-revisions-of-one-original case.
+**Fixed 2026-09-02** by rejecting a second supersession of an already-superseded record at `add()` time, with an error naming the record to chain from. A set would not have been enough: it stops the original being returned, but leaves two sibling revisions both current and neither superseded. Resolving that by guessing (say, latest `available_time` wins) would be inference; rejecting it is not. Two regression tests, both verified to fail without the fix: the ambiguous case raises, and an honest three-vintage chain still returns the vintage live at each decision time.
 
-### 1.2 An assumed −100% delisting return is labelled `OK` and marked usable
+### 1.2 An assumed −100% delisting return is labelled `OK` and marked usable — FIXED
 `src/labels/contract.py` — `build_label()`
 
 When a delisting has no `DLRET`, the contract appends `-1.0` — a total loss it did not observe — and correctly sets `delisting_return_imputed=True`. It then overwrites the status back to `OK`:
@@ -73,9 +75,9 @@ status=OK   y=0   excess=-inf
 imputed=True   is_usable()=True
 ```
 
-**Fix:** either return a distinct status so the imputation is filterable, or have `is_usable()` consult `delisting_return_imputed`. The second is a one-line change and matches the module's existing posture.
+**Fixed 2026-09-02** by having `is_usable()` consult `delisting_return_imputed`. The flag was already set and simply unread. A delisting carrying a real DLRET is an observation and stays usable; only the assumed total loss is excluded.
 
-### 1.3 The risk gate raises instead of failing closed
+### 1.3 The risk gate raises instead of failing closed — FIXED
 `src/gates/risk.py` — `need()` and the threshold comparisons
 
 `need()` handles `None` and NaN carefully — the NaN guard is genuinely good, with a comment explaining that an unguarded NaN slides past every threshold, and there is a test for it. It does **not** handle a value of the wrong type.
@@ -92,7 +94,7 @@ candidate = dict(..., dte="35", ...)   # everything else valid
 RAISED TypeError: '<=' not supported between instances of 'int' and 'str'
 ```
 
-**Fix:** extend `need()` to reject non-numerics the way it rejects NaN — append `invalid_type:{key}` to `failed`, which already routes to `PASS`. Roughly four lines, and it closes the last hole in an otherwise well-built gate.
+**Fixed 2026-09-02** by rejecting non-numerics the way NaN is rejected: `invalid_type:{key}` into `failed`, which routes to `PASS`. Applied to `need()` and to the three optional sizing fields. `bool` is excluded explicitly — it subclasses `int`, so `True` would otherwise compare as 1 against every threshold.
 
 ---
 
@@ -129,8 +131,8 @@ LEAK: True
 
 **Fix:** as the prior review prescribes — purge in bar-index space. But write the Thanksgiving-week regression test **first** and watch `purge_gap_prevents_label_horizon_bleed` fail alongside it. That existing test is part of the defect and must be rewritten, not preserved.
 
-### 2.2 The permutation null never refits
-`src/backtest/evaluate.py` — see prior review §1.2(b)
+### 2.2 The permutation null never refits — FIXED 2026-09-03
+`src/backtest/evaluate.py` — see prior review §1.2(a) and §1.2(b)
 
 `predict_fn(feats)` sits inside the permutation loop but takes no labels, so it returns the identical prediction vector on all 200 iterations.
 
@@ -143,36 +145,73 @@ predict_fn calls: 204   (4 scoring + 4×50 permutation)
 distinct feature inputs ever passed: 1
 ```
 
-**Fix:** as prescribed — change the interface to `fit_predict_fn(train_X, train_y, test_X)` and refit inside each permutation. This is the highest-leverage fix in the repository, because it is the instrument every later result is read on. Phase 4's component rank IC means nothing until the null is right.
+**Fixed 2026-09-03**, and the prior review's §1.2(a) with it — the two were one defect wearing two hats.
 
-### 2.3 The leakage guard is still not in the path
-`src/backtest/walkforward.py` — see prior review §1.3
+**(b) The fit is now in the null.** The interface is `fit_predict_fn(train_X, train_y, test_X)` and folds are `Fold` objects carrying train and test data. Under permutation the model is refit on permuted *training* labels, so whatever a procedure can wring out of noise is priced into the noise floor. A regression test spies on the labels the callback receives and asserts they actually change across permutations.
 
-`assert_no_future_features` remains defined, tested, and never called by `evaluate_walk_forward`. Confirmed unchanged.
+**(a) The permutation now preserves autocorrelation.** This was the more dangerous half and was still open. Labels are 5-day forward returns computed daily, so consecutive labels share four of five days. An IID shuffle destroys that dependence and makes the null *too tight* — smaller `permutation_std`, larger `z`, smaller `p` — biasing the harness toward reporting edge. Permutation is now over contiguous blocks of `2 × label_horizon`. `block_size=1` still reaches the old behaviour, kept only so the bias can be demonstrated rather than asserted.
+
+`demo/run_noise_floor.py` now measures the distortion on overlapping labels — same strategy, same data, only the null differing:
+
+```
+                              null std        z        p
+  IID shuffle (the old null)    0.0156    -0.20   0.5572
+  block permutation             0.0204    -0.10   0.5622
+
+  The IID null is 23% tighter than the honest one.
+```
+
+The demo also gained a genuinely *fitted* strategy — a momentum threshold searched on the training labels — because a fixed rule cannot exercise the refit path at all. All three strategies still read `NO_EDGE` on a random walk, which is the property that makes the harness trustworthy.
+
+### 2.3 The leakage guard is still not in the path — FIXED 2026-09-03
+`src/backtest/walkforward.py`, `src/backtest/evaluate.py` — see prior review §1.3
+
+`assert_no_future_features` was defined, tested, and never called by `evaluate_walk_forward`, because folds were bare `(features, labels)` tuples carrying no timestamps to check.
+
+**Fixed** as a consequence of the §2.2 interface change: `Fold` now optionally carries `train_times` and `test_times`, and when present `evaluate_walk_forward` checks them itself — test data strictly after training data, with a purge gap of at least the label horizon. It cannot invent timestamps that were never supplied, but it will no longer let a fold through that trains on the future. A guard you have to remember to call is a guard that eventually doesn't get called.
 
 ---
 
 ## 3. Medium and low severity
 
-### 3.1 Split adjustment is an undocumented, untested assumption **[VERIFY]**
-`src/adapters/yahoo_daily.py` — `fetch_daily_bars_yfinance()`, `daily_total_return()`
+### 3.1 Split adjustment was an undocumented assumption — now verified, still untested
+`src/adapters/yahoo_daily.py` — `daily_total_return()`
 
-The module argues carefully for `auto_adjust=False` and raw closes plus cash dividends, because vendor-adjusted series get silently restated. That reasoning covers **dividends**. It never mentions **splits**, and `daily_total_return()` has no split term.
+**Status: the assumption holds.** Severity downgraded from Medium; the finding stays open on the narrower ground below.
 
-The code is only correct if Yahoo's unadjusted `Close` is nonetheless split-adjusted — which it historically is. That is a load-bearing assumption about a third-party scraper this repository elsewhere describes as breaking regularly, and it is written down nowhere. If it is ever false, a 4:1 split injects a fabricated −75% daily return, and the label contract will faithfully score it as a real catastrophic move.
+The module argues carefully for `auto_adjust=False` and raw closes plus cash dividends, because vendor-adjusted series get silently restated. That reasoning covers **dividends**. It never mentioned **splits**, and `daily_total_return()` has no split term. The code is correct only if Yahoo's unadjusted `Close` is nonetheless split-adjusted.
 
-Not verifiable without network access.
+**Verified 2026-09-02** on Tyler's machine, live fetch with yfinance 1.7.0, against NVDA's 10-for-1 split effective 2024-06-10:
 
-**Fix:** one fetch across a known split (NVDA 2024-06-10, AAPL 2020-08-31). Then add a sanity assertion in `normalize_bars` that marks an implausible single-day move `UNKNOWN` rather than trusting it, and state the assumption in the docstring next to the dividend argument.
+```
+daily_total_return for 2024-06-10 : +0.7461%
+independently reported             : ~0.75%
+had Close been genuinely raw       : ~ -90%
+```
 
-### 3.2 `src/strategy/` is an empty package
-`src/strategy/__init__.py` — 0 lines
+So Yahoo's `Close` is split-adjusted and dividend-unadjusted, which is exactly what this module needs. The assumption is now recorded in the `daily_total_return()` docstring with this evidence.
+
+**What remains.** Documenting an assumption is not testing it. This is still a property of a third-party scraper the repository elsewhere describes as breaking regularly, and if a future change makes `Close` genuinely raw, every split in the history becomes a fabricated ~−90% move that the label contract will faithfully score as real. Nothing in the pipeline would complain.
+
+**Remaining fix — a judgment call, deliberately not made unilaterally.** Two options, with a real tradeoff:
+
+- **Magnitude threshold** in `normalize_bars`: flag any single-day move beyond some bound as `UNKNOWN`. Simple, offline-testable, but blunt — a genuine −40% earnings collapse is a real observation and marking it `UNKNOWN` silently deletes exactly the tail events that matter most to a risk model.
+- **Split cross-check**: fetch `yf.Ticker(t).splits` alongside the dividends this adapter already fetches, and assert no return straddling a split date matches the unadjusted price ratio. Precise, no false positives on real crashes, but it lives in the live-fetch path and cannot be tested offline.
+
+The second is better and is what the hazard actually calls for. It needs a decision about where the threshold sits and a machine with network access to develop against.
+
+### 3.2 `src/strategy/` is an empty package — FIXED 2026-09-03
+`src/strategy/__init__.py` — was 0 lines
 
 Every other package under `src/` is substantive. This one is empty, and roadmap Phases 3 through 5 — null run on real bars, component rank IC, post-cost gate — all assume something lives here to be evaluated. The pipeline can measure a strategy but has nowhere to define one, which is why the demos pass functions inline.
 
-Not a bug. Named because it is the actual blocker between "the machinery is verified" and "Phase 3 can start", and an empty directory appears on no status report.
+Not a bug. Named because it was the actual blocker between "the machinery is verified" and "Phase 3 can start", and an empty directory appears on no status report.
 
-### 3.3 Dead branch: both confidence thresholds return `BUY`
+**Filled 2026-09-03** with `components.py` (point-in-time score components), `variants.py` (five named weight sets, including a deliberately contradictory reversion tilt and a naive equal-weight control), and `picks.py` (contract selection, pre-registered exit policy, generated rationale, and a SHA-256-frozen pick envelope). Driven by `generate_picks.py` and scored by a separate `resolve_picks.py`, which is the roadmap's Phase 6 shape: frozen hashed predictions, scored later by a program that cannot edit them.
+
+None of the components is validated — that remains Phase 4's job, and every pick says so on its face.
+
+### 3.3 Dead branch: both confidence thresholds return `BUY` — FIXED
 `market_intelligence_engine.py` — `PredictionEngine.predict()`
 
 ```python
@@ -186,12 +225,12 @@ The arms are identical, so the 0.65 threshold does nothing and the rule is simpl
 
 On the same lines, `prediction = self.model.predict(features)[0]` is computed and discarded.
 
-### 3.4 Six unused imports, three of them heavy
+### 3.4 Six unused imports, three of them heavy — FIXED
 `market_intelligence_engine.py` lines 18–31
 
 `os`, `sys`, `Path`, `requests`, `BeautifulSoup` and `StandardScaler` are imported and never used. The last three matter: the module cannot be imported without `requests`, `beautifulsoup4` and `scikit-learn` installed, and uses none of them. `bs4` is a leftover from before the scraper became synthetic.
 
-### 3.5 The two requirements files contradict each other on `yfinance`
+### 3.5 The two requirements files contradict each other on `yfinance` — FIXED
 
 `requirements.txt` pins `yfinance==0.2.32`. `claude/app/mp_v01/requirements.txt` requires `yfinance>=0.2.40`. **0.2.32 does not satisfy >=0.2.40.** A fresh install that follows the root file produces an environment the pipeline's own requirements declare unsupported, and pip resolves it silently by whichever file was installed last.
 
@@ -205,7 +244,9 @@ mp_v01/requirements.txt      : yfinance>=0.2.40
 0.2.32 satisfies '>=0.2.40'  : False
 ```
 
-Compounding it: `0.2.32` predates several Yahoo endpoint changes, so the pinned version is a poor candidate for actually working against Yahoo today. Current pip resolves `yfinance` to 1.7.0 — five minor versions past either pin, with a changed `auto_adjust` default, which `yahoo_daily.py` sets explicitly and so survives.
+Compounding it: `0.2.32` predates several Yahoo endpoint changes, so the pinned version is a poor candidate for actually working against Yahoo today. Current pip resolves `yfinance` to **1.7.0** — five minor versions past either pin, with a changed `auto_adjust` default, which `yahoo_daily.py` sets explicitly and so survives.
+
+**Update 2026-09-02:** yfinance 1.7.0 was confirmed working end-to-end on Windows — a live fetch of SPY/QQQ/MSFT/NVDA produced correct bars, and the split check in §3.1 passed against it. So the working version is 1.7.0 and **both pins are wrong**, not just contradictory. Pin both files to a version that has actually fetched.
 
 **Fix:** pick one version, verify it fetches, and pin it in both files — or better, have the root file defer to the package's own requirements rather than restating them. Whichever version wins needs a real fetch behind it before the pin means anything.
 
@@ -227,11 +268,11 @@ Recorded because the findings above are only worth acting on if the foundation i
 
 ## 5. Recommended order of work
 
-1. **Fix the null first (§2.2).** Every result the project will ever produce is read on this instrument. Nothing downstream means anything until it is calibrated.
-2. **Write the failing purge test, then fix the purge (§2.1).** Construct a split spanning Thanksgiving week and assert it is rejected. It will fail, and so will the existing `purge_gap_prevents_label_horizon_bleed`. Do not fix the code first — you want to see both tests fail.
-3. **Close the three fail-closed holes (§1.1, §1.2, §1.3).** A set instead of a dict in the store, `is_usable()` consulting the imputation flag, a type check in `need()`. Small, independent, each with an obvious regression test.
-4. **Verify the split assumption (§3.1).** One fetch, one assertion, one docstring sentence.
-5. **Then start Phase 3.** Running a deliberately worthless strategy on real bars before step 1 would tell you nothing — a null that cannot price overfitting cannot certify a null result either.
+1. ~~**Fix the null first (§2.2).**~~ **Done 2026-09-03**, along with §2.3. The instrument is now calibrated: the fit is inside the null, and the permutation respects label overlap.
+2. **Write the failing purge test, then fix the purge (§2.1).** ← **now the top of the list.** Construct a split spanning Thanksgiving week and assert it is rejected. It will fail, and so will the existing `purge_gap_prevents_label_horizon_bleed`. Do not fix the code first — you want to see both tests fail.
+3. ~~**Close the three fail-closed holes (§1.1, §1.2, §1.3).**~~ **Done 2026-09-02**, along with §3.3, §3.4 and §3.5. Core suite 76 → 81 tests; 105 across the repo.
+4. **Decide the split guard (§3.1).** The assumption is verified and documented; what remains is choosing between a magnitude threshold and a split cross-check, and pinning `yfinance` to the version that actually fetched (§3.5).
+5. **Then start Phase 3.** With the null fixed this is now genuinely informative: run a deliberately worthless strategy on real bars and confirm `NO_EDGE`. It needs §2.1 closed first — a leaky split would flatter even a worthless strategy — and something in `src/strategy/` to run (§3.2).
 
 ---
 

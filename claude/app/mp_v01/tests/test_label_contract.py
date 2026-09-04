@@ -98,6 +98,21 @@ def missing_dlret_imputes_total_loss_and_flags_it():
     assert lab.y == 0
 
 @test
+def an_imputed_delisting_return_is_never_usable():
+    """With no DLRET the contract assumes a total loss and flags it - but the
+    status is still OK, so is_usable() used to return True and an ASSUMPTION
+    entered training indistinguishable from an observation."""
+    lab = build_label("XYZ", "2026-03-05", [0.0]*5, FLAT,
+                      delisted_in_horizon=True, delisting_return=None)
+    assert lab.delisting_return_imputed is True
+    assert not lab.is_usable(), "an assumed -100% must never train as observed"
+    # A delisting with a REAL DLRET is an observation and stays usable.
+    real = build_label("XYZ", "2026-03-05", [0.0]*4 + [0.0], FLAT,
+                       delisted_in_horizon=True, delisting_return=-0.9)
+    assert not real.delisting_return_imputed
+    assert real.is_usable()
+
+@test
 def none_in_return_series_raises_rather_than_silently_zeroing():
     assert_raises(ValueError, log_total_return, [0.01, None])
 

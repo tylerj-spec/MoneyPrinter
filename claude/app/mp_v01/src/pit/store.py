@@ -48,6 +48,20 @@ class PointInTimeStore:
                 raise ValueError(
                     "A revision cannot become available before the value it supersedes"
                 )
+            # Two records superseding the SAME original leave no way to say which
+            # vintage is current. The old code overwrote this entry, orphaning the
+            # first revision so nothing marked it superseded and as_of() returned
+            # BOTH as current - which then inflates
+            # independent_information_events() and, through it, the evidence gate.
+            # Resolving the ambiguity by guessing (say, latest available_time) would
+            # be inference; rejecting it is not.
+            already = self._superseded_by.get(rec.supersedes_record_id)
+            if already is not None:
+                raise ValueError(
+                    f"{rec.record_id} supersedes {rec.supersedes_record_id}, but "
+                    f"{already} already does. Two revisions of one record cannot "
+                    f"both be current. Chain it instead: supersede {already}."
+                )
             self._superseded_by[rec.supersedes_record_id] = rec.record_id
         self._records.append(rec)
         self._by_id[rec.record_id] = rec
