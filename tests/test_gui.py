@@ -35,7 +35,8 @@ except ImportError:
     for name in ("LEFT", "RIGHT", "TOP", "BOTTOM", "X", "Y", "BOTH", "WORD",
                  "CHAR", "END", "NORMAL", "DISABLED", "SUNKEN", "W"):
         setattr(tk, name, name.lower())
-    for sub in ("ttk", "filedialog", "messagebox", "scrolledtext"):
+    for sub in ("ttk", "filedialog", "messagebox", "scrolledtext",
+                "simpledialog"):
         mod = types.ModuleType(f"tkinter.{sub}")
         mod.__getattr__ = lambda n: type(n, (), {})  # type: ignore[attr-defined]
         setattr(tk, sub, mod)
@@ -161,12 +162,20 @@ def the_missing_chain_marker_matches_what_generate_picks_actually_prints():
         f"in generate_picks.py, so the GUI will stop offering the fix")
 
 @test
-def option_chains_are_fetched_by_default():
-    """Off by default, step 1 succeeds and step 3 refuses two steps later for
-    want of a chain - a failure that surfaces nowhere near its cause, and the
-    exact shape of the first bug reported against this app."""
-    src = (ROOT / "gui.py").read_text(encoding="utf-8")
-    assert 'saved.get("chains", True)' in src, "the chains checkbox must default to on"
+def option_chains_are_not_optional():
+    """There is no chains setting any more, in either surface.
+
+    A checkbox that can be left off produced a run which looked successful and
+    then failed two steps later - twice, to the same user. Bars without a chain
+    cannot make a pick, and Yahoo keeps no historical chains, so a snapshot not
+    taken today is gone. The GUI must not offer the choice, and fetch_data must
+    default to taking them.
+    """
+    gui_src = (ROOT / "gui.py").read_text(encoding="utf-8")
+    assert "chains_var" not in gui_src, "the chains checkbox must be gone entirely"
+    fetch_src = (ROOT / "claude/app/mp_v01/fetch_data.py").read_text(encoding="utf-8")
+    assert "BooleanOptionalAction" in fetch_src and "default=True" in fetch_src, (
+        "fetch_data.py must snapshot chains unless --no-chains is passed")
 
 @test
 def the_picks_workbook_has_a_folder_of_its_own():
@@ -190,6 +199,48 @@ def nothing_printed_to_a_console_is_outside_ascii():
             if "print(" in line and any(ord(c) > 127 for c in line):
                 offenders.append(f"{name}:{i}  {line.strip()[:70]}")
     assert not offenders, "non-ASCII in console output:\n  " + "\n  ".join(offenders)
+
+
+@test
+def the_api_key_is_never_written_to_the_settings_file():
+    """The settings file is plaintext in the home directory. A key written
+    there outlives every reason it was needed, and the last one leaked by being
+    somewhere it could be copied from."""
+    src = (ROOT / "gui.py").read_text(encoding="utf-8")
+    body = src[src.index("def _save_settings"):]
+    body = body[:body.index("except Exception")]
+    assert "massive_key" not in body and "MASSIVE" not in body, (
+        "the Massive key must not be persisted:\n" + body)
+
+@test
+def the_api_key_reaches_the_child_through_the_environment_only():
+    """Not argv: every process on the machine can read the process table, and
+    the GUI echoes the command line to its own console. Not a file either."""
+    src = (ROOT / "gui.py").read_text(encoding="utf-8")
+    assert "def _massive_env" in src
+    body = src[src.index("def _massive_env"):]
+    body = body[:body.index("def test_massive_key")]
+    assert f"{{MASSIVE_ENV_VAR: key}}" in body, body
+    # The two Massive commands must pass env_extra and must not pass the key
+    # as an argument.
+    for name in ("def test_massive_key", "def fetch_massive"):
+        chunk = src[src.index(name):]
+        chunk = chunk[:chunk.index("\n    def ", 10)]
+        assert "env_extra=self._massive_env()" in chunk, name
+        assert "massive_key_var.get()" not in chunk.split("_massive_env")[0], name
+
+@test
+def the_key_box_is_masked():
+    """A screenshot or a screen-share is how the previous key got exposed."""
+    src = (ROOT / "gui.py").read_text(encoding="utf-8")
+    entry = src[src.index("self.key_entry = "):]
+    assert 'show="*"' in entry[:300], entry[:300]
+
+@test
+def the_env_var_name_matches_the_vendors_own_client():
+    """massive-com/client-python defaults to MASSIVE_API_KEY, so a key already
+    set for their tooling is picked up rather than retyped."""
+    assert gui.MASSIVE_ENV_VAR == "MASSIVE_API_KEY"
 
 
 if __name__ == "__main__":
