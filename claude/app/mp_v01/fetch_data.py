@@ -24,19 +24,25 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from app_paths import get_paths
+from common.timezones import US_EASTERN
+from gates.risk import RiskLimits
 
 from adapters.yahoo_daily import (normalize_bars, fetch_daily_bars_yfinance,  # noqa: E402
                                   check_split_adjustment, normalize_option_row)
 
 UNIVERSE = ["SPY", "QQQ", "MSFT"]          # approved first slice (INDEX_PLUS_ONE)
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_store")
+DATA_DIR = str(get_paths().data)
 
 
 def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _iso(o):
@@ -71,7 +77,7 @@ def fetch_bars(start: str, end: str, tickers: list[str]) -> int:
         broken = [c for c in checks if c.failed]
 
         path = os.path.join(DATA_DIR, "bars", f"{t}_{start}_{end}__v{vintage}.json")
-        with open(path, "w") as f:
+        with open(path, "x", encoding="utf-8") as f:
             json.dump({
                 "ticker": t, "start": start, "end": end,
                 "vintage_id": vintage,
@@ -100,21 +106,44 @@ def fetch_bars(start: str, end: str, tickers: list[str]) -> int:
     return total
 
 
+def select_expiries(expiries, snapshot_day: date,
+                    limits: RiskLimits = RiskLimits()) -> list[str]:
+    """Cover the entry DTE band and nearer expiries needed to mark open picks.
+
+    A fixed count of expirations is not a duration: six daily expirations can
+    all be rejected by a 21-day minimum. Never truncate before reaching the
+    complete allowed band. Expiries beyond max_dte cannot enter this strategy.
+    """
+    selected = set()
+    for value in expiries:
+        try:
+            expiry = date.fromisoformat(value)
+        except (ValueError, TypeError):
+            continue
+        if 0 <= (expiry - snapshot_day).days <= limits.max_dte:
+            selected.add(expiry.isoformat())
+    return sorted(selected)
+
+
 def snapshot_chains(tickers: list[str]) -> int:
     """Point-in-time option chain snapshot. THIS is how you build options history for free."""
     import yfinance as yf
     os.makedirs(os.path.join(DATA_DIR, "chains"), exist_ok=True)
-    snap_time = datetime.now(timezone.utc)
-    vintage = _ts()
     total = 0
     for t in tickers:
         print(f"  {t} chain ... ", end="", flush=True)
         try:
             tk = yf.Ticker(t)
-            expiries = list(tk.options or [])[:6]      # nearest 6 expiries
-            blocks, skipped = [], 0
+            snapshot_day = datetime.now(US_EASTERN).date()
+            expiries = select_expiries(tk.options or [], snapshot_day)
+            blocks, skipped, failed_expiries = [], 0, []
             for exp in expiries:
-                ch = tk.option_chain(exp)
+                try:
+                    ch = tk.option_chain(exp)
+                except Exception as e:
+                    failed_expiries.append(exp)
+                    print(f"\n    FAILED: expiry {exp}: {type(e).__name__}: {e}")
+                    continue
                 for side, df in (("CALL", ch.calls), ("PUT", ch.puts)):
                     for _, r in df.iterrows():
                         # Per ROW, not per ticker. One malformed contract used to
@@ -130,9 +159,18 @@ def snapshot_chains(tickers: list[str]) -> int:
             print(f"FAILED: {type(e).__name__}: {e}")
             continue
 
+        if not blocks:
+            print("FAILED: no contracts returned; previous snapshots preserved")
+            continue
+        # The full ticker snapshot is knowable only AFTER its last response.
+        snap_time = datetime.now(timezone.utc)
+        vintage = _ts()
         ok = sum(1 for b in blocks if b["status"] == "OK")
+        limits = RiskLimits()
+        in_band = sum(limits.min_dte <= (date.fromisoformat(b["expiration"]) -
+                                       snapshot_day).days <= limits.max_dte for b in blocks)
         path = os.path.join(DATA_DIR, "chains", f"{t}__v{vintage}.json")
-        with open(path, "w") as f:
+        with open(path, "x", encoding="utf-8") as f:
             json.dump({
                 "underlying": t,
                 "snapshot_time_utc": snap_time.isoformat(),
@@ -140,6 +178,9 @@ def snapshot_chains(tickers: list[str]) -> int:
                 "vintage_id": vintage,
                 "source": "yahoo_finance_option_chain",
                 "expiries": expiries,
+                "failed_expiries": failed_expiries,
+                "entry_dte_band": [limits.min_dte, limits.max_dte],
+                "contracts_in_entry_band": in_band,
                 "contract_count": len(blocks),
                 "usable_quotes": ok,
                 "unreadable_rows": skipped,
@@ -149,20 +190,24 @@ def snapshot_chains(tickers: list[str]) -> int:
             }, f, indent=2, allow_nan=False)
         note = f", {skipped} unreadable" if skipped else ""
         print(f"{len(blocks)} contracts, {ok} usable{note} -> {os.path.basename(path)}")
+        print(f"    {in_band} contracts in the {limits.min_dte}-{limits.max_dte} DTE entry band")
         total += len(blocks)
     return total
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    global DATA_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2019-01-01")
     ap.add_argument("--end", default=datetime.now().strftime("%Y-%m-%d"))
     ap.add_argument("--tickers", default=",".join(UNIVERSE))
+    ap.add_argument("--data-dir", default=DATA_DIR)
     ap.add_argument("--chains", action=argparse.BooleanOptionalAction, default=True,
                     help="snapshot today's option chains as well as bars (default: yes). "
                          "--no-chains fetches bars only. Yahoo has no HISTORICAL chains, "
                          "so a snapshot missed today cannot be taken later at any price.")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    DATA_DIR = str(Path(a.data_dir).expanduser().resolve())
     tickers = [t.strip().upper() for t in a.tickers.split(",") if t.strip()]
 
     try:

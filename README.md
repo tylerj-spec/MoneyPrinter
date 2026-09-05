@@ -30,13 +30,13 @@ The goal is to find out, honestly, whether a small, disciplined, point-in-time-c
 ├── gui.py                         Desktop GUI - fetch data, build the Excel workbook
 ├── generate_picks.py              Frozen, hashed paper picks from the PIT store
 ├── resolve_picks.py               Scores an earlier pick file against what happened
-├── picks/                         The forward paper record - COMMIT THESE
+├── picks/                         Documentation (records live outside the checkout)
 ├── run_gui.bat                    Windows double-click launcher for the GUI
 ├── diagnose.py                    Setup report - what this copy is and what it produced
 ├── excel_report.py                Data store -> .xlsx (bars, labels, summary)
 ├── run_tests.py                   Runs every suite in the repo
 ├── tests/                         Tests for the Excel export and the GUI
-├── excel_out/                     Generated workbooks (gitignored)
+├── app_paths.py                   Shared external runtime paths and migration
 ├── CODE_REVIEW_2026-08-13.md      Complete accounting of MIE issues and remediation
 ├── CODE_REVIEW_2026-09-02.md      Follow-up review; 6 of 11 findings now fixed
 ├── claude/                        Claude's work: architecture, orchestration, review
@@ -115,6 +115,45 @@ confirms the install worked. If anything ever looks wrong, **Check setup** is th
 first thing to press — it reports which commit you are on, what data you have, and
 whether a workbook was built by older code.
 
+### Outputs stay outside the code checkout
+
+All generated files default to **`~/MoneyPrinterData`** (on Windows, normally
+`C:\Users\<you>\MoneyPrinterData`). The GUI shows this folder and lets you change it.
+Command-line tools use the same saved setting. `MONEYPRINTER_HOME` overrides it
+for a session, portable drive, or automated run.
+
+| Subfolder / file | Contents |
+|---|---|
+| `data_store/` | Immutable bars, option snapshots, and Massive research data |
+| `picks/` | Frozen JSON paper records; back these up |
+| `excel_out/` | Data workbooks |
+| `picks_out/` | Picks workbooks |
+| `backtests/` | Signal studies |
+| `dashboard.html` | Offline dashboard |
+
+The first GUI launch copies existing runtime files from this checkout and old
+saved workbook folders. It preserves the original files and keeps conflicting
+versions under distinct names. No existing pick is rewritten or rehashed.
+CLI-only users can run `python migrate_outputs.py`. For an older ZIP checkout,
+use `python migrate_outputs.py --from-code-dir "path/to/old/MoneyPrinter"`.
+Inspect the new folder before removing any old copies. Backups of this output
+folder are separate from GitHub.
+
+The picks workbook opens on **Pick_Runs**, showing proposal and abstention
+counts for each run. Zero proposals is an explicit result; **Pick_Abstentions**
+contains the reasons. Contract failures report counts for DTE, spread, open
+interest, volume and model availability; counts can overlap.
+
+Forward generation uses today's US Eastern date. It refuses backdating and
+requires a same-day chain observed by the earlier of generation time and 15:45 ET.
+Weekend runs record abstentions. The app does not yet carry a complete exchange
+holiday/early-close calendar or a verified quote-age feed; this remains paper
+research, and modeled fills are not executable quotes.
+
+Version 0.2 records checksum both the picks and their metadata. Original 0.1
+records remain readable with their original picks-only checksum. A checksum
+detects content mismatch; it does not prove when someone generated the file.
+
 ### What the buttons do
 
 | Button | What it does |
@@ -142,7 +181,8 @@ whether the signal behind them has ever been shown to work. One `.html` file wit
 style, number and chart inlined: no CDN, no fonts to fetch, no server. Copy it to a
 machine with the wifi off and it renders identically.
 
-Tick **"also snapshot option chains"** before fetching if you want Greeks or picks.
+Step 1 snapshots option chains automatically, including every listed expiry through the
+60-day entry limit. The 21–60 DTE strategy band is never replaced by a fixed count of expirations.
 Yahoo publishes no historical chains, so a daily snapshot is the only way to build
 options history — and without a chain there is nothing to compute Greeks from or
 choose a contract out of.
@@ -151,7 +191,7 @@ choose a contract out of.
 
 | Menu item | |
 |---|---|
-| File → Open the picks folder | The forward record. Commit this folder — unlike the data store it cannot be regenerated. |
+| File → Open the picks folder | The forward record in the output folder. Back it up; it cannot be regenerated. |
 | Run → Score a specific pick file… | Score an older file rather than the newest. |
 | File → Open the backtests folder | Raw JSON behind the dashboard's evidence section. |
 | Run → Build and open the dashboard | Same as the button. |
@@ -169,7 +209,7 @@ python diagnose.py                                   # the setup report
 python claude/app/mp_v01/fetch_data.py --chains      # fetch
 python excel_report.py                               # build the workbook
 python generate_picks.py                             # freeze picks
-python resolve_picks.py picks/<file>.json            # score them
+python resolve_picks.py ~/MoneyPrinterData/picks/<file>.json            # score them
 python backtest.py                                   # walk the signal forward
 python dashboard.py --open                           # build and open the page
 ```
@@ -286,8 +326,8 @@ developing." Changing these mid-flight invalidates the record.
 ### The history accumulates in Excel
 
 `Pick_History` is a **view over every frozen file in `picks/`**, not something the
-workbook remembers. So rebuilding the workbook never loses history, and committing
-`picks/` is what preserves it. Regenerate any time:
+workbook remembers. Backing up the output folder preserves these records;
+Git no longer stores runtime output. Regenerate any time:
 
 ```bash
 python excel_report.py          # rebuilds every sheet, history included
@@ -323,7 +363,7 @@ Those rows are still shown, but excluded from `Pick_Performance`.
 ### Scoring it later
 
 ```bash
-python resolve_picks.py picks/picks_2026-09-03_20260903-160000.json
+python resolve_picks.py ~/MoneyPrinterData/picks/picks_2026-09-03_20260903-160000.json
 ```
 
 The resolver re-hashes the picks before doing anything else. A mismatch means the

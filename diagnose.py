@@ -28,10 +28,13 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+from app_paths import get_paths
+
+PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "claude" / "app" / "mp_v01" / "data_store"
-EXCEL_DIR = HERE / "excel_out"
-PICKS_DIR = HERE / "picks"
+DATA_DIR = PATHS.data
+EXCEL_DIR = PATHS.excel
+PICKS_DIR = PATHS.picks
 
 # Markers that prove a feature is present in THIS checkout, not just on GitHub.
 FEATURE_MARKERS = [
@@ -121,8 +124,7 @@ def check_store() -> None:
         print("\n  >>> THIS IS WHY YOU HAVE NO GREEKS AND NO PICKS. <<<")
         print("      Greeks are computed from an option chain, and picks need one to")
         print("      choose a contract from. Bars alone cannot produce either.")
-        print("      Fix: tick 'also snapshot today's option chains' in the GUI before")
-        print("      Fetch, or run:")
+        print("      Fix: run step 1 again and inspect any chain-fetch failures, or run:")
         print("        python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT --chains")
 
 
@@ -143,11 +145,11 @@ def check_picks() -> None:
 
 
 def check_workbooks() -> None:
-    rule("4. WORKBOOKS IN excel_out/  (newest first)")
-    if not EXCEL_DIR.is_dir():
-        print(f"  No {EXCEL_DIR} yet.")
-        return
-    books = sorted(EXCEL_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+    rule("4. WORKBOOKS  (both output folders, newest first)")
+    print(f"  Data workbooks : {EXCEL_DIR}")
+    print(f"  Picks workbooks: {PATHS.picks_excel}")
+    books = sorted([*EXCEL_DIR.glob("*.xlsx"), *PATHS.picks_excel.glob("*.xlsx")],
+                   key=lambda p: p.stat().st_mtime, reverse=True)
     if not books:
         print(f"  No .xlsx files in {EXCEL_DIR}.")
         return
@@ -194,6 +196,7 @@ def main() -> int:
     print("MONEY PRINTER - environment diagnostic")
     print("=" * 74)
     print(f"Python {sys.version.split()[0]}")
+    print(f"Output folder: {PATHS.root}")
     check_code()
     check_store()
     check_picks()

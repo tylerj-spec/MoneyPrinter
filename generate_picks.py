@@ -10,15 +10,15 @@ Requires a fetch WITH option chains first:
 
     python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT --chains
 
-Writes picks/picks_<decision-date>_<timestamp>.json and prints the short list.
+Writes <output folder>/picks/picks_<decision-date>_<timestamp>.json.
 Score them later with:
 
     python resolve_picks.py picks/<that file>
 
 WHAT THIS IS
 The generator half of the roadmap's Phase 6. Each run produces predictions that
-are frozen and hashed at the moment of writing, so they cannot be edited once
-the outcome is known. That property - not the picks themselves - is what makes
+are hashed at writing, so later content changes can be detected. A local hash
+is not an authenticated timestamp; keep independent backups of the record. That property - not the picks themselves - is what makes
 a forward paper record worth more than any backtest in this repository.
 
 WHAT THIS IS NOT
@@ -35,10 +35,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app_paths import get_paths
+
+PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
-DEFAULT_DATA_DIR = MP_V01_DIR / "data_store"
-DEFAULT_PICKS_DIR = HERE / "picks"
+DEFAULT_DATA_DIR = PATHS.data
+DEFAULT_PICKS_DIR = PATHS.picks
 
 sys.path.insert(0, str(MP_V01_DIR / "src"))
 
@@ -48,8 +51,35 @@ from strategy.picks import (                    # noqa: E402
     ExitPolicy, approximate_assessment_date, freeze, generate_picks,
 )
 from strategy.variants import BY_NAME, VARIANTS  # noqa: E402
+from common.timezones import US_EASTERN
+from labels.contract import decision_time_utc_for as decision_time_utc
 
 import excel_report as ex                        # noqa: E402
+
+
+def prepare_inputs(data: dict, decision_date: str, now: datetime) -> dict:
+    """Require a same-day, already observed chain for a forward paper proposal."""
+    result = {}
+    for ticker, rows in data["rows"].items():
+        reason = None
+        path = data.get("chain_files", {}).get(ticker)
+        if datetime.fromisoformat(decision_date).weekday() >= 5:
+            reason = "market closed (weekend); no new paper entry from an off-session snapshot"
+        elif not path:
+            reason = "no option chain available by the decision cutoff; fetch before 15:45 ET"
+        else:
+            doc = json.loads(Path(path).read_text(encoding="utf-8"))
+            snap = datetime.fromisoformat(doc["snapshot_time_utc"].replace("Z", "+00:00"))
+            if snap.tzinfo is None or snap > min(now, decision_time_utc(decision_date)):
+                reason = "option chain was not available by the decision cutoff"
+            elif snap.astimezone(US_EASTERN).date().isoformat() != decision_date:
+                reason = "stale option chain; a same-day snapshot is required for a new paper entry"
+        result[ticker] = {
+            "components": components.compute(rows, decision_date),
+            "option_rows": data["options"].get(ticker, []),
+            "precondition_reason": reason,
+        }
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,13 +89,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tickers", default=None, help="comma-separated subset")
     ap.add_argument("--variants", default=None,
                     help=f"comma-separated subset of: {', '.join(BY_NAME)}")
-    ap.add_argument("--decision-date", default=datetime.now().strftime("%Y-%m-%d"))
+    now = datetime.now(timezone.utc)
+    today = now.astimezone(US_EASTERN).date().isoformat()
+    ap.add_argument("--decision-date", default=today,
+                    help="today in US Eastern; forward records cannot be backdated")
     ap.add_argument("--risk-free-rate", type=float, default=ex.DEFAULT_RISK_FREE_RATE)
     ap.add_argument("--excel", default=None, metavar="PATH",
                     help="also write a PICKS workbook here, so Pick_History includes "
                          "this run (needs openpyxl). Picks only - the bars and labels "
                          "live in the data workbook that step 2 writes.")
     a = ap.parse_args(argv)
+    if a.decision_date != today:
+        ap.error("forward picks must use today's US Eastern date; use backtest.py for historical research")
 
     data_dir = Path(a.data_dir).expanduser().resolve()
     only = a.tickers.split(",") if a.tickers else None
@@ -83,40 +118,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"MONEY PRINTER - paper pick generation   decision date {a.decision_date}")
     print("=" * 78)
 
-    data = ex.collect(data_dir, only, risk_free_rate=a.risk_free_rate)
+    cutoff = min(now, decision_time_utc(a.decision_date))
+    data = ex.collect(data_dir, only, risk_free_rate=a.risk_free_rate, chain_cutoff=cutoff)
     if not data["rows"]:
         print("\nNo bars in the store. Fetch first:")
         print("    python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT --chains")
         return 1
-    if not data.get("options"):
+    if not ex.find_chain_files(data_dir):
         print("\nBars are present but no option chain snapshots are.")
         print("Picks need a chain. Re-fetch with --chains:")
         print("    python claude/app/mp_v01/fetch_data.py --tickers SPY,QQQ,MSFT --chains")
         return 1
 
-    # A chain snapshot older than the decision date makes every quote, DTE and
-    # Greek in the picks stale. It still generates - a day-old chain is often the
-    # best available - but silently pricing yesterday's contracts as today's is
-    # how a pick list stops describing anything real.
-    stale = []
-    for ticker, doc_path in data.get("chain_files", {}).items():
-        snap = json.loads(Path(doc_path).read_text(encoding="utf-8"))
-        day = str(snap.get("snapshot_time_utc") or "")[:10]
-        if day and day < a.decision_date:
-            stale.append((ticker, day))
-    if stale:
-        print("\n  WARNING: the newest option chain predates the decision date.")
-        for ticker, day in sorted(stale):
-            print(f"    {ticker}: snapshot {day}, deciding for {a.decision_date}")
-        print("  Quotes, DTE and Greeks below are as of those snapshots, not today.")
-        print("  Re-fetch with --chains for a current chain.")
-
-    per_ticker = {}
-    for ticker, rows in data["rows"].items():
-        per_ticker[ticker] = {
-            "components": components.compute(rows, a.decision_date),
-            "option_rows": data["options"].get(ticker, []),
-        }
+    per_ticker = prepare_inputs(data, a.decision_date, now)
 
     policy = ExitPolicy()
     picks = generate_picks(a.decision_date, per_ticker, variants=chosen,
@@ -127,7 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         universe=sorted(data["rows"]),
         generated_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         source_files={"bars": data["files"], "chains": data["chain_files"],
-                      "risk_free_rate": a.risk_free_rate},
+                      "risk_free_rate": a.risk_free_rate,
+                      "decision_cutoff_utc": cutoff.isoformat()},
     )
 
     proposed = [p for p in picks if p["action"] != "ABSTAIN"]
@@ -170,9 +185,10 @@ def main(argv: list[str] | None = None) -> int:
 
     out_dir = Path(a.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     path = out_dir / f"picks_{a.decision_date}_{stamp}.json"
-    path.write_text(json.dumps(frozen, indent=2, default=str), encoding="utf-8")
+    with path.open("x", encoding="utf-8") as output:
+        json.dump(frozen, output, indent=2, default=str, allow_nan=False)
 
     excel_path = None
     if a.excel:
@@ -190,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     if excel_path:
         print(f"Workbook  : {excel_path}")
     print(f"SHA-256   : {frozen['picks_sha256']}")
-    print("\nCommit this file. It is the record, and unlike the data store it is not")
+    print("\nBack up this output folder. The frozen record is not")
     print("regenerable - re-running tomorrow produces tomorrow's picks, not today's.")
     print(f"\nScore it later with:\n    python resolve_picks.py {path}")
     print("\nPaper/simulation only. Hypotheses for forward measurement, not advice.")

@@ -37,11 +37,14 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from app_paths import get_paths
+
+PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
-DEFAULT_DATA_DIR = MP_V01_DIR / "data_store"
-DEFAULT_OUT_DIR = HERE / "excel_out"
-DEFAULT_PICKS_DIR = HERE / "picks"
+DEFAULT_DATA_DIR = PATHS.data
+DEFAULT_OUT_DIR = PATHS.excel
+DEFAULT_PICKS_DIR = PATHS.picks
 
 # The label contract is imported, never re-derived here. If the definition of
 # the target changes in the codebase, this workbook changes with it.
@@ -59,6 +62,7 @@ from options.greeks import (  # noqa: E402
     implied_volatility,
     years_to_expiry,
 )
+from common.timezones import US_EASTERN
 
 # The risk-free rate is an ASSUMPTION, not something the bar store contains.
 # Override with --risk-free-rate. It moves the Greeks only slightly at short
@@ -118,7 +122,7 @@ def dated_rows(doc: dict[str, Any]) -> list[dict[str, Any]]:
 # Option chains
 # ---------------------------------------------------------------------------
 
-def find_chain_files(data_dir: Path) -> dict[str, Path]:
+def find_chain_files(data_dir: Path, cutoff: datetime | None = None) -> dict[str, Path]:
     """Newest chain snapshot per underlying under <data_dir>/chains."""
     chains_dir = data_dir / "chains"
     if not chains_dir.is_dir():
@@ -128,6 +132,17 @@ def find_chain_files(data_dir: Path) -> dict[str, Path]:
         head, sep, vintage = path.stem.partition("__v")
         if not sep:
             continue
+        if cutoff is not None:
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+                if not doc.get("snapshot_time_utc"):
+                    continue
+                times = [datetime.fromisoformat(doc[key].replace("Z", "+00:00"))
+                         for key in ("snapshot_time_utc", "available_time") if doc.get(key)]
+                if not times or any(t.tzinfo is None or t > cutoff for t in times):
+                    continue
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
         ticker = head.split("_")[0].upper()
         if ticker not in newest or vintage > newest[ticker][0]:
             newest[ticker] = (vintage, path)
@@ -207,7 +222,12 @@ def build_option_rows(
     volatility at all gets a model_status and blank Greeks - never a plausible
     substitute.
     """
-    snapshot = str(chain_doc.get("snapshot_time_utc") or "")[:10]
+    raw_snapshot = str(chain_doc.get("snapshot_time_utc") or "")
+    try:
+        snapshot = datetime.fromisoformat(raw_snapshot.replace("Z", "+00:00")).astimezone(
+            US_EASTERN).date().isoformat()
+    except ValueError:
+        snapshot = ""
     und_date, spot = underlying_as_of(bar_rows, snapshot) if snapshot else (None, None)
     q = trailing_dividend_yield(bar_rows, snapshot) if (snapshot and spot) else 0.0
 
@@ -375,7 +395,8 @@ def summarize(ticker: str, doc: dict[str, Any], rows: list[dict[str, Any]],
 
 def collect(data_dir: Path, only: list[str] | None = None, *,
             risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
-            picks_dir: Path | None = None) -> dict[str, Any]:
+            picks_dir: Path | None = None,
+            chain_cutoff: datetime | None = None) -> dict[str, Any]:
     """Everything the workbook needs, with no Excel dependency in sight."""
     files = find_bar_files(data_dir)
     if only:
@@ -404,7 +425,7 @@ def collect(data_dir: Path, only: list[str] | None = None, *,
 
     # Option chains are optional: they exist only if fetch_data.py ran --chains.
     limits, costs = RiskLimits(), CostModel()
-    chain_files = find_chain_files(data_dir)
+    chain_files = find_chain_files(data_dir, chain_cutoff)
     if only:
         wanted = {t.strip().upper() for t in only if t.strip()}
         chain_files = {t: p for t, p in chain_files.items() if t in wanted}
@@ -866,6 +887,13 @@ PICK_PERF_COLUMNS = [
 PICK_ABSTENTION_COLUMNS = [
     ("decision_date", 14, "yyyy-mm-dd"), ("variant", 21, None), ("ticker", 8, None),
     ("composite_score", 15, "0.000"), ("reason", 70, None),
+    ("integrity", 11, None), ("source_file", 48, None),
+]
+
+PICK_RUN_COLUMNS = [
+    ("decision_date", 15, "yyyy-mm-dd"), ("generated_utc", 28, None),
+    ("n_picks", 15, "0"), ("n_abstentions", 16, "0"),
+    ("result", 65, None), ("integrity", 11, None), ("file", 55, None),
 ]
 
 
@@ -926,7 +954,8 @@ def load_pick_history(picks_dir: Path, data: dict[str, Any],
         ok = verify(frozen)
         files.append({"file": path.name, "decision_date": frozen.get("decision_date"),
                       "generated_utc": frozen.get("generated_utc"),
-                      "n_picks": frozen.get("n_picks"),
+                      "n_picks": sum(p.get("action") != "ABSTAIN" for p in frozen.get("picks", [])),
+                      "n_abstentions": sum(p.get("action") == "ABSTAIN" for p in frozen.get("picks", [])),
                       "integrity": "OK" if ok else "VOID"})
 
         for pick in frozen.get("picks", []):
@@ -936,6 +965,7 @@ def load_pick_history(picks_dir: Path, data: dict[str, Any],
                     "variant": pick.get("variant"), "ticker": pick.get("ticker"),
                     "composite_score": pick.get("composite_score"),
                     "reason": pick.get("reason"),
+                    "integrity": "OK" if ok else "VOID", "source_file": path.name,
                 })
                 continue
             ticker = pick.get("ticker")
@@ -1044,7 +1074,8 @@ def write_workbook(data: dict[str, Any], out_path: Path,
     _write_readme(wb.active, data)
     wb.active.title = "README"
 
-    _write_summary(wb.create_sheet("Summary"), data["summaries"])
+    if want_data:
+        _write_summary(wb.create_sheet("Summary"), data["summaries"])
 
     if want_data:
         for ticker in sorted(data["rows"]):
@@ -1063,7 +1094,19 @@ def write_workbook(data: dict[str, Any], out_path: Path,
                            data["options"][ticker])
 
     hist = data.get("pick_history") or {}
-    if want_picks and (hist.get("outcomes") or hist.get("abstentions")):
+    if want_picks and (sections == PICK_SECTIONS or hist.get("files")
+                       or hist.get("outcomes") or hist.get("abstentions")):
+        run_rows = []
+        for run in reversed(hist.get("files", [])):
+            result = ("VOID record - exclude from performance" if run.get("integrity") != "OK"
+                      else "Paper hypotheses - see Pick_History" if run.get("n_picks")
+                      else "NO PROPOSALS - see Pick_Abstentions for every reason")
+            run_rows.append({**run, "result": result})
+        if not run_rows:
+            run_rows = [{"result": "No frozen runs found. Generate paper picks first."}]
+        _write_simple(wb.create_sheet("Pick_Runs"), PICK_RUN_COLUMNS, run_rows)
+        if sections == PICK_SECTIONS:
+            wb.active = wb.sheetnames.index("Pick_Runs")
         _write_pick_history(wb.create_sheet("Pick_History"), hist.get("outcomes", []))
         _write_pick_justifications(wb.create_sheet("Pick_Justifications"),
                                    hist.get("rationales", []))

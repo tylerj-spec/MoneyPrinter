@@ -57,7 +57,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from common.timezones import US_EASTERN as NY
@@ -238,7 +238,11 @@ def _get(path: str, params: dict[str, Any] | None = None,
     })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            doc = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(doc, dict) or doc.get("status") not in ("OK", "DELAYED"):
+                raise MassiveError("Response did not report an OK/DELAYED data status",
+                                   "INVALID_RESPONSE")
+            return doc
     except urllib.error.HTTPError as e:
         body = ""
         try:
@@ -268,7 +272,35 @@ def _paginate(path: str, params: dict[str, Any], *, max_pages: int = 20) -> Iter
         nxt = page.get("next_url")
         if not nxt:
             return
+        if _ + 1 == max_pages:
+            raise MassiveError(f"Response exceeds max_pages={max_pages}; incomplete history rejected",
+                               "INCOMPLETE_RESPONSE")
+        if not nxt.startswith(BASE_URL + "/"):
+            raise MassiveError("Unexpected pagination URL", "INVALID_RESPONSE")
         page = _get(nxt[len(BASE_URL):] if nxt.startswith(BASE_URL) else nxt)
+
+
+def _validate_contracts(rows, underlying: str, as_of: str) -> list[dict[str, Any]]:
+    """An HTTP success is insufficient: verify the returned scope before saving."""
+    expected = underlying.strip().upper()
+    day = date.fromisoformat(as_of)
+    normalized = []
+    for row in rows:
+        contract = normalize_contract(row, as_of=as_of)
+        try:
+            valid = (contract["status"] == "OK" and contract["underlying"] == expected
+                     and contract["strike"] > 0
+                     and date.fromisoformat(contract["expiration"]) >= day)
+        except (ValueError, TypeError):
+            valid = False
+        if not valid:
+            raise MassiveError(
+                f"Contract response does not match {expected} on {as_of}: "
+                f"{contract['contract_symbol']} (underlying={contract['underlying']}, "
+                f"expiration={contract['expiration']}). History rejected.",
+                "INVALID_CONTRACT_RESPONSE")
+        normalized.append(contract)
+    return normalized
 
 
 def list_contracts_as_of(underlying: str, as_of: str, *, expired: bool = True,
@@ -277,8 +309,9 @@ def list_contracts_as_of(underlying: str, as_of: str, *, expired: bool = True,
     rows = _paginate(CONTRACTS_PATH, {
         "underlying_ticker": underlying.strip().upper(),
         "as_of": as_of, "expired": str(bool(expired)).lower(), "limit": limit,
+        "expiration_date.gte": as_of,
     }, max_pages=max_pages)
-    return [normalize_contract(r, as_of=as_of) for r in rows]
+    return _validate_contracts(rows, underlying, as_of)
 
 
 def contract_daily_bars(symbol: str, start: str, end: str,
@@ -304,7 +337,9 @@ def probe(underlying: str = "SPY", as_of: str | None = None) -> dict[str, Any]:
                            "endpoint": CONTRACTS_PATH}
     try:
         doc = _get(CONTRACTS_PATH, {"underlying_ticker": underlying.upper(),
-                                    "as_of": as_of, "expired": "true", "limit": 5})
+                                    "as_of": as_of, "expired": "true", "limit": 5,
+                                    "expiration_date.gte": as_of})
+        contracts = _validate_contracts(doc.get("results") or [], underlying, as_of)
     except MissingCredential as e:
         out.update(ok=False, reason="NO_KEY", detail=str(e))
         return out
@@ -313,9 +348,15 @@ def probe(underlying: str = "SPY", as_of: str | None = None) -> dict[str, Any]:
         return out
 
     rows = doc.get("results") or []
+    if not rows:
+        out.update(ok=False, reason="NO_MATCHING_CONTRACTS",
+                   detail="No matching reference contracts returned; access is inconclusive.")
+        return out
     out.update(ok=True, status=doc.get("status"), returned=len(rows),
+               capability="CONTRACT_REFERENCE_ONLY",
+               price_history_verified=False,
                has_next_page=bool(doc.get("next_url")),
-               sample=[normalize_contract(r, as_of=as_of) for r in rows[:3]],
+               sample=contracts[:3],
                unexpected_keys=sorted(set(rows[0]) - {
                    "cfi", "contract_type", "exercise_style", "expiration_date",
                    "primary_exchange", "shares_per_contract", "strike_price",

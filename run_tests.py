@@ -18,6 +18,7 @@ STEPS = [
     ("Excel export", "tests/test_excel_report.py"),
     ("Dashboard (offline HTML)", "tests/test_dashboard.py"),
     ("GUI (headless)", "tests/test_gui.py"),
+    ("Run output regressions", "tests/test_run_regressions.py"),
 ]
 
 failed = []

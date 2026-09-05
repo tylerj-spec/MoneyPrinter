@@ -35,10 +35,13 @@ from dataclasses import is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app_paths import get_paths
+
+PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
-DEFAULT_DATA_DIR = MP_V01_DIR / "data_store"
-DEFAULT_OUT_DIR = HERE / "backtests"
+DEFAULT_DATA_DIR = PATHS.data
+DEFAULT_OUT_DIR = PATHS.backtests
 
 sys.path.insert(0, str(MP_V01_DIR / "src"))
 
