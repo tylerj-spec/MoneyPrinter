@@ -157,6 +157,92 @@ def a_proxy_refusing_a_tunnel_is_not_an_entitlement_verdict():
     assert mv.MassiveError("something else").kind == "ERROR"
 
 
+# ---------- the access ladder ----------
+def _ladder(responses, monkey_target=mv):
+    """Run diagnose_access against canned responses instead of the network."""
+    calls = []
+    def fake_get(path, params=None, **kw):
+        calls.append(dict(params or {}))
+        r = responses[len(calls) - 1]
+        if isinstance(r, Exception):
+            raise r
+        return r
+    original = monkey_target._get
+    monkey_target._get = fake_get
+    try:
+        return monkey_target.diagnose_access("SPY", "2025-08-01", pause_seconds=0.0), calls
+    finally:
+        monkey_target._get = original
+
+
+@test
+def the_ladder_names_an_ignored_underlying_filter():
+    """The exact failure from the first live run: asked SPY, got CYU 2012.
+
+    HTTP 200 with a body that contradicts the request is worse than an error,
+    because a backfill built on it is silently wrong rather than obviously
+    empty. The rung that adds underlying_ticker is the one that must catch it.
+    """
+    cyu = {"results": [{"ticker": "O:CYU121222C00060000", "underlying_ticker": "CYU",
+                        "contract_type": "call", "strike_price": 60.0,
+                        "expiration_date": "2012-12-22"}]}
+    steps, _ = _ladder([cyu, cyu, cyu, cyu, cyu])
+    assert steps[0]["verdict"] == "OK", "a bare call has no filter to contradict"
+    assert steps[1]["verdict"] == "IGNORED", steps[1]
+    assert "CYU" in steps[1]["detail"] and "SPY" in steps[1]["detail"], steps[1]
+
+@test
+def the_ladder_adds_exactly_one_parameter_per_rung():
+    """The whole method depends on this: two changes per rung and the failing
+    rung no longer names a single cause."""
+    ok = {"results": [{"ticker": "O:SPY260116C00500000", "underlying_ticker": "SPY",
+                       "contract_type": "call", "strike_price": 500.0,
+                       "expiration_date": "2026-01-16"}]}
+    steps, calls = _ladder([ok] * 5)
+    assert [set(c) - {"limit"} for c in calls] == [
+        set(),
+        {"underlying_ticker"},
+        {"underlying_ticker", "expired"},
+        {"underlying_ticker", "expired"},
+        {"underlying_ticker", "expired", "as_of"},
+    ], calls
+    assert all(s["verdict"] == "OK" for s in steps), steps
+
+@test
+def the_ladder_stops_at_a_refusal_because_higher_rungs_are_moot():
+    ok = {"results": [{"ticker": "O:SPY260116C00500000", "underlying_ticker": "SPY",
+                       "contract_type": "call", "strike_price": 500.0,
+                       "expiration_date": "2026-01-16"}]}
+    steps, calls = _ladder([ok, mv.MassiveError("HTTP 403", "NOT_ENTITLED")])
+    assert len(steps) == 2 and steps[1]["verdict"] == "NOT_ENTITLED", steps
+    assert len(calls) == 2, "must not keep spending calls after a refusal"
+
+@test
+def an_empty_rung_is_reported_but_does_not_stop_the_ladder():
+    """EMPTY is inconclusive alone - it only means something read against the
+    rung below, so the walk continues."""
+    ok = {"results": [{"ticker": "O:SPY260116C00500000", "underlying_ticker": "SPY",
+                       "contract_type": "call", "strike_price": 500.0,
+                       "expiration_date": "2026-01-16"}]}
+    steps, calls = _ladder([ok, ok, ok, {"results": []}, ok])
+    assert steps[3]["verdict"] == "EMPTY", steps[3]
+    assert len(calls) == 5, "an empty rung is not a refusal"
+
+@test
+def an_as_of_that_returns_only_older_expiries_is_flagged_as_ignored():
+    """Every contract expiring before the as_of date means the point-in-time
+    filter is not filtering - the rung that actually matters for history."""
+    ok = {"results": [{"ticker": "O:SPY260116C00500000", "underlying_ticker": "SPY",
+                       "contract_type": "call", "strike_price": 500.0,
+                       "expiration_date": "2026-01-16"}]}
+    stale = {"results": [{"ticker": "O:SPY121222C00060000", "underlying_ticker": "SPY",
+                          "contract_type": "call", "strike_price": 60.0,
+                          "expiration_date": "2012-12-22"}]}
+    steps, _ = _ladder([ok, ok, ok, ok, stale])
+    assert steps[4]["verdict"] == "IGNORED", steps[4]
+    assert "as_of" in steps[4]["detail"]
+
+
 # ---------- the paths, pinned ----------
 @test
 def the_endpoint_paths_are_the_ones_the_vendor_client_uses():
