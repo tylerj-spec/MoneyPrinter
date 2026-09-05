@@ -243,6 +243,45 @@ def the_env_var_name_matches_the_vendors_own_client():
     assert gui.MASSIVE_ENV_VAR == "MASSIVE_API_KEY"
 
 
+@test
+def historical_options_button_runs_after_date_validation():
+    from unittest.mock import Mock, patch
+    app = types.SimpleNamespace(_massive_env=lambda: {"MASSIVE_API_KEY": "test-only"},
+        start_var=types.SimpleNamespace(get=lambda: "2026-1-2"),
+        _valid_date=gui.MoneyPrinterGUI._valid_date, _banner=Mock(), _log=Mock(),
+        _tickers=lambda: ["SPY"], _start=Mock(return_value=True))
+    with patch.object(gui.simpledialog, "askstring", return_value="2026-1-2"):
+        gui.MoneyPrinterGUI.fetch_massive(app)
+    assert app._start.call_count == 1
+    assert app._start.call_args.args[0][-1] == "2026-01-02"
+
+
+@test
+def child_processes_share_the_selected_runtime_folder():
+    from unittest.mock import Mock, patch
+    import app_paths
+    app = types.SimpleNamespace(_runner=None, paths=app_paths.get_paths(),
+        _set_status=Mock(), _busy=Mock(), progress=Mock(), _out_q=Mock())
+    with patch.object(gui, "SubprocessRunner") as runner:
+        assert gui.MoneyPrinterGUI._start(app, [gui.DIAGNOSE_SCRIPT], "diagnose", ROOT)
+        assert runner.call_args.args[3]["MONEYPRINTER_HOME"] == str(app.paths.root)
+        assert runner.call_args.args[3]["PYTHONIOENCODING"] == "utf-8"
+
+
+@test
+def a_busy_menu_action_does_not_clear_the_running_workbook():
+    from unittest.mock import Mock
+    import app_paths
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = app_paths.get_paths(tmp)
+        previous = paths.excel / "running.xlsx"
+        app = types.SimpleNamespace(paths=paths, out_dir=lambda: paths.excel,
+            _pending_workbook=previous, _banner=Mock(), _log=Mock(), _start=Mock(return_value=False))
+        gui.MoneyPrinterGUI.export_excel(app)
+        assert app._pending_workbook == previous
+
+
 if __name__ == "__main__":
     if STUBBED:
         print("  (tkinter not installed here; imported gui.py against a stub)")

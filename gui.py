@@ -33,6 +33,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, scrolledtext, ttk
 
+from app_paths import get_paths, migrate_legacy, SETTINGS_FILE, OUTPUT_ENV
+
+PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
 FETCH_SCRIPT = MP_V01_DIR / "fetch_data.py"
@@ -40,19 +43,19 @@ EXPORT_SCRIPT = HERE / "excel_report.py"
 MIE_SCRIPT = HERE / "market_intelligence_engine.py"
 TEST_SCRIPT = HERE / "run_tests.py"
 PICKS_SCRIPT = HERE / "generate_picks.py"
-PICKS_DIR = HERE / "picks"
+PICKS_DIR = PATHS.picks
 DIAGNOSE_SCRIPT = HERE / "diagnose.py"
 RESOLVE_SCRIPT = HERE / "resolve_picks.py"
 BACKTEST_SCRIPT = HERE / "backtest.py"
-BACKTESTS_DIR = HERE / "backtests"
+BACKTESTS_DIR = PATHS.backtests
 DASHBOARD_SCRIPT = HERE / "dashboard.py"
-DASHBOARD_FILE = HERE / "dashboard.html"
+DASHBOARD_FILE = PATHS.dashboard
 
 # Everything a first run needs. Kept here rather than in a document so the
 # "Install required packages" button and the docs cannot drift apart.
 REQUIRED_PACKAGES = ["yfinance", "openpyxl", "tzdata"]
-DEFAULT_OUT_DIR = HERE / "excel_out"        # the data workbook: bars, labels, chains
-DEFAULT_PICKS_OUT_DIR = HERE / "picks_out"  # the picks workbook: the record and outcomes
+DEFAULT_OUT_DIR = PATHS.excel        # the data workbook: bars, labels, chains
+DEFAULT_PICKS_OUT_DIR = PATHS.picks_excel  # the picks workbook: the record and outcomes
 
 # The sentence generate_picks.py prints when the store has no chain snapshot.
 # Pinned by a test against that script's source, so the two cannot drift.
@@ -62,7 +65,6 @@ MASSIVE_SCRIPT = HERE / "fetch_massive.py"
 # The vendor client's own variable name, so a key already set for their tools
 # is picked up without being retyped.
 MASSIVE_ENV_VAR = "MASSIVE_API_KEY"
-SETTINGS_FILE = Path.home() / ".moneyprinter_gui.json"
 
 BENCHMARK = "SPY"          # labels are excess return vs this; see labels/contract.py
 
@@ -161,6 +163,8 @@ class MoneyPrinterGUI(tk.Tk):
         self._out_q: queue.Queue = queue.Queue()
 
         saved = self._load_settings()
+        self.paths = get_paths()
+        migration = migrate_legacy(self.paths, settings=saved)
         self.tickers_var = tk.StringVar(value=saved.get("tickers", "SPY,QQQ,MSFT"))
         self.start_var = tk.StringVar(value=saved.get("start", "2019-01-01"))
         self.end_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
@@ -169,9 +173,9 @@ class MoneyPrinterGUI(tk.Tk):
         # fails two steps later - which it did, twice, to the same user. Bars
         # without a chain cannot make a pick, and Yahoo has no historical
         # chains, so a snapshot not taken today is gone for good.
-        self.outdir_var = tk.StringVar(value=saved.get("outdir", str(DEFAULT_OUT_DIR)))
-        self.picksdir_var = tk.StringVar(
-            value=saved.get("picks_outdir", str(DEFAULT_PICKS_OUT_DIR)))
+        self.output_root_var = tk.StringVar(value=str(self.paths.root))
+        self.outdir_var = tk.StringVar(value=str(self.paths.excel))
+        self.picksdir_var = tk.StringVar(value=str(self.paths.picks_excel))
         # DELIBERATELY NOT IN saved. The settings file is plaintext in the home
         # directory, and a key written there outlives every reason it was
         # needed. It is held in memory for this session, passed to child
@@ -182,6 +186,11 @@ class MoneyPrinterGUI(tk.Tk):
         self.mie_tickers_var = tk.StringVar(value=saved.get("mie_tickers", "AAPL,MSFT,GOOGL"))
 
         self._build_ui()
+        self._log(f"Output folder: {self.paths.root}\n", "info")
+        if migration["copied"]:
+            self._log(f"Copied {migration['copied']} existing output files. Originals preserved.\n", "info")
+        for error in migration["errors"]:
+            self._log(f"Output migration: {error}\n", "warning")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll()
 
@@ -280,23 +289,31 @@ class MoneyPrinterGUI(tk.Tk):
                                    state=tk.DISABLED)
         self.stop_btn.pack(side=tk.RIGHT)
 
-        out_row = ttk.Frame(self, padding=(12, 8))
+        root_row = ttk.Frame(self, padding=(12, 8))
+        root_row.pack(fill=tk.X)
+        ttk.Label(root_row, text="Output folder").pack(side=tk.LEFT)
+        ttk.Entry(root_row, textvariable=self.output_root_var, state="readonly").pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(root_row, text="Change…", command=self.choose_output_root).pack(side=tk.LEFT)
+
+        out_row = ttk.Frame(self, padding=(12, 0))
         out_row.pack(fill=tk.X)
         ttk.Label(out_row, text="Data workbook").pack(side=tk.LEFT)
-        ttk.Entry(out_row, textvariable=self.outdir_var).pack(
+        ttk.Entry(out_row, textvariable=self.outdir_var, state="readonly").pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        ttk.Button(out_row, text="Change…", command=self.choose_output).pack(side=tk.LEFT)
+        ttk.Button(out_row, text="Open", command=self.choose_output).pack(side=tk.LEFT)
 
         picks_row = ttk.Frame(self, padding=(12, 0))
         picks_row.pack(fill=tk.X)
         ttk.Label(picks_row, text="Picks workbook").pack(side=tk.LEFT)
-        ttk.Entry(picks_row, textvariable=self.picksdir_var).pack(
+        ttk.Entry(picks_row, textvariable=self.picksdir_var, state="readonly").pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        ttk.Button(picks_row, text="Change…",
+        ttk.Button(picks_row, text="Open",
                    command=self.choose_picks_output).pack(side=tk.LEFT)
 
         self._job_buttons = (self.install_btn, self.diag_btn, self.fetch_btn,
-                             self.export_btn, self.picks_btn, self.score_btn)
+                             self.export_btn, self.picks_btn, self.score_btn,
+                             self.backtest_btn, self.dash_btn)
 
         # --- console --------------------------------------------------------
         con = ttk.Frame(self, padding=(12, 0))
@@ -335,7 +352,7 @@ class MoneyPrinterGUI(tk.Tk):
 
         m_file = tk.Menu(menubar, tearoff=0)
         m_file.add_command(label="Open output folder", command=self.open_output)
-        m_file.add_command(label="Change output folder…", command=self.choose_output)
+        m_file.add_command(label="Change output folder…", command=self.choose_output_root)
         m_file.add_separator()
         m_file.add_command(label="Open the picks folder", command=self.open_picks)
         m_file.add_command(label="Open the backtests folder", command=self.open_backtests)
@@ -405,7 +422,7 @@ class MoneyPrinterGUI(tk.Tk):
         self.stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
 
     def out_dir(self) -> Path:
-        return Path(self.outdir_var.get().strip() or DEFAULT_OUT_DIR).expanduser()
+        return self.paths.excel
 
     def picks_out_dir(self) -> Path:
         """Where the PICKS workbook goes - deliberately not the data folder.
@@ -416,8 +433,7 @@ class MoneyPrinterGUI(tk.Tk):
         outcomes resolve. Mixed in one folder the picks are impossible to find
         among the timestamped data exports.
         """
-        return Path(self.picksdir_var.get().strip()
-                    or DEFAULT_PICKS_OUT_DIR).expanduser()
+        return self.paths.picks_excel
 
     def _tickers(self) -> list[str]:
         return [t.strip().upper() for t in self.tickers_var.get().split(",") if t.strip()]
@@ -443,8 +459,7 @@ class MoneyPrinterGUI(tk.Tk):
             SETTINGS_FILE.write_text(json.dumps({
                 "tickers": self.tickers_var.get(),
                 "start": self.start_var.get(),
-                "outdir": self.outdir_var.get(),
-                "picks_outdir": self.picksdir_var.get(),
+                "output_root": str(self.paths.root),
                 "mie_tickers": self.mie_tickers_var.get(),
             }, indent=2), encoding="utf-8")
         except Exception:
@@ -460,15 +475,17 @@ class MoneyPrinterGUI(tk.Tk):
 
     def _start(self, args: list, label: str, cwd: Path,
                env_extra: dict[str, str] | None = None) -> bool:
-        self._saw_missing_chain = False
         if self._runner is not None and self._runner.is_alive():
             messagebox.showinfo("Busy", "Something is already running. Wait for it, or press Stop.")
             return False
+        self._saw_missing_chain = False
         self._set_status(f"Running {label}…")
         self._busy(True)
         self.progress.start(12)
         self._start_time = time.time()
-        self._runner = SubprocessRunner(args, cwd, self._out_q, env_extra)
+        child_env = {OUTPUT_ENV: str(self.paths.root), "PYTHONIOENCODING": "utf-8"}
+        child_env.update(env_extra or {})
+        self._runner = SubprocessRunner(args, cwd, self._out_q, child_env)
         self._runner.start()
         return True
 
@@ -533,7 +550,7 @@ class MoneyPrinterGUI(tk.Tk):
         elif code == 0 and self._pending_workbook is not None:
             self._last_workbook = self._pending_workbook
             self._set_status(f"Workbook ready — {self._last_workbook.name}", "#0B7A28")
-            self._log(f"\nOpen it with '4 · Open output folder', or double-click:\n"
+            self._log(f"\nOpen it with 'Open output folder', or double-click:\n"
                       f"  {self._last_workbook}\n", "success")
         elif code == 0:
             self._set_status("Finished", "#0B7A28")
@@ -588,9 +605,8 @@ class MoneyPrinterGUI(tk.Tk):
         self._banner("Building the Excel workbook")
         self._log("Exports every ticker currently in the data store. Needs openpyxl:\n"
                   "  pip install openpyxl\n\n", "info")
-        self._pending_workbook = target
-        if not self._start([EXPORT_SCRIPT, "--out", target], "excel_report.py", HERE):
-            self._pending_workbook = None
+        if self._start([EXPORT_SCRIPT, "--out", target], "excel_report.py", HERE):
+            self._pending_workbook = target
 
     def generate_picks(self) -> None:
         """Freeze a paper-pick list and render it to Excel.
@@ -613,19 +629,15 @@ class MoneyPrinterGUI(tk.Tk):
         self._banner("Generating paper picks")
         self._log(
             "NEEDS A FETCH WITH OPTION CHAINS. If this step reports no chain snapshots,\n"
-            "tick 'also snapshot option chains' in step 1 and run step 1 again - the\n"
+            "run step 1 again and check its chain-fetch messages. The\n"
             "chain is what a pick IS, and no amount of bar history substitutes.\n\n"
-            "Writes the hashed JSON record under picks\\, then a PICKS workbook so\n"
-            "Pick_History shows this run alongside every earlier one. That history comes\n"
-            "from the files in picks\\, so commit them - they are the record, and unlike\n"
-            "the data store they are not regenerable.\n\n"
+            "Writes the hashed JSON record and picks workbook under the output folder.\n"
+            "Back up that folder: frozen picks are the forward record.\n\n"
             "These are hypotheses for forward measurement, not recommendations. The risk\n"
             "gate declines to approve any of them, and the workbook says why.\n\n", "info")
-        self._pending_workbook = target
-        args = [PICKS_SCRIPT, "--out-dir", PICKS_DIR, "--excel", target,
-                "--decision-date", datetime.now().strftime("%Y-%m-%d")]
-        if not self._start(args, "generate_picks.py", HERE):
-            self._pending_workbook = None
+        args = [PICKS_SCRIPT, "--out-dir", self.paths.picks, "--excel", target]
+        if self._start(args, "generate_picks.py", HERE):
+            self._pending_workbook = target
 
     def _massive_env(self) -> dict[str, str] | None:
         """The key, for the child process only. None when the box is empty."""
@@ -652,9 +664,8 @@ class MoneyPrinterGUI(tk.Tk):
         self._log(
             "One call to /v3/reference/options/contracts, asking for a handful of\n"
             "contracts as they stood on a past date.\n\n"
-            "It answers the only question worth answering first: does THIS key\n"
-            "reach options history? Subscriptions are per asset class, so a free\n"
-            "Stocks plan does not imply free Options.\n\n"
+            "Checks reference access and validates the returned ticker and dates.\n"
+            "A successful reference probe does not verify historical price access.\n\n"
             "The key goes to the child process through the environment, not the\n"
             "command line - the '$ ...' line below will not contain it.\n\n", "info")
         self.key_status.config(text="testing...", foreground="#777777")
@@ -676,9 +687,10 @@ class MoneyPrinterGUI(tk.Tk):
             parent=self, initialvalue=self.start_var.get())
         if not as_of:
             return
-        if not valid_date(as_of):
+        if not self._valid_date(as_of):
             messagebox.showerror("Date", f"{as_of!r} is not a YYYY-MM-DD date.")
             return
+        as_of = datetime.strptime(as_of.strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
         self._banner(f"Historical option contracts as of {as_of}")
         self._log(
             "Contracts only on this pass - one call per page, and a page holds up\n"
@@ -716,7 +728,7 @@ class MoneyPrinterGUI(tk.Tk):
             "Read the VERDICT lines, not the accuracy. Accuracy above the majority class\n"
             "means nothing until it also clears the noise floor.\n\n"
             "A few hundred permutations on a few years of bars takes under a minute.\n\n", "info")
-        self._start([BACKTEST_SCRIPT, "--out-dir", BACKTESTS_DIR], "backtest.py", HERE)
+        self._start([BACKTEST_SCRIPT, "--out-dir", self.paths.backtests], "backtest.py", HERE)
 
     def open_dashboard(self) -> None:
         """Rebuild the dashboard from the newest files, then open it.
@@ -732,14 +744,13 @@ class MoneyPrinterGUI(tk.Tk):
             "and it renders identically, which is what taking this offline needs.\n\n"
             "It reads the NEWEST pick file and the NEWEST backtest. If either section is\n"
             "empty, the page names the button that fills it.\n\n", "info")
-        self._pending_dashboard = DASHBOARD_FILE
-        if not self._start([DASHBOARD_SCRIPT, "--out", DASHBOARD_FILE,
-                            "--picks-dir", PICKS_DIR, "--backtest-dir", BACKTESTS_DIR],
+        if self._start([DASHBOARD_SCRIPT, "--out", self.paths.dashboard,
+                            "--picks-dir", self.paths.picks, "--backtest-dir", self.paths.backtests],
                            "dashboard.py", HERE):
-            self._pending_dashboard = None
+            self._pending_dashboard = self.paths.dashboard
 
     def open_backtests(self) -> None:
-        self._reveal(BACKTESTS_DIR)
+        self._reveal(self.paths.backtests)
 
     def install_packages(self) -> None:
         """Install what a first run needs, so no terminal is required.
@@ -768,7 +779,7 @@ class MoneyPrinterGUI(tk.Tk):
 
     def _newest_pick_file(self) -> Path | None:
         try:
-            files = sorted(PICKS_DIR.glob("picks_*.json"))
+            files = sorted(self.paths.picks.glob("picks_*.json"))
         except OSError:
             return None
         return files[-1] if files else None
@@ -788,11 +799,11 @@ class MoneyPrinterGUI(tk.Tk):
     def score_picks_choose(self) -> None:
         """Score a pick file the user chooses, rather than the newest."""
         try:
-            PICKS_DIR.mkdir(parents=True, exist_ok=True)
+            self.paths.picks.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
         chosen = filedialog.askopenfilename(
-            initialdir=str(PICKS_DIR), title="Which frozen pick file?",
+            initialdir=str(self.paths.picks), title="Which frozen pick file?",
             filetypes=[("Frozen picks", "picks_*.json"), ("All files", "*.*")])
         if chosen:
             self._run_resolver(Path(chosen))
@@ -875,10 +886,10 @@ class MoneyPrinterGUI(tk.Tk):
             (None, "Workbooks go to the folder shown above; every export is a new timestamped "
                    "file, so nothing you have edited is ever overwritten. Open the newest.\n\n"
                    "Frozen picks go to the picks folder, and backtest results to the "
-                   "backtests folder. Commit the picks folder to git — it is the forward "
-                   "record, and unlike the data store it cannot be regenerated. The "
+                   "backtests folder, all inside the output folder outside the code checkout. "
+                   "Back up this folder: the forward record cannot be regenerated. The "
                    "workbook's pick history is only a view over those files.\n\n"
-                   "The dashboard is written to dashboard.html beside the app."),
+                   "The dashboard is written to dashboard.html inside the output folder."),
 
             ("h", "IN THE MENU"),
             (None, "Run → Score a specific pick file… — score an older file instead of the "
@@ -904,7 +915,7 @@ class MoneyPrinterGUI(tk.Tk):
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
 
     def open_picks(self) -> None:
-        self._reveal(PICKS_DIR)
+        self._reveal(self.paths.picks)
 
     def run_tests(self) -> None:
         self._banner("Running every test suite (no network, no market data)")
@@ -924,22 +935,45 @@ class MoneyPrinterGUI(tk.Tk):
         # broke on any unexpected character and left the file behind.
         self._start([MIE_SCRIPT, "--tickers", ",".join(tickers)], "market_intelligence_engine.py", HERE)
 
+    def choose_output_root(self) -> None:
+        if self._runner is not None and self._runner.is_alive():
+            messagebox.showinfo("Busy", "Wait for the current run before changing folders.")
+            return
+        chosen = filedialog.askdirectory(initialdir=str(self.paths.root.parent),
+                                         title="Folder for all MoneyPrinter data and outputs")
+        if not chosen:
+            return
+        try:
+            new_paths = get_paths(chosen)
+            if new_paths == self.paths:
+                return
+            # Copy the current runtime folder through the same conflict-safe migration.
+            result = migrate_legacy(new_paths, repo=self.paths.root,
+                                    settings={"outdir": str(self.paths.excel),
+                                              "picks_outdir": str(self.paths.picks_excel)})
+            # A runtime root stores data_store directly, unlike an old code checkout.
+            data_result = migrate_legacy(new_paths, repo=HERE, settings={})
+            if result["errors"] or data_result["errors"]:
+                raise OSError("; ".join(result["errors"] + data_result["errors"]))
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Output folder", str(exc))
+            return
+        self.paths = new_paths
+        self.output_root_var.set(str(new_paths.root))
+        self.outdir_var.set(str(new_paths.excel))
+        self.picksdir_var.set(str(new_paths.picks_excel))
+        self._last_workbook = None
+        self._save_settings()
+        self._log(f"Output folder: {new_paths.root}\n", "info")
+
     def choose_picks_output(self) -> None:
-        chosen = filedialog.askdirectory(title="Folder for the PICKS workbook",
-                                         initialdir=str(self.picks_out_dir()))
-        if chosen:
-            self.picksdir_var.set(chosen)
-            self._save_settings()
+        self._reveal(self.paths.picks_excel)
 
     def choose_output(self) -> None:
-        chosen = filedialog.askdirectory(initialdir=str(self.out_dir().parent),
-                                         title="Where should workbooks go?")
-        if chosen:
-            self.outdir_var.set(chosen)
-            self._save_settings()
+        self._reveal(self.paths.excel)
 
     def open_output(self) -> None:
-        self._reveal(self.out_dir(), self._last_workbook)
+        self._reveal(self.paths.root, self._last_workbook)
 
     def _reveal(self, out_dir: Path, select: Path | None = None) -> None:
         try:

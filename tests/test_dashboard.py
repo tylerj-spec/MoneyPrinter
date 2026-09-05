@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import hashlib
 import os
 import sys
 import tempfile
@@ -36,6 +37,10 @@ PICKS = {
          "reason": "conviction 0.03 below the variant's 0.20 floor"},
     ],
 }
+
+PICKS["contract_version"] = "0.1.0"
+PICKS["picks_sha256"] = hashlib.sha256(json.dumps(
+    PICKS["picks"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 BACKTEST = {
     "observations": 1836, "sessions": 700,
@@ -201,6 +206,16 @@ def the_newest_pick_file_is_the_one_rendered():
 @test
 def a_missing_folder_is_an_empty_page_not_a_crash():
     assert dash.newest(Path("/definitely/not/here"), "picks_*.json") is None
+
+
+@test
+def integrity_is_checked_in_the_dashboard_instead_of_printing_a_digest_as_proof():
+    assert "legacy picks checksum only" in _render(PICKS)
+    changed = json.loads(json.dumps(PICKS))
+    changed["picks"][0]["entry_fill_estimate"] = 0.01
+    rendered = _render(changed)
+    assert "VOID" in rendered
+    assert "exclude from evidence" in rendered
 
 
 if __name__ == "__main__":

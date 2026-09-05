@@ -36,9 +36,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app_paths import get_paths
+
+PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
-DEFAULT_DATA_DIR = MP_V01_DIR / "data_store"
+DEFAULT_DATA_DIR = PATHS.data
 
 sys.path.insert(0, str(MP_V01_DIR / "src"))
 
@@ -91,9 +94,9 @@ def do_probe(args) -> int:
         print(f"\n  Fields this adapter does not yet read: {', '.join(r['unexpected_keys'])}")
         print("  Not a failure - worth a look in case something useful was added.")
 
-    print("\nThe `as_of` parameter is what makes this point-in-time: it returns the")
-    print("contracts that EXISTED that day, not the ones that still trade now.")
-    print("Without it every backfill would carry survivorship bias.")
+    print("\nVerified: matching contract reference records only.")
+    print("Historical price access is NOT verified by this probe. Contract metadata")
+    print("and price bars are separate endpoints with separate plan entitlements.")
     print("\nNext:  python fetch_massive.py --tickers SPY --as-of 2024-03-05 --bars")
     return 0
 
@@ -108,6 +111,7 @@ def do_fetch(args) -> int:
     print(f"MASSIVE - historical option contracts as of {args.as_of}")
     print("=" * 74)
     total_contracts = total_bars = 0
+    failures = 0
 
     for t in tickers:
         print(f"\n  {t} ... ", end="", flush=True)
@@ -118,6 +122,7 @@ def do_fetch(args) -> int:
             print("no key"); print(f"\n{e}"); return 1
         except mv.MassiveError as e:
             print(f"FAILED: {e}")
+            failures += 1
             continue
 
         usable = [c for c in contracts if c["status"] == "OK"]
@@ -146,15 +151,16 @@ def do_fetch(args) -> int:
                     c["contract_symbol"], args.bars_from or args.as_of, args.as_of))
             except mv.MassiveError as e:
                 print(f"      {c['contract_symbol']}: {e}")
+                failures += 1
         ok = sum(1 for r in rows if r["status"] == "OK")
         print(f"      {len(rows)} bars, {ok} usable")
         _write(data_dir / "massive_bars" / f"{t}_{args.as_of}__v{stamp}.json", {
             "underlying": t, "as_of": args.as_of, "vintage_id": stamp,
             "ingested_time": now, "source": "massive_option_aggregates",
             "endpoint": mv.AGGS_PATH,
-            "note": ("Daily bars per contract. Greeks are NOT vendor-supplied "
-                     "here and are solved from these quotes by options/greeks.py, "
-                     "so the volatility model is this repository's and is stated."),
+            "note": ("Daily trade aggregates, not bid/ask quotes or historical chains. "
+                     "Stored for research; these files are not consumed by the "
+                     "current chain-pricing or pick-resolution pipeline."),
             "row_count": len(rows), "usable": ok, "rows": rows,
         })
         total_bars += len(rows)
@@ -165,7 +171,7 @@ def do_fetch(args) -> int:
     print("\nNothing was interpolated or estimated. Rows that could not be read")
     print("are marked UNKNOWN rather than dropped or filled.")
     print("=" * 74)
-    return 0
+    return 1 if failures or not total_contracts else 0
 
 
 def main(argv: list[str] | None = None) -> int:

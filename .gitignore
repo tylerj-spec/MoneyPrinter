@@ -38,7 +38,11 @@ excel_out/
 
 # Backtest results and the rendered dashboard. Both are regenerable from the
 # data store by pressing a button, and both are timestamped, so committing them
-# would grow the repo without adding a record. The PICKS folder is the opposite
-# and IS committed: it cannot be regenerated.
+# would grow the repo without adding source. Back up the external runtime
+# folder separately; frozen picks cannot be regenerated.
 backtests/
 dashboard.html
+picks/picks_*.json
+picks_out/
+data_store/
+market_intelligence_report.json

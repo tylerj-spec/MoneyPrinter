@@ -38,7 +38,7 @@ from gates.risk import RiskLimits, evaluate as evaluate_gate
 from labels.contract import HORIZON_TRADING_DAYS
 from strategy.variants import Variant, score as score_variant
 
-PICK_CONTRACT_VERSION = "0.1.0"
+PICK_CONTRACT_VERSION = "0.2.0"
 
 # Required keys on an option row handed to this module. Stated so the coupling
 # to whatever produced the chain is explicit rather than discovered at runtime.
@@ -106,11 +106,22 @@ def select_contract(option_rows: Sequence[dict[str, Any]], *, kind: str,
                   and isinstance(r.get("delta"), (int, float))]
     if not candidates:
         n_kind = sum(1 for r in option_rows if r.get("type") == kind)
+        matching = [r for r in option_rows if r.get("type") == kind]
+        failures = {label: sum(r.get(key) is False for r in matching)
+                    for key, label in (("screen_dte", "DTE outside entry band"),
+                                       ("screen_spread", "spread"),
+                                       ("screen_open_interest", "open interest"),
+                                       ("screen_volume", "volume"))}
+        failures["unmodellable Greeks"] = sum(r.get("model_status") != "OK" for r in matching)
+        detail = "; ".join(f"{label}: {count}/{n_kind}" for label, count in failures.items()
+                           if count)
         return None, (f"no {kind} passed the liquidity screen with modellable Greeks "
-                      f"({n_kind} {kind}s in the snapshot)")
+                      f"({n_kind} {kind}s in the snapshot)" +
+                      (f". Failed checks (can overlap): {detail}" if detail else ""))
 
     best = min(candidates, key=lambda r: (abs(abs(r["delta"]) - target_abs_delta),
-                                          r.get("relative_spread") or 9.9))
+                                          r["relative_spread"] if r.get("relative_spread")
+                                          is not None else 9.9))
     return best, "closest liquid strike to the variant's delta target"
 
 
@@ -219,6 +230,11 @@ def generate_picks(
                 "contract_version": PICK_CONTRACT_VERSION,
             }
 
+            if payload.get("precondition_reason"):
+                out.append({**base, "action": "ABSTAIN", "composite_score": None,
+                            "reason": payload["precondition_reason"]})
+                continue
+
             composite, missing = score_variant(variant, comps.get("scaled", {}))
             if composite is None:
                 out.append({**base, "action": "ABSTAIN", "composite_score": None,
@@ -283,15 +299,14 @@ def freeze(decision_date: str, picks: Sequence[dict[str, Any]], *,
            generated_utc: str, source_files: dict[str, Any]) -> dict[str, Any]:
     """Wrap picks in an envelope carrying a hash of their exact content.
 
-    The hash is over the canonical JSON of the picks alone. Re-running the
-    resolver later recomputes it; if it does not match, the file was edited
-    after the fact and the record is void. That is the entire mechanism that
-    makes a forward paper log worth more than a backtest.
+    The legacy picks checksum is retained. Version 0.2 also checksums the full
+    envelope, including dates, source files and exit policy. These are content
+    integrity checks, not signatures or independently trusted timestamps.
     """
     canonical = json.dumps(picks, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(canonical.encode()).hexdigest()
     proposed = [p for p in picks if p["action"] != "ABSTAIN"]
-    return {
+    frozen = {
         "schema": "moneyprinter.picks",
         "contract_version": PICK_CONTRACT_VERSION,
         "decision_date": decision_date,
@@ -312,13 +327,24 @@ def freeze(decision_date: str, picks: Sequence[dict[str, Any]], *,
         "picks_sha256": digest,
         "picks": list(picks),
     }
+    frozen["record_sha256"] = _record_digest(frozen)
+    return frozen
+
+
+def _record_digest(frozen: dict[str, Any]) -> str:
+    record = {k: v for k, v in frozen.items() if k != "record_sha256"}
+    canonical = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def verify(frozen: dict[str, Any]) -> bool:
     """True if the picks still hash to what was recorded when they were frozen."""
     canonical = json.dumps(frozen.get("picks", []), sort_keys=True,
                            separators=(",", ":"), default=str)
-    return hashlib.sha256(canonical.encode()).hexdigest() == frozen.get("picks_sha256")
+    picks_ok = hashlib.sha256(canonical.encode()).hexdigest() == frozen.get("picks_sha256")
+    if frozen.get("contract_version") == "0.1.0" and "record_sha256" not in frozen:
+        return picks_ok  # Legacy records covered only the picks, not the metadata.
+    return picks_ok and frozen.get("record_sha256") == _record_digest(frozen)
 
 
 def approximate_assessment_date(decision_date: str, trading_days: int) -> str | None:

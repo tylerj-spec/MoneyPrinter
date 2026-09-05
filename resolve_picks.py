@@ -29,9 +29,12 @@ import json
 import sys
 from pathlib import Path
 
+from app_paths import get_paths
+
+PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
-DEFAULT_DATA_DIR = MP_V01_DIR / "data_store"
+DEFAULT_DATA_DIR = PATHS.data
 
 sys.path.insert(0, str(MP_V01_DIR / "src"))
 

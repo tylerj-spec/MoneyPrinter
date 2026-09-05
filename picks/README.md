@@ -1,12 +1,12 @@
 # Frozen paper picks
 
-Each file here is one run of `generate_picks.py`: a set of predictions, hashed at
+Records now live in `~/MoneyPrinterData/picks/` (or your configured output
+folder), outside the code checkout. Each file is one run of `generate_picks.py`: a set of predictions, hashed at
 the moment they were written.
 
-**Commit these.** Unlike `data_store/`, they are not regenerable — re-running
-tomorrow produces tomorrow's picks, not today's. The forward record is the only
-genuinely out-of-sample evidence this project will ever have, and it exists only
-if the files survive.
+**Back up the output folder.** Frozen records cannot be regenerated. The GUI
+copies legacy files from this directory on startup, preserving the originals.
+CLI users can run `python migrate_outputs.py`.
 
 These files are also the source of the `Pick_History`, `Pick_Justifications`,
 `Pick_Performance` and `Pick_Abstentions` tabs in the Excel workbook. That history is
@@ -16,7 +16,7 @@ lost, but delete a file here and its picks leave the record.
 Score one with:
 
 ```
-python resolve_picks.py picks/<file>.json
+python resolve_picks.py ~/MoneyPrinterData/picks/<file>.json
 ```
 
 The resolver re-hashes the picks first. If the digest does not match, the file

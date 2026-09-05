@@ -34,10 +34,15 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app_paths import get_paths
+
+PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
-DEFAULT_PICKS_DIR = HERE / "picks"
-DEFAULT_BACKTEST_DIR = HERE / "backtests"
-DEFAULT_OUT = HERE / "dashboard.html"
+DEFAULT_PICKS_DIR = PATHS.picks
+DEFAULT_BACKTEST_DIR = PATHS.backtests
+DEFAULT_OUT = PATHS.dashboard
+sys.path.insert(0, str(HERE / "claude/app/mp_v01/src"))
+from strategy.picks import verify
 
 # Dark surface palette, from the validated reference instance. Checked with the
 # palette validator at three categorical slots on the #1a1a19 surface: lightness
@@ -258,11 +263,16 @@ def picks_section(doc: dict | None, path: Path | None) -> str:
     policy = doc.get("exit_policy", {})
 
     out = [f'<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">']
+    integrity = verify(doc)
     for k, v, n in (("Decision date", doc.get("decision_date"), "the 15:45 ET clock"),
                     ("Proposed", len(proposed), f"{len(abstained)} abstentions"),
                     ("Universe", ", ".join(doc.get("universe", [])) or "—", "instruments considered"),
                     ("Frozen SHA-256", (doc.get("picks_sha256") or "")[:12] or "—",
-                     "cannot be edited after the fact")):
+                     "content checksum; not proof of generation time"),
+                    ("Integrity", "OK" if integrity else "VOID",
+                     "record checksum verified" if integrity and doc.get("record_sha256")
+                     else "legacy picks checksum only" if integrity
+                     else "modified or unverifiable record; exclude from evidence")):
         out.append(f'<div class="stat"><div class="k">{esc(k)}</div>'
                    f'<div class="v mono" style="font-size:{"15px" if k in ("Universe","Frozen SHA-256") else "22px"}">'
                    f'{esc(v)}</div><div class="n">{esc(n)}</div></div>')
@@ -530,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     bt = json.loads(bp.read_text(encoding="utf-8")) if bp and bp.is_file() else None
 
     out = Path(a.out).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render(picks, pp if picks else None, bt, bp if bt else None), encoding="utf-8")
 
     print(f"Picks    : {pp if picks else 'none found - run generate_picks.py'}")

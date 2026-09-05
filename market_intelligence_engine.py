@@ -16,6 +16,8 @@ For forward paper trading: use claude/app/mp_v01/fetch_data.py + gates/risk.py
 
 import argparse
 import json
+from pathlib import Path
+from app_paths import get_paths
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -481,8 +483,9 @@ class MarketIntelligenceApp:
         
         return self.results
     
-    def generate_report(self, output_file: str = 'market_intelligence_report.json') -> str:
+    def generate_report(self, output_file: str | None = None) -> str:
         """Generate report with disclaimer."""
+        output_file = output_file or str(get_paths().root / "market_intelligence_report.json")
         report = {
             'timestamp': datetime.now().isoformat(),
             'DISCLAIMER': 'UNVALIDATED. See CODE_REVIEW_2026-08-13.md. NOT FOR REAL TRADING.',
@@ -490,6 +493,7 @@ class MarketIntelligenceApp:
             'predictions': self.results['predictions']
         }
         
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, 'w') as f:
             json.dump(report, f, indent=2)
         
@@ -525,7 +529,7 @@ def main(argv: Optional[List[str]] = None):
     )
     ap.add_argument('--tickers', default='AAPL,MSFT,GOOGL',
                     help='comma-separated tickers to analyse')
-    ap.add_argument('--out', default='market_intelligence_report.json',
+    ap.add_argument('--out', default=str(get_paths().root / 'market_intelligence_report.json'),
                     help='path for the JSON report')
     a = ap.parse_args(argv)
 
