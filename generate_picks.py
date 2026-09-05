@@ -62,8 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--decision-date", default=datetime.now().strftime("%Y-%m-%d"))
     ap.add_argument("--risk-free-rate", type=float, default=ex.DEFAULT_RISK_FREE_RATE)
     ap.add_argument("--excel", default=None, metavar="PATH",
-                    help="rebuild the full workbook afterwards so the Pick_History tab "
-                         "includes this run (needs openpyxl)")
+                    help="also write a PICKS workbook here, so Pick_History includes "
+                         "this run (needs openpyxl). Picks only - the bars and labels "
+                         "live in the data workbook that step 2 writes.")
     a = ap.parse_args(argv)
 
     data_dir = Path(a.data_dir).expanduser().resolve()
@@ -175,12 +176,14 @@ def main(argv: list[str] | None = None) -> int:
 
     excel_path = None
     if a.excel:
-        # Rebuild the whole workbook rather than a picks-only one, so Pick_History
-        # shows this run alongside every earlier one. Re-collecting picks up the
-        # file just written.
+        # Re-collect so Pick_History includes the file just written, then write
+        # the PICKS half only. Rebuilding the bar sheets to append a few pick
+        # rows cost megabytes per run and buried the picks behind twelve sheets
+        # of prices; the data workbook is step 2's job and is unaffected.
         refreshed = ex.collect(data_dir, only, risk_free_rate=a.risk_free_rate,
                                picks_dir=out_dir)
-        excel_path = ex.write_workbook(refreshed, Path(a.excel).expanduser().resolve())
+        excel_path = ex.write_workbook(refreshed, Path(a.excel).expanduser().resolve(),
+                                       sections=ex.PICK_SECTIONS)
 
     print("\n" + "=" * 78)
     print(f"Frozen to : {path}")

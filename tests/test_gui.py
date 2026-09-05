@@ -149,6 +149,49 @@ def the_packages_the_install_button_offers_are_the_ones_needed():
     assert set(gui.REQUIRED_PACKAGES) == {"yfinance", "openpyxl", "tzdata"}
 
 
+@test
+def the_missing_chain_marker_matches_what_generate_picks_actually_prints():
+    """The GUI offers a one-click fix when a pick run dies for want of a chain,
+    and it recognises that case by matching the child script's own sentence.
+    Two copies of one string in two files is a drift waiting to happen, so this
+    pins them together: reword the message and this test says so."""
+    src = (ROOT / "generate_picks.py").read_text(encoding="utf-8")
+    assert gui.MISSING_CHAIN_MARKER in src, (
+        f"gui.MISSING_CHAIN_MARKER {gui.MISSING_CHAIN_MARKER!r} no longer appears "
+        f"in generate_picks.py, so the GUI will stop offering the fix")
+
+@test
+def option_chains_are_fetched_by_default():
+    """Off by default, step 1 succeeds and step 3 refuses two steps later for
+    want of a chain - a failure that surfaces nowhere near its cause, and the
+    exact shape of the first bug reported against this app."""
+    src = (ROOT / "gui.py").read_text(encoding="utf-8")
+    assert 'saved.get("chains", True)' in src, "the chains checkbox must default to on"
+
+@test
+def the_picks_workbook_has_a_folder_of_its_own():
+    """Mixed into the data folder, a picks workbook is unfindable among the
+    timestamped data exports - which is what 'I do not see them' meant."""
+    assert gui.DEFAULT_PICKS_OUT_DIR != gui.DEFAULT_OUT_DIR
+    src = (ROOT / "gui.py").read_text(encoding="utf-8")
+    assert "def picks_out_dir" in src and "self.picks_out_dir()" in src
+
+@test
+def nothing_printed_to_a_console_is_outside_ascii():
+    """A Windows console at cp1252 cannot encode an em-dash. Tyler's run showed
+    one as a replacement character; on a stricter console the same line raises
+    UnicodeEncodeError and the button looks broken. HTML and Excel are written
+    with an explicit encoding and are exempt - only print() is at risk."""
+    offenders = []
+    for name in ("gui.py", "dashboard.py", "backtest.py", "generate_picks.py",
+                 "resolve_picks.py", "excel_report.py", "diagnose.py",
+                 "claude/app/mp_v01/fetch_data.py"):
+        for i, line in enumerate((ROOT / name).read_text(encoding="utf-8").splitlines(), 1):
+            if "print(" in line and any(ord(c) > 127 for c in line):
+                offenders.append(f"{name}:{i}  {line.strip()[:70]}")
+    assert not offenders, "non-ASCII in console output:\n  " + "\n  ".join(offenders)
+
+
 if __name__ == "__main__":
     if STUBBED:
         print("  (tkinter not installed here; imported gui.py against a stub)")

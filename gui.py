@@ -51,7 +51,12 @@ DASHBOARD_FILE = HERE / "dashboard.html"
 # Everything a first run needs. Kept here rather than in a document so the
 # "Install required packages" button and the docs cannot drift apart.
 REQUIRED_PACKAGES = ["yfinance", "openpyxl", "tzdata"]
-DEFAULT_OUT_DIR = HERE / "excel_out"
+DEFAULT_OUT_DIR = HERE / "excel_out"        # the data workbook: bars, labels, chains
+DEFAULT_PICKS_OUT_DIR = HERE / "picks_out"  # the picks workbook: the record and outcomes
+
+# The sentence generate_picks.py prints when the store has no chain snapshot.
+# Pinned by a test against that script's source, so the two cannot drift.
+MISSING_CHAIN_MARKER = "no option chain snapshots"
 SETTINGS_FILE = Path.home() / ".moneyprinter_gui.json"
 
 BENCHMARK = "SPY"          # labels are excess return vs this; see labels/contract.py
@@ -134,6 +139,8 @@ class MoneyPrinterGUI(tk.Tk):
         self._start_time: float | None = None
         self._pending_workbook: Path | None = None
         self._pending_dashboard: Path | None = None
+        # Set while reading the child's output, consumed by _finish.
+        self._saw_missing_chain = False
         self._last_workbook: Path | None = None
         self._out_q: queue.Queue = queue.Queue()
 
@@ -141,8 +148,14 @@ class MoneyPrinterGUI(tk.Tk):
         self.tickers_var = tk.StringVar(value=saved.get("tickers", "SPY,QQQ,MSFT"))
         self.start_var = tk.StringVar(value=saved.get("start", "2019-01-01"))
         self.end_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
-        self.chains_var = tk.BooleanVar(value=bool(saved.get("chains", False)))
+        # Default ON. Off, step 1 succeeds and step 3 then correctly refuses for
+        # want of a chain - a setup whose failure surfaces two steps from its
+        # cause. Chains are what the picks are FOR; the slower fetch is the
+        # cheaper mistake.
+        self.chains_var = tk.BooleanVar(value=bool(saved.get("chains", True)))
         self.outdir_var = tk.StringVar(value=saved.get("outdir", str(DEFAULT_OUT_DIR)))
+        self.picksdir_var = tk.StringVar(
+            value=saved.get("picks_outdir", str(DEFAULT_PICKS_OUT_DIR)))
         self.mie_tickers_var = tk.StringVar(value=saved.get("mie_tickers", "AAPL,MSFT,GOOGL"))
 
         self._build_ui()
@@ -232,10 +245,18 @@ class MoneyPrinterGUI(tk.Tk):
 
         out_row = ttk.Frame(self, padding=(12, 8))
         out_row.pack(fill=tk.X)
-        ttk.Label(out_row, text="Workbooks go to").pack(side=tk.LEFT)
+        ttk.Label(out_row, text="Data workbook").pack(side=tk.LEFT)
         ttk.Entry(out_row, textvariable=self.outdir_var).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         ttk.Button(out_row, text="Change…", command=self.choose_output).pack(side=tk.LEFT)
+
+        picks_row = ttk.Frame(self, padding=(12, 0))
+        picks_row.pack(fill=tk.X)
+        ttk.Label(picks_row, text="Picks workbook").pack(side=tk.LEFT)
+        ttk.Entry(picks_row, textvariable=self.picksdir_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(picks_row, text="Change…",
+                   command=self.choose_picks_output).pack(side=tk.LEFT)
 
         self._job_buttons = (self.install_btn, self.diag_btn, self.fetch_btn,
                              self.export_btn, self.picks_btn, self.score_btn)
@@ -346,6 +367,18 @@ class MoneyPrinterGUI(tk.Tk):
     def out_dir(self) -> Path:
         return Path(self.outdir_var.get().strip() or DEFAULT_OUT_DIR).expanduser()
 
+    def picks_out_dir(self) -> Path:
+        """Where the PICKS workbook goes - deliberately not the data folder.
+
+        The two workbooks are read on different schedules: the data one is
+        rebuilt whenever you fetch and is thousands of rows you check arithmetic
+        against; the picks one grows a few rows per run and is revisited as
+        outcomes resolve. Mixed in one folder the picks are impossible to find
+        among the timestamped data exports.
+        """
+        return Path(self.picksdir_var.get().strip()
+                    or DEFAULT_PICKS_OUT_DIR).expanduser()
+
     def _tickers(self) -> list[str]:
         return [t.strip().upper() for t in self.tickers_var.get().split(",") if t.strip()]
 
@@ -372,6 +405,7 @@ class MoneyPrinterGUI(tk.Tk):
                 "start": self.start_var.get(),
                 "chains": self.chains_var.get(),
                 "outdir": self.outdir_var.get(),
+                "picks_outdir": self.picksdir_var.get(),
                 "mie_tickers": self.mie_tickers_var.get(),
             }, indent=2), encoding="utf-8")
         except Exception:
@@ -386,6 +420,7 @@ class MoneyPrinterGUI(tk.Tk):
     # -- job plumbing ------------------------------------------------------
 
     def _start(self, args: list, label: str, cwd: Path) -> bool:
+        self._saw_missing_chain = False
         if self._runner is not None and self._runner.is_alive():
             messagebox.showinfo("Busy", "Something is already running. Wait for it, or press Stop.")
             return False
@@ -409,6 +444,13 @@ class MoneyPrinterGUI(tk.Tk):
                 if tag == "done":
                     self._finish(int(payload))
                 else:
+                    # generate_picks.py prints this exact diagnosis when the
+                    # store has bars but no chain. Matching on the script's own
+                    # sentence keeps one source of truth for the condition; a
+                    # test pins the two together so a reworded message cannot
+                    # silently stop the GUI offering the fix.
+                    if MISSING_CHAIN_MARKER in payload:
+                        self._saw_missing_chain = True
                     self._log(payload, tag)
         except queue.Empty:
             pass
@@ -423,6 +465,29 @@ class MoneyPrinterGUI(tk.Tk):
         self.progress.stop()
         self._start_time = None
         self._log(f"\n<process exited {code}>\n", "info")
+
+        # A step that fails for want of a chain has a one-click fix, and saying
+        # so here is the difference between a bug report and a re-run. The
+        # underlying script already explains itself; what it cannot do is tick
+        # the box or press the button, so the GUI offers to.
+        if code != 0 and self._saw_missing_chain:
+            self._saw_missing_chain = False
+            if not self.chains_var.get():
+                self.chains_var.set(True)
+                self._save_settings()
+                self._log(
+                    "\nThe data store has bars but no option chain snapshots, which is\n"
+                    "why this step stopped. 'also snapshot option chains' was OFF in\n"
+                    "step 1; it has now been TICKED FOR YOU.\n\n"
+                    "Press '1 - Fetch market data' again, then this step. Yahoo has no\n"
+                    "historical chains, so a snapshot can only ever be taken today -\n"
+                    "which is also why running step 1 daily is worth doing.\n", "warning")
+            else:
+                self._log(
+                    "\nThe data store has bars but no option chain snapshots. The box is\n"
+                    "ticked, so the last fetch should have taken them - re-run step 1 and\n"
+                    "watch for a 'chains' line per ticker. If none appears, run\n"
+                    "'Check setup' and send me what it prints.\n", "warning")
 
         if code == 0 and self._pending_dashboard is not None:
             page = self._pending_dashboard
@@ -504,22 +569,24 @@ class MoneyPrinterGUI(tk.Tk):
         readable view of it. The workbook is rendered FROM the frozen file
         rather than derived alongside it, so the two cannot disagree.
         """
-        out_dir = self.out_dir()
+        out_dir = self.picks_out_dir()
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            messagebox.showerror("Output folder", f"Cannot create {out_dir}:\n{e}")
+            messagebox.showerror("Picks folder", f"Cannot create {out_dir}:\n{e}")
             return
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        target = out_dir / f"moneyprinter_{stamp}.xlsx"
+        target = out_dir / f"picks_{stamp}.xlsx"
 
         self._banner("Generating paper picks")
         self._log(
-            "Needs a fetch WITH option chains — tick the box in step 1 if you have not.\n\n"
-            "Writes the hashed JSON record under picks\\, then rebuilds the workbook so\n"
+            "NEEDS A FETCH WITH OPTION CHAINS. If this step reports no chain snapshots,\n"
+            "tick 'also snapshot option chains' in step 1 and run step 1 again - the\n"
+            "chain is what a pick IS, and no amount of bar history substitutes.\n\n"
+            "Writes the hashed JSON record under picks\\, then a PICKS workbook so\n"
             "Pick_History shows this run alongside every earlier one. That history comes\n"
-            "from the files in picks\\, so commit them — they are the record, and unlike\n"
+            "from the files in picks\\, so commit them - they are the record, and unlike\n"
             "the data store they are not regenerable.\n\n"
             "These are hypotheses for forward measurement, not recommendations. The risk\n"
             "gate declines to approve any of them, and the workbook says why.\n\n", "info")
@@ -760,6 +827,13 @@ class MoneyPrinterGUI(tk.Tk):
         # ticker string into a temp .py file written next to the repo root, which
         # broke on any unexpected character and left the file behind.
         self._start([MIE_SCRIPT, "--tickers", ",".join(tickers)], "market_intelligence_engine.py", HERE)
+
+    def choose_picks_output(self) -> None:
+        chosen = filedialog.askdirectory(title="Folder for the PICKS workbook",
+                                         initialdir=str(self.picks_out_dir()))
+        if chosen:
+            self.picksdir_var.set(chosen)
+            self._save_settings()
 
     def choose_output(self) -> None:
         chosen = filedialog.askdirectory(initialdir=str(self.out_dir().parent),
