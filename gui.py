@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, simpledialog, scrolledtext, ttk
 
 HERE = Path(__file__).resolve().parent
 MP_V01_DIR = HERE / "claude" / "app" / "mp_v01"
@@ -57,6 +57,11 @@ DEFAULT_PICKS_OUT_DIR = HERE / "picks_out"  # the picks workbook: the record and
 # The sentence generate_picks.py prints when the store has no chain snapshot.
 # Pinned by a test against that script's source, so the two cannot drift.
 MISSING_CHAIN_MARKER = "no option chain snapshots"
+
+MASSIVE_SCRIPT = HERE / "fetch_massive.py"
+# The vendor client's own variable name, so a key already set for their tools
+# is picked up without being retyped.
+MASSIVE_ENV_VAR = "MASSIVE_API_KEY"
 SETTINGS_FILE = Path.home() / ".moneyprinter_gui.json"
 
 BENCHMARK = "SPY"          # labels are excess return vs this; see labels/contract.py
@@ -93,20 +98,31 @@ def classify(line: str) -> str:
 class SubprocessRunner(threading.Thread):
     """Runs one python script, streaming its output into a queue."""
 
-    def __init__(self, args: list[str], cwd: Path, out_q: queue.Queue):
+    def __init__(self, args: list[str], cwd: Path, out_q: queue.Queue,
+                 env_extra: dict[str, str] | None = None):
         super().__init__(daemon=True)
         self.args = args
         self.cwd = cwd
         self.out_q = out_q
+        # Secrets reach the child THROUGH THE ENVIRONMENT and nowhere else.
+        # Not a command-line argument, which every process on the machine can
+        # read out of the process table, and not a file. It is echoed nowhere:
+        # the "$ ..." line printed below is the argv, which never holds it.
+        self.env_extra = dict(env_extra or {})
         self.proc: subprocess.Popen | None = None
 
     def run(self) -> None:
         cmd = [sys.executable] + [str(a) for a in self.args]
         try:
             self.out_q.put(("command", f"$ {' '.join(cmd)}\n"))
+            env = None
+            if self.env_extra:
+                env = os.environ.copy()
+                env.update(self.env_extra)
             self.proc = subprocess.Popen(
                 cmd,
                 cwd=str(self.cwd),
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=1,
@@ -156,6 +172,13 @@ class MoneyPrinterGUI(tk.Tk):
         self.outdir_var = tk.StringVar(value=saved.get("outdir", str(DEFAULT_OUT_DIR)))
         self.picksdir_var = tk.StringVar(
             value=saved.get("picks_outdir", str(DEFAULT_PICKS_OUT_DIR)))
+        # DELIBERATELY NOT IN saved. The settings file is plaintext in the home
+        # directory, and a key written there outlives every reason it was
+        # needed. It is held in memory for this session, passed to child
+        # processes through the environment, and forgotten when the app closes.
+        # An existing MASSIVE_API_KEY in the environment pre-fills it, so
+        # `setx` once is still the least typing.
+        self.massive_key_var = tk.StringVar(value=os.environ.get(MASSIVE_ENV_VAR, ""))
         self.mie_tickers_var = tk.StringVar(value=saved.get("mie_tickers", "AAPL,MSFT,GOOGL"))
 
         self._build_ui()
@@ -210,6 +233,20 @@ class MoneyPrinterGUI(tk.Tk):
         ttk.Entry(row, textvariable=self.end_var, width=12).pack(side=tk.LEFT, padx=(6, 16))
         ttk.Label(row, text="option chains snapshotted automatically",
                   foreground="#777777").pack(side=tk.LEFT)
+
+        key_row = ttk.Frame(box)
+        key_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(key_row, text="Massive API key").pack(side=tk.LEFT)
+        # show="*" so a screen-share or a screenshot does not leak it, which is
+        # how the last one got exposed.
+        self.key_entry = ttk.Entry(key_row, textvariable=self.massive_key_var,
+                                   show="*", width=34)
+        self.key_entry.pack(side=tk.LEFT, padx=6)
+        ttk.Button(key_row, text="Test key", command=self.test_massive_key).pack(side=tk.LEFT)
+        ttk.Button(key_row, text="Historical options",
+                   command=self.fetch_massive).pack(side=tk.LEFT, padx=6)
+        self.key_status = ttk.Label(key_row, text="", foreground="#777777")
+        self.key_status.pack(side=tk.LEFT, padx=8)
 
         ttk.Label(
             box,
@@ -315,6 +352,9 @@ class MoneyPrinterGUI(tk.Tk):
         m_run.add_command(label="3 · Generate paper picks", command=self.generate_picks)
         m_run.add_command(label="4 · Score past picks", command=self.score_picks)
         m_run.add_command(label="5 · Backtest the signal", command=self.run_backtest)
+        m_run.add_separator()
+        m_run.add_command(label="Test the Massive API key", command=self.test_massive_key)
+        m_run.add_command(label="Historical options (Massive)", command=self.fetch_massive)
         m_run.add_command(label="Build and open the dashboard", command=self.open_dashboard)
         m_run.add_separator()
         m_run.add_command(label="Score a specific pick file…", command=self.score_picks_choose)
@@ -418,7 +458,8 @@ class MoneyPrinterGUI(tk.Tk):
 
     # -- job plumbing ------------------------------------------------------
 
-    def _start(self, args: list, label: str, cwd: Path) -> bool:
+    def _start(self, args: list, label: str, cwd: Path,
+               env_extra: dict[str, str] | None = None) -> bool:
         self._saw_missing_chain = False
         if self._runner is not None and self._runner.is_alive():
             messagebox.showinfo("Busy", "Something is already running. Wait for it, or press Stop.")
@@ -427,7 +468,7 @@ class MoneyPrinterGUI(tk.Tk):
         self._busy(True)
         self.progress.start(12)
         self._start_time = time.time()
-        self._runner = SubprocessRunner(args, cwd, self._out_q)
+        self._runner = SubprocessRunner(args, cwd, self._out_q, env_extra)
         self._runner.start()
         return True
 
@@ -585,6 +626,71 @@ class MoneyPrinterGUI(tk.Tk):
                 "--decision-date", datetime.now().strftime("%Y-%m-%d")]
         if not self._start(args, "generate_picks.py", HERE):
             self._pending_workbook = None
+
+    def _massive_env(self) -> dict[str, str] | None:
+        """The key, for the child process only. None when the box is empty."""
+        key = self.massive_key_var.get().strip()
+        return {MASSIVE_ENV_VAR: key} if key else None
+
+    def test_massive_key(self) -> None:
+        """Spend ONE call to find out what the key can actually do.
+
+        Cheap on purpose. Massive sells subscriptions per asset class and they
+        are independent, so a key that works for stocks and not for options is
+        an ordinary outcome rather than a fault - and finding that out should
+        cost one request, not a backfill.
+        """
+        if not self._massive_env():
+            messagebox.showinfo(
+                "No key",
+                "Paste your Massive API key into the box first.\n\n"
+                "It is held in memory for this session only. It is never written\n"
+                "to the settings file, never logged, and never appears in the\n"
+                "command line echoed to the console.")
+            return
+        self._banner("Testing the Massive API key")
+        self._log(
+            "One call to /v3/reference/options/contracts, asking for a handful of\n"
+            "contracts as they stood on a past date.\n\n"
+            "It answers the only question worth answering first: does THIS key\n"
+            "reach options history? Subscriptions are per asset class, so a free\n"
+            "Stocks plan does not imply free Options.\n\n"
+            "The key goes to the child process through the environment, not the\n"
+            "command line - the '$ ...' line below will not contain it.\n\n", "info")
+        self.key_status.config(text="testing...", foreground="#777777")
+        self._start([MASSIVE_SCRIPT, "--probe"], "fetch_massive.py --probe",
+                    HERE, env_extra=self._massive_env())
+
+    def fetch_massive(self) -> None:
+        """Pull the option contracts that existed on a chosen past date."""
+        if not self._massive_env():
+            messagebox.showinfo("No key", "Paste your Massive API key into the box first.")
+            return
+        as_of = simpledialog.askstring(
+            "Point-in-time date",
+            "Fetch the option contracts that existed on which date?\n\n"
+            "YYYY-MM-DD. This is the whole point of the call: it returns the\n"
+            "contracts listed THAT DAY, expired ones included, rather than the\n"
+            "ones that still trade now. Without it the history is survivorship-\n"
+            "biased and would flatter every backtest built on it.",
+            parent=self, initialvalue=self.start_var.get())
+        if not as_of:
+            return
+        if not valid_date(as_of):
+            messagebox.showerror("Date", f"{as_of!r} is not a YYYY-MM-DD date.")
+            return
+        self._banner(f"Historical option contracts as of {as_of}")
+        self._log(
+            "Contracts only on this pass - one call per page, and a page holds up\n"
+            "to 1000. Bars per contract are a separate, much larger spend: a full\n"
+            "chain is thousands of calls, so that stays behind an explicit flag.\n\n"
+            "This is the data Yahoo cannot give at any price, and it is what would\n"
+            "let the options layer be tested against history rather than only\n"
+            "forward. Nothing is interpolated; unreadable rows are marked UNKNOWN.\n\n",
+            "info")
+        self._start([MASSIVE_SCRIPT, "--tickers", ",".join(self._tickers()),
+                     "--as-of", as_of], "fetch_massive.py", HERE,
+                    env_extra=self._massive_env())
 
     def run_backtest(self) -> None:
         """Walk the signal forward through history, against a noise floor.
