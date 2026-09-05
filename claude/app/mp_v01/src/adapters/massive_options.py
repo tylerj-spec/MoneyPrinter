@@ -57,6 +57,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterator
 
@@ -321,6 +322,91 @@ def contract_daily_bars(symbol: str, start: str, end: str,
                             multiplier=1, timespan="day", from_=start, to=end)
     doc = _get(path, {"adjusted": str(bool(adjusted)).lower(), "limit": 50000})
     return [normalize_agg(r, contract_symbol=symbol) for r in (doc.get("results") or [])]
+
+
+def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
+                    pause_seconds: float = 13.0) -> list[dict[str, Any]]:
+    """Walk up from the barest possible request, one parameter at a time.
+
+    WHY A LADDER AND NOT ONE CALL
+
+    A single fully-specified request has one failure mode and five possible
+    causes. The first live probe asked for SPY contracts as of 2025-08-01 and
+    got back CYU contracts that expired in 2012 - an HTTP 200 whose body had
+    nothing to do with the question. That is what an IGNORED query parameter
+    looks like, and no amount of staring at one response can say WHICH
+    parameter was ignored.
+
+    So each rung adds exactly one thing and checks the response against what
+    was asked. The rung that first reports IGNORED or EMPTY names the problem.
+
+    Verdicts:
+      OK       the response matches the request
+      IGNORED  HTTP 200, but the rows contradict the filter - the parameter is
+               not being honoured, which is worse than an error because it
+               looks like data
+      EMPTY    HTTP 200, zero rows. Inconclusive on its own; read it against
+               the rung below, which is the whole point of the ladder
+      HTTP_*   the service refused, with its own reason
+
+    Costs up to five calls, paced for the documented 5-per-minute free tier.
+    """
+    as_of = as_of or (datetime.now(NY).date() - timedelta(days=400)).isoformat()
+    want = underlying.strip().upper()
+    rungs = [
+        ("bare", {"limit": 3},
+         "does the endpoint answer this key at all?"),
+        ("underlying filter", {"underlying_ticker": want, "limit": 3},
+         "is underlying_ticker honoured?"),
+        ("current only", {"underlying_ticker": want, "expired": "false", "limit": 3},
+         "contracts listed right now"),
+        ("expired included", {"underlying_ticker": want, "expired": "true", "limit": 3},
+         "does this plan expose delisted contracts?"),
+        ("point in time", {"underlying_ticker": want, "expired": "true",
+                           "as_of": as_of, "limit": 3},
+         "is as_of honoured? this is the rung that matters"),
+    ]
+
+    out: list[dict[str, Any]] = []
+    for i, (name, params, asks) in enumerate(rungs):
+        if i:
+            time.sleep(pause_seconds)      # the free tier is 5 calls per MINUTE
+        step: dict[str, Any] = {"step": name, "asks": asks,
+                                "params": {k: v for k, v in params.items() if k != "limit"}}
+        try:
+            doc = _get(CONTRACTS_PATH, params)
+        except MassiveError as e:
+            step.update(verdict=e.kind, detail=str(e))
+            out.append(step)
+            break                          # a refusal makes every rung above moot
+        rows = doc.get("results") or []
+        step["returned"] = len(rows)
+        if not rows:
+            step["verdict"] = "EMPTY"
+            out.append(step)
+            continue
+
+        underlyings = {str(r.get("underlying_ticker") or "?") for r in rows}
+        step["underlyings_returned"] = sorted(underlyings)[:5]
+        step["expirations_returned"] = sorted(
+            {str(r.get("expiration_date") or "?") for r in rows})[:5]
+
+        if "underlying_ticker" in params and underlyings != {want}:
+            step["verdict"] = "IGNORED"
+            step["detail"] = (f"asked for {want}, got {', '.join(sorted(underlyings))} - "
+                              f"the underlying_ticker filter is not being applied")
+        elif "as_of" in params and all(
+                str(r.get("expiration_date") or "") < as_of for r in rows):
+            # Every contract expired before the as_of date. Not proof on its
+            # own, but combined with the rung below it separates "no history"
+            # from "as_of ignored".
+            step["verdict"] = "IGNORED"
+            step["detail"] = (f"every contract expired before {as_of}, so as_of "
+                              f"does not appear to be filtering")
+        else:
+            step["verdict"] = "OK"
+        out.append(step)
+    return out
 
 
 def probe(underlying: str = "SPY", as_of: str | None = None) -> dict[str, Any]:

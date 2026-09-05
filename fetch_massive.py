@@ -55,6 +55,70 @@ def _write(path: Path, doc: dict) -> Path:
     return path
 
 
+def do_diagnose(args) -> int:
+    """Which parameter is the service not honouring? Up to five calls."""
+    print("=" * 74)
+    print("MASSIVE - access ladder. One parameter at a time, until something breaks.")
+    print("=" * 74)
+    print("\nA fully-specified request has one failure mode and five possible causes.")
+    print("The first live probe asked for SPY as of 2025-08-01 and got back CYU")
+    print("contracts that expired in 2012 - an HTTP 200 whose body had nothing to do")
+    print("with the question. That is an IGNORED parameter, and one response cannot")
+    print("say which one. So each rung below adds exactly one thing.\n")
+    print("Up to 5 calls, paced ~13s apart for the free tier's 5-per-minute limit.")
+    print("This takes about a minute.\n")
+
+    try:
+        steps = mv.diagnose_access(args.tickers.split(",")[0].strip().upper(),
+                                   args.as_of)
+    except mv.MissingCredential as e:
+        print(f"{e}")
+        return 1
+
+    worst = None
+    for st in steps:
+        v = st["verdict"]
+        print(f"  [{v:<22}] {st['step']:<18} {st['asks']}")
+        if st.get("params"):
+            print(f"      sent      : {st['params']}")
+        if "returned" in st:
+            print(f"      returned  : {st['returned']} row(s)"
+                  f"{'  underlyings ' + ', '.join(st['underlyings_returned']) if st.get('underlyings_returned') else ''}")
+        if st.get("expirations_returned"):
+            print(f"      expiries  : {', '.join(st['expirations_returned'])}")
+        if st.get("detail"):
+            print(f"      -> {st['detail']}")
+        if v != "OK" and worst is None:
+            worst = st
+
+    print("\n" + "-" * 74)
+    if worst is None:
+        print("Every rung passed. underlying_ticker, expired and as_of are all being")
+        print("honoured, so point-in-time contract history is available on this key.")
+        print("\nNext:  python fetch_massive.py --tickers SPY --as-of 2024-03-05")
+        return 0
+
+    print(f"FIRST FAILURE: {worst['step']}  ({worst['verdict']})")
+    v = worst["verdict"]
+    if v == "IGNORED":
+        print("\nThe service answered 200 and returned rows that contradict the filter.")
+        print("That is worse than an error, because it looks like data - and a backfill")
+        print("built on it would be silently wrong rather than obviously empty. The")
+        print("adapter refuses such a response rather than storing it.")
+    elif v == "EMPTY":
+        print("\nZero rows where the rung below returned some. On a free plan this")
+        print("usually means the parameter is accepted but the underlying DATA is not")
+        print("included - reference history is commonly a paid tier even when the")
+        print("current-contract listing is free.")
+    elif v == "NOT_ENTITLED":
+        print("\nThe key is valid but this data is not on the plan. Massive sells per")
+        print("asset class and they are independent.")
+    elif v == "UNREACHABLE":
+        print("\nThe host could not be reached - network, DNS or a proxy.")
+    print("\nEverything ABOVE that line worked, so the boundary is exactly there.")
+    return 1
+
+
 def do_probe(args) -> int:
     print("=" * 74)
     print("MASSIVE - probe. One call, to find out what this key can do.")
@@ -176,6 +240,11 @@ def do_fetch(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    ap.add_argument("--diagnose", action="store_true",
+                    help="walk up from the barest request, one parameter at a time, "
+                         "to find which one the service is not honouring. Up to 5 "
+                         "calls, paced for the free tier. Use this when --probe "
+                         "fails and the reason is not obvious.")
     ap.add_argument("--probe", action="store_true",
                     help="spend ONE call to test entitlement, then stop. Start here.")
     ap.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
@@ -193,6 +262,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="cap on pagination per ticker (default 20)")
     a = ap.parse_args(argv)
 
+    if a.diagnose:
+        return do_diagnose(a)
     if a.probe:
         return do_probe(a)
     if not a.as_of:

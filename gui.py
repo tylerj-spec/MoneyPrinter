@@ -252,6 +252,8 @@ class MoneyPrinterGUI(tk.Tk):
                                    show="*", width=34)
         self.key_entry.pack(side=tk.LEFT, padx=6)
         ttk.Button(key_row, text="Test key", command=self.test_massive_key).pack(side=tk.LEFT)
+        ttk.Button(key_row, text="Diagnose key",
+                   command=self.diagnose_massive_key).pack(side=tk.LEFT, padx=6)
         ttk.Button(key_row, text="Historical options",
                    command=self.fetch_massive).pack(side=tk.LEFT, padx=6)
         self.key_status = ttk.Label(key_row, text="", foreground="#777777")
@@ -371,6 +373,7 @@ class MoneyPrinterGUI(tk.Tk):
         m_run.add_command(label="5 · Backtest the signal", command=self.run_backtest)
         m_run.add_separator()
         m_run.add_command(label="Test the Massive API key", command=self.test_massive_key)
+        m_run.add_command(label="Diagnose the Massive API key", command=self.diagnose_massive_key)
         m_run.add_command(label="Historical options (Massive)", command=self.fetch_massive)
         m_run.add_command(label="Build and open the dashboard", command=self.open_dashboard)
         m_run.add_separator()
@@ -670,6 +673,28 @@ class MoneyPrinterGUI(tk.Tk):
             "command line - the '$ ...' line below will not contain it.\n\n", "info")
         self.key_status.config(text="testing...", foreground="#777777")
         self._start([MASSIVE_SCRIPT, "--probe"], "fetch_massive.py --probe",
+                    HERE, env_extra=self._massive_env())
+
+    def diagnose_massive_key(self) -> None:
+        """Find WHICH parameter the service is not honouring.
+
+        Test key asks one fully-specified question, which has one failure mode
+        and five possible causes. When it fails and the reason is not obvious,
+        this walks up from the barest possible request adding one parameter at
+        a time, so the rung that first misbehaves names the problem.
+        """
+        if not self._massive_env():
+            messagebox.showinfo("No key", "Paste your Massive API key into the box first.")
+            return
+        self._banner("Diagnosing the Massive API key")
+        self._log(
+            "Up to five calls, one parameter at a time, paced ~13s apart for the\n"
+            "free tier's 5-per-minute limit. Takes about a minute.\n\n"
+            "The first live probe asked for SPY as of 2025-08-01 and got back CYU\n"
+            "contracts that expired in 2012 - an HTTP 200 whose body had nothing to\n"
+            "do with the question. That is an IGNORED parameter, and no single\n"
+            "response can say which one, which is why this exists.\n\n", "info")
+        self._start([MASSIVE_SCRIPT, "--diagnose"], "fetch_massive.py --diagnose",
                     HERE, env_extra=self._massive_env())
 
     def fetch_massive(self) -> None:
