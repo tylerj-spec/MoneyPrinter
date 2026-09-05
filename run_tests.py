@@ -16,6 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STEPS = [
     ("Core pipeline (point-in-time, costs, gates)", "claude/app/mp_v01/run_all.py"),
     ("Excel export", "tests/test_excel_report.py"),
+    ("Dashboard (offline HTML)", "tests/test_dashboard.py"),
     ("GUI (headless)", "tests/test_gui.py"),
 ]
 

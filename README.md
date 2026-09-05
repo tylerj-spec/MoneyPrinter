@@ -125,7 +125,22 @@ whether a workbook was built by older code.
 | **2 · Build Excel workbook** | Turns the data store into a workbook — bars, labels, option chain with Greeks, and the accumulated pick history. |
 | **3 · Generate paper picks** | Scores every ticker under five weight variants, proposes a contract for each, freezes the result with a SHA-256, and rebuilds the workbook. |
 | **4 · Score past picks** | Takes the newest frozen file and works out what happened: was the direction right, and what would the pre-registered exits have returned. |
+| **5 · Backtest the signal** | Walks the components forward through every bar in the store, out of sample, against a **noise floor** — what the same procedure scores on shuffled labels with the model refit. Also reports rank IC per component. No network needed. |
+| **View dashboard** | Rebuilds a single self-contained `dashboard.html` and opens it: every pick with its full rationale, then the backtest evidence. Rebuilt every time, because a stale page looks current no matter how old it is. |
 | **Open output folder** | Opens where the workbooks are, with the newest selected. |
+
+### The workbook versus the dashboard
+
+Two outputs, two jobs, and neither replaces the other.
+
+**The Excel workbook is the audit trail.** Every bar, label, Greek and pick, in a form
+you can sort, pivot and check the arithmetic of. Use it to *verify* the app rather than
+trust it — that is what it is for.
+
+**The dashboard is the reading surface.** What the picks are, why each was proposed, and
+whether the signal behind them has ever been shown to work. One `.html` file with every
+style, number and chart inlined: no CDN, no fonts to fetch, no server. Copy it to a
+machine with the wifi off and it renders identically.
 
 Tick **"also snapshot option chains"** before fetching if you want Greeks or picks.
 Yahoo publishes no historical chains, so a daily snapshot is the only way to build
@@ -138,7 +153,9 @@ choose a contract out of.
 |---|---|
 | File → Open the picks folder | The forward record. Commit this folder — unlike the data store it cannot be regenerated. |
 | Run → Score a specific pick file… | Score an older file rather than the newest. |
-| Run → Run the test suite | 161 tests, no network, no market data. |
+| File → Open the backtests folder | Raw JSON behind the dashboard's evidence section. |
+| Run → Build and open the dashboard | Same as the button. |
+| Run → Run the test suite | The full suite, no network and no market data. |
 | Run → Market Intelligence Engine | Development only. Unvalidated, not point-in-time correct, synthetic news input. |
 | Help → What each button does | The same reference, inside the app. |
 
@@ -153,7 +170,80 @@ python claude/app/mp_v01/fetch_data.py --chains      # fetch
 python excel_report.py                               # build the workbook
 python generate_picks.py                             # freeze picks
 python resolve_picks.py picks/<file>.json            # score them
+python backtest.py                                   # walk the signal forward
+python dashboard.py --open                           # build and open the page
 ```
+
+---
+
+## Backtesting the signal — and what it cannot test
+
+`5 · Backtest the signal` answers the historical half of the question the picks raise:
+have these components **ever** predicted the sign of 5-trading-day forward excess return
+versus SPY, out of sample?
+
+**It is not an options backtest, and cannot be made into one.** Yahoo serves current
+option chains only, so no historical chain exists to price a contract against. Any
+options equity curve built from this data would be drawn from numbers nobody observed.
+The options layer is tested *forward*, one day at a time, by buttons 3 and 4.
+
+That is not a limitation to work around. The signal layer is where an edge would have to
+come from: if the underlying forecast has no edge, no options overlay rescues it — you
+would be selecting contracts on a coin flip. So this is the measurement that comes first,
+and a `NO_EDGE` verdict is a real result. Arguably the most useful one, because it is the
+one that stops you paying for option data.
+
+### Two numbers, never one
+
+Accuracy alone is unreadable. 54% might be an edge, might be a coin flip at this sample
+size, and is definitely not an edge if 54% of the labels are 1s. So every result carries:
+
+- the **majority-class rate** — what you get by always guessing the common answer;
+- the **noise floor** — what this exact procedure scores when the labels are
+  block-permuted and the model **refit**, which prices in its capacity to overfit noise.
+
+The verdict comes from those, never from accuracy on its own.
+
+### Rank IC
+
+Accuracy asks a yes/no question of a blend. Rank IC asks the sharper one of each component
+separately: does its *ranking* of instruments line up with the ranking of their forward
+excess returns? Measured out of sample, once per test window, and reported with the
+fold-to-fold spread — **a mean IC whose sign does not hold across folds is not a weak
+edge, it is no edge measured several times.**
+
+This is what would justify or retire each component on its own merits rather than as part
+of a blend, and it is the measurement the roadmap calls Phase 4.
+
+### Where this sits on the quant map
+
+Theory → mechanism → observable → feature → hypothesis → test → signal → strategy → factor
+→ portfolio. Against that spine:
+
+| Stage | State |
+|---|---|
+| I–III Foundations, market architecture, theory | Built — PIT store, four-timestamp contract, ET clock |
+| **IV Edge mechanisms** | **Not started — the honest gap** |
+| V Observable world | Built — bars and chains, each carrying when it became knowable |
+| VI Feature engineering | Built — five scaled components |
+| VII Hypothesis | Built — label contract v1.0 |
+| VIII Validation | **In progress — this is where the project is** |
+| IX–X Forecast, decision policy | Built — composite score, conviction floor, risk gate |
+| XI Strategy | Partial — five variants logged together |
+| XII–XV Factors, ensembles, portfolio construction | Not started, correctly: they compose edges, and no edge is established |
+| XVI Implementation | Out of scope — no live order path exists here, by design |
+| XVII Live research | Running — the frozen forward paper record |
+
+The gap worth naming is **stage IV**. Everything below it is built and tested, and not one
+component has a stated reason a market would pay for it. `trailing_return`,
+`distance_from_sma`, `realised_volatility` and `drawdown_from_high` are ordinary technical
+constructions; the code calls them `components` rather than `signals` for exactly that
+reason. Rank IC can tell you whether one of them *happens to* rank forward returns. It
+cannot tell you why, and without a why, a positive IC on three tickers over two years is a
+finding with no reason to persist.
+
+The dashboard renders this same table, so the gap is visible next to the numbers rather
+than only in a document.
 
 ---
 

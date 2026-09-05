@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-MoneyPrinter desktop GUI - fetch market data, turn it into an Excel workbook.
+MoneyPrinter desktop GUI - fetch, export, pick, score, backtest, read.
 
     python gui.py
 
-Three buttons, in order: fetch, export, open the folder. Everything else is
-tucked under Advanced. The console shows exactly which command ran, so anything
-you can do here you can also do from a terminal.
+Numbered buttons run the workflow in order; the menu bar carries the rest. The
+console echoes the exact command each button runs, so anything you can do here
+you can also do from a terminal.
+
+TWO OUTPUTS, TWO JOBS. The Excel workbook is the AUDIT TRAIL - every bar, label
+and Greek, in a form you can sort and check the arithmetic of. The dashboard is
+the READING SURFACE - the picks, why each one was proposed, and whether the
+signal behind them has ever been shown to work. Use the workbook to check the
+app; use the dashboard to read it.
 
 Paper/simulation research only. Nothing in this project places an order.
 """
@@ -20,6 +26,7 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +43,10 @@ PICKS_SCRIPT = HERE / "generate_picks.py"
 PICKS_DIR = HERE / "picks"
 DIAGNOSE_SCRIPT = HERE / "diagnose.py"
 RESOLVE_SCRIPT = HERE / "resolve_picks.py"
+BACKTEST_SCRIPT = HERE / "backtest.py"
+BACKTESTS_DIR = HERE / "backtests"
+DASHBOARD_SCRIPT = HERE / "dashboard.py"
+DASHBOARD_FILE = HERE / "dashboard.html"
 
 # Everything a first run needs. Kept here rather than in a document so the
 # "Install required packages" button and the docs cannot drift apart.
@@ -122,6 +133,7 @@ class MoneyPrinterGUI(tk.Tk):
         self._runner: SubprocessRunner | None = None
         self._start_time: float | None = None
         self._pending_workbook: Path | None = None
+        self._pending_dashboard: Path | None = None
         self._last_workbook: Path | None = None
         self._out_q: queue.Queue = queue.Queue()
 
@@ -207,6 +219,12 @@ class MoneyPrinterGUI(tk.Tk):
         self.score_btn = ttk.Button(steps, text="4 · Score past picks",
                                     command=self.score_picks)
         self.score_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.backtest_btn = ttk.Button(steps, text="5 · Backtest the signal",
+                                       command=self.run_backtest)
+        self.backtest_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.dash_btn = ttk.Button(steps, text="View dashboard",
+                                   command=self.open_dashboard)
+        self.dash_btn.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(steps, text="Open output folder", command=self.open_output).pack(side=tk.LEFT)
         self.stop_btn = ttk.Button(steps, text="Stop", command=self.stop_running,
                                    state=tk.DISABLED)
@@ -262,6 +280,7 @@ class MoneyPrinterGUI(tk.Tk):
         m_file.add_command(label="Change output folder…", command=self.choose_output)
         m_file.add_separator()
         m_file.add_command(label="Open the picks folder", command=self.open_picks)
+        m_file.add_command(label="Open the backtests folder", command=self.open_backtests)
         m_file.add_separator()
         m_file.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="File", menu=m_file)
@@ -274,6 +293,8 @@ class MoneyPrinterGUI(tk.Tk):
         m_run.add_command(label="2 · Build Excel workbook", command=self.export_excel)
         m_run.add_command(label="3 · Generate paper picks", command=self.generate_picks)
         m_run.add_command(label="4 · Score past picks", command=self.score_picks)
+        m_run.add_command(label="5 · Backtest the signal", command=self.run_backtest)
+        m_run.add_command(label="Build and open the dashboard", command=self.open_dashboard)
         m_run.add_separator()
         m_run.add_command(label="Score a specific pick file…", command=self.score_picks_choose)
         m_run.add_command(label="Run the test suite", command=self.run_tests)
@@ -403,7 +424,16 @@ class MoneyPrinterGUI(tk.Tk):
         self._start_time = None
         self._log(f"\n<process exited {code}>\n", "info")
 
-        if code == 0 and self._pending_workbook is not None:
+        if code == 0 and self._pending_dashboard is not None:
+            page = self._pending_dashboard
+            self._set_status(f"Dashboard ready — {page.name}", "#0B7A28")
+            self._log(f"\nOpening {page} in your browser.\n", "success")
+            try:
+                webbrowser.open(page.as_uri())
+            except Exception as e:      # a headless or locked-down desktop
+                self._log(f"Could not open a browser ({e}). Open this file yourself:\n"
+                          f"  {page}\n", "warning")
+        elif code == 0 and self._pending_workbook is not None:
             self._last_workbook = self._pending_workbook
             self._set_status(f"Workbook ready — {self._last_workbook.name}", "#0B7A28")
             self._log(f"\nOpen it with '4 · Open output folder', or double-click:\n"
@@ -413,6 +443,7 @@ class MoneyPrinterGUI(tk.Tk):
         else:
             self._set_status(f"Last run failed (exit {code}) — see console", "#C0281C")
         self._pending_workbook = None
+        self._pending_dashboard = None
         self._save_settings()
 
     # -- actions -----------------------------------------------------------
@@ -497,6 +528,55 @@ class MoneyPrinterGUI(tk.Tk):
                 "--decision-date", datetime.now().strftime("%Y-%m-%d")]
         if not self._start(args, "generate_picks.py", HERE):
             self._pending_workbook = None
+
+    def run_backtest(self) -> None:
+        """Walk the signal forward through history, against a noise floor.
+
+        This is the historical half of the question the picks raise. It asks
+        whether the components behind them have EVER predicted the sign of
+        5-trading-day forward excess return out of sample - and answers it
+        against a permuted noise floor, so an accuracy number cannot be read
+        without the thing that makes it readable.
+
+        It is NOT a backtest of the options picks and cannot be made into one:
+        Yahoo serves current chains only, so no historical chain exists to price
+        a contract against. Both facts are printed on every run.
+        """
+        self._banner("Backtesting the signal")
+        self._log(
+            "Walk-forward over the bars already in the data store. No network, no fetch.\n\n"
+            "WHAT IT MEASURES: whether a weighted blend of the components predicts the\n"
+            "sign of 5-trading-day forward excess return versus SPY, out of sample.\n\n"
+            "WHAT IT CANNOT: this is not an options backtest. No historical option chain\n"
+            "exists in this data, so an options equity curve would be fabricated. The\n"
+            "options layer is tested FORWARD, by buttons 3 and 4.\n\n"
+            "Read the VERDICT lines, not the accuracy. Accuracy above the majority class\n"
+            "means nothing until it also clears the noise floor.\n\n"
+            "A few hundred permutations on a few years of bars takes under a minute.\n\n", "info")
+        self._start([BACKTEST_SCRIPT, "--out-dir", BACKTESTS_DIR], "backtest.py", HERE)
+
+    def open_dashboard(self) -> None:
+        """Rebuild the dashboard from the newest files, then open it.
+
+        It rebuilds every time rather than opening whatever is already on disk.
+        A stale workbook has already cost this project one confusing bug report,
+        and a dashboard is worse: it looks current no matter how old it is.
+        """
+        self._banner("Building the dashboard")
+        self._log(
+            "One self-contained .html file - every style, number and chart inlined.\n"
+            "No CDN, no fonts to fetch, no server. Copy it to a machine with no network\n"
+            "and it renders identically, which is what taking this offline needs.\n\n"
+            "It reads the NEWEST pick file and the NEWEST backtest. If either section is\n"
+            "empty, the page names the button that fills it.\n\n", "info")
+        self._pending_dashboard = DASHBOARD_FILE
+        if not self._start([DASHBOARD_SCRIPT, "--out", DASHBOARD_FILE,
+                            "--picks-dir", PICKS_DIR, "--backtest-dir", BACKTESTS_DIR],
+                           "dashboard.py", HERE):
+            self._pending_dashboard = None
+
+    def open_backtests(self) -> None:
+        self._reveal(BACKTESTS_DIR)
 
     def install_packages(self) -> None:
         """Install what a first run needs, so no terminal is required.
@@ -606,19 +686,41 @@ class MoneyPrinterGUI(tk.Tk):
                    "rebuilds the workbook so the new picks join the history.\n\n"
                    "4 · Score past picks — takes the most recent frozen file and works out "
                    "what actually happened: whether the direction was right, and what "
-                   "following the pre-registered exit rules would have returned."),
+                   "following the pre-registered exit rules would have returned.\n\n"
+                   "5 · Backtest the signal — the historical half of the question. Walks the "
+                   "components forward through every bar in the store, out of sample, and "
+                   "measures them against a NOISE FLOOR: what the same procedure scores when "
+                   "the labels are shuffled and the model refit. Also reports rank IC per "
+                   "component — whether each one's ranking of instruments matches the ranking "
+                   "of their forward returns, which is what justifies or retires a component "
+                   "on its own. Needs no network.\n\n"
+                   "View dashboard — rebuilds a single self-contained .html page and opens "
+                   "it: the picks with their full rationale, then the backtest evidence. It "
+                   "rebuilds every time rather than opening what is already on disk, because "
+                   "a stale page looks current no matter how old it is."),
+
+            ("h", "THE WORKBOOK VERSUS THE DASHBOARD"),
+            (None, "They are not two views of the same thing and neither replaces the other.\n\n"
+                   "The Excel workbook is the AUDIT TRAIL. Every bar, every label, every "
+                   "Greek, every pick, in a form you can sort, pivot and check the arithmetic "
+                   "of. Use it to verify the app rather than trust it.\n\n"
+                   "The dashboard is the READING SURFACE. What the picks are, why each was "
+                   "proposed, and whether the signal behind them has ever been shown to work. "
+                   "One .html file with nothing external in it, so it works offline."),
 
             ("h", "WHERE THINGS GO"),
             (None, "Workbooks go to the folder shown above; every export is a new timestamped "
                    "file, so nothing you have edited is ever overwritten. Open the newest.\n\n"
-                   "Frozen picks go to the picks folder. Commit that folder to git — it is "
-                   "the forward record, and unlike the data store it cannot be regenerated. "
-                   "The workbook's pick history is only a view over those files."),
+                   "Frozen picks go to the picks folder, and backtest results to the "
+                   "backtests folder. Commit the picks folder to git — it is the forward "
+                   "record, and unlike the data store it cannot be regenerated. The "
+                   "workbook's pick history is only a view over those files.\n\n"
+                   "The dashboard is written to dashboard.html beside the app."),
 
             ("h", "IN THE MENU"),
             (None, "Run → Score a specific pick file… — score an older file instead of the "
                    "newest.\n\n"
-                   "Run → Run the test suite — 161 tests, no network and no market data. "
+                   "Run → Run the test suite — no network and no market data needed. "
                    "Worth running after an update.\n\n"
                    "Run → Market Intelligence Engine — development only. Its output is "
                    "unvalidated, it is not point-in-time correct, and its news input is "
