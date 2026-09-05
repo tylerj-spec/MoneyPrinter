@@ -35,3 +35,10 @@ claude/app/mp_v01/data_store/
 # data store, and the ones you have edited by hand are yours, not the repo's.
 excel_out/
 *.xlsx
+
+# Backtest results and the rendered dashboard. Both are regenerable from the
+# data store by pressing a button, and both are timestamped, so committing them
+# would grow the repo without adding a record. The PICKS folder is the opposite
+# and IS committed: it cannot be regenerated.
+backtests/
+dashboard.html

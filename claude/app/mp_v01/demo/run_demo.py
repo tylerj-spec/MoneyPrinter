@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 from pit.schema import make_record, SourceTier, ValidationStatus
 from pit.store import PointInTimeStore
 from backtest.costs import CostModel
-from backtest.walkforward import make_splits
+from backtest.walkforward import make_splits, Split, TradingCalendar, LeakageError
 from gates.risk import evaluate, RiskLimits, Decision
 
 random.seed(42)
@@ -26,6 +26,28 @@ LINE = "-" * 72
 
 def hdr(t):
     print(f"\n{LINE}\n{t}\n{LINE}")
+
+
+def demo_calendar() -> TradingCalendar:
+    """Synthetic sessions for the demo: weekdays, minus a few real closures.
+
+    SYNTHETIC, like everything else in this file. A real run builds its calendar
+    from the dates of the bars it actually fetched -
+
+        TradingCalendar.from_dates(r["date"] for r in bars)
+
+    - because `src/` has no holiday table and must not grow one. The three
+    closures below are named here, in the demo, purely so section 3 can show the
+    leak the old calendar-day purge waved through.
+    """
+    closed = {"2024-01-01", "2024-07-04", "2024-11-28", "2024-12-25",
+              "2025-01-01", "2025-07-04", "2025-11-27", "2025-12-25"}
+    days, d = [], datetime(2024, 1, 1)
+    while d < datetime(2026, 1, 1):
+        if d.weekday() < 5 and d.strftime("%Y-%m-%d") not in closed:
+            days.append(d.date())
+        d += timedelta(days=1)
+    return TradingCalendar(tuple(days))
 
 
 def build_store() -> PointInTimeStore:
@@ -115,17 +137,35 @@ def main() -> int:
     print("\n  -> On Mar 10 the model sees 2.0, the number that actually existed then.")
     print("  -> It only sees 3.4 after the revision was published. No backwards leak.")
 
-    hdr("3. WALK-FORWARD SPLITS")
-    splits = make_splits(
-        datetime(2024, 1, 1, tzinfo=timezone.utc),
-        datetime(2026, 1, 1, tzinfo=timezone.utc),
-        train_days=180, test_days=30, label_horizon_days=5, embargo_days=2,
-    )
-    print(f"Generated {len(splits)} chronological splits (5-day purge, 2-day embargo)")
-    for s in splits[:3]:
-        print(f"  split {s.index}: train {s.train_start.date()}..{s.train_end.date()} "
-              f"| purge 5d | test {s.test_start.date()}..{s.test_end.date()}")
+    hdr("3. WALK-FORWARD SPLITS (purged in SESSIONS, not calendar days)")
+    cal = demo_calendar()
+    splits = make_splits(cal, train_sessions=180, test_sessions=30,
+                         label_horizon_sessions=5, embargo_sessions=2)
+    print(f"Calendar: {len(cal)} sessions, {cal.first}..{cal.last}")
+    print(f"Generated {len(splits)} chronological splits (5-SESSION purge, 2-session embargo)")
+    for sp in splits[:3]:
+        print(f"  split {sp.index}: train {sp.train_start}..{sp.train_end} "
+              f"| purge 5 sessions | test {sp.test_start}..{sp.test_end}")
     print(f"  ... {len(splits)-3} more")
+    print("\n  -> Every boundary is a real session. The calendar-arithmetic version")
+    print("     ended training on Sat 2024-06-29 and opened testing on 2024-07-04,")
+    print("     a market holiday, because it only ever added timedeltas.")
+
+    # The defect this replaced, shown rather than asserted.
+    leaky = Split(99, "2024-11-01", "2024-11-27", "2024-12-02", "2024-12-20")
+    between = cal.sessions_strictly_between(leaky.train_end, leaky.test_start)
+    i = cal.index_of(leaky.train_end)
+    print(f"\n  Thanksgiving week 2024, the split the old guard called safe:")
+    print(f"    train_end {leaky.train_end} -> test_start {leaky.test_start}"
+          f" = {(leaky.test_start - leaky.train_end).days} calendar days (old rule: PASS)")
+    print(f"    sessions in that gap: {between}  (the 28th was Thanksgiving)")
+    print(f"    a label decided {leaky.train_end} resolves {cal[i + 5]},"
+          f" inside the test window")
+    try:
+        leaky.validate(5, cal)
+        print("    validate(5, cal): PASSED  <-- the fix is not working")
+    except LeakageError as e:
+        print(f"    validate(5, cal): REJECTED  {str(e).split(': ', 1)[1][:60]}...")
 
     hdr("4. EXECUTION COSTS ON A REALISTIC OPTION QUOTE")
     cm = CostModel()

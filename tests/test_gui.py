@@ -108,9 +108,45 @@ def date_validation_rejects_what_fetch_data_cannot_parse():
 
 @test
 def the_gui_points_at_scripts_that_actually_exist():
-    for path in (gui.FETCH_SCRIPT, gui.EXPORT_SCRIPT, gui.MIE_SCRIPT,
-                 gui.TEST_SCRIPT, gui.MP_V01_DIR / "run_all.py"):
+    for path in (gui.FETCH_SCRIPT, gui.EXPORT_SCRIPT, gui.MIE_SCRIPT, gui.TEST_SCRIPT,
+                 gui.DIAGNOSE_SCRIPT, gui.RESOLVE_SCRIPT, gui.MP_V01_DIR / "run_all.py"):
         assert path.exists(), f"gui.py references a missing script: {path}"
+
+
+@test
+def every_button_and_menu_command_resolves_to_a_real_method():
+    """The window cannot be built headlessly, so the wiring is checked here.
+
+    A command= pointing at a method that does not exist raises only when the
+    user clicks it - which, for a menu item, might be weeks after the typo.
+    """
+    import ast
+    tree = ast.parse(Path(gui.__file__).read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "MoneyPrinterGUI")
+    methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
+
+    wired = []
+    for node in ast.walk(cls):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg != "command":
+                continue
+            v = kw.value
+            if isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) \
+                    and v.value.id == "self":
+                wired.append(v.attr)
+    missing = sorted(set(wired) - methods)
+    assert not missing, f"command= points at methods that do not exist: {missing}"
+    assert len(wired) >= 18, f"only {len(wired)} controls wired; expected the full set"
+
+
+@test
+def the_packages_the_install_button_offers_are_the_ones_needed():
+    """tzdata is not optional on Windows: zoneinfo has no IANA database there,
+    so the label contract's 15:45 ET clock cannot be built without it."""
+    assert set(gui.REQUIRED_PACKAGES) == {"yfinance", "openpyxl", "tzdata"}
 
 
 if __name__ == "__main__":

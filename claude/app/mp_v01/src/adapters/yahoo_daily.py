@@ -33,8 +33,9 @@ every prediction. bar_available_time() below encodes this conservatively.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Mapping
 
 from common.timezones import US_EASTERN as NY
 
@@ -87,7 +88,133 @@ def daily_total_return(close_prev: float, close: float, dividend: float = 0.0) -
     return (close + dividend) / close_prev - 1.0
 
 
-def normalize_bars(raw_rows: list[dict[str, Any]], ticker: str) -> list[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Split-adjustment guard
+# ---------------------------------------------------------------------------
+# daily_total_return() has no split term, which is correct ONLY while Yahoo's
+# Close stays split-adjusted. That was verified once, by hand, against NVDA in
+# June 2024. A verified assumption about a third-party scraper is still an
+# assumption, and the failure is silent: if Close ever goes genuinely raw, every
+# split in the history becomes a fabricated ~-90% move and the label contract
+# scores it as a real crash.
+#
+# So the assumption is now checked on every fetch, against the split dates Yahoo
+# reports alongside the bars.
+#
+# HOW IT DISCRIMINATES. On the effective date of an r-for-1 split:
+#   Close is split-adjusted (what we need) -> close/prev_close is an ordinary day
+#   Close is raw                           -> close/prev_close is almost exactly 1/r
+# A 10-for-1 split makes those 1.00-ish versus 0.10 — not a close call. The
+# check therefore fires on the arithmetic signature of an unadjusted series, not
+# on the size of a move, which is what makes it precise where a plain magnitude
+# threshold is blunt: a genuine -40% earnings collapse is a real observation and
+# is left alone, because a -40% day is nowhere near 1/r for any material split.
+#
+# WHAT IT DOES NOT COVER. Small splits (3-for-2, 5-for-4) are skipped and
+# reported as IMMATERIAL: their unadjusted signature is a -33% or -20% day, which
+# a real session can produce, so flagging them would cost false positives on
+# exactly the tail events a risk model needs. That is an acceptable hole because
+# the hazard being defended against is a VENDOR-WIDE change in behaviour, and a
+# vendor that starts serving raw closes serves them for the big splits too.
+#
+# THE REPAIR IS SURGICAL. In a raw series only the return that straddles the
+# split is wrong; every other day is priced in one consistent regime and is
+# fine. So a flagged date loses its return and keeps its prices, and the chain
+# continues into the new regime rather than being broken.
+
+SPLIT_MATERIALITY = 2.0        # only ratios >= 2:1 or <= 1:2 are discriminable
+SPLIT_MATCH_TOLERANCE = 0.15   # how near 1/r the observed ratio must sit
+
+
+@dataclass(frozen=True)
+class SplitCheck:
+    """One split, and what the bars around it say about vendor adjustment."""
+    date: str
+    ratio: float
+    verdict: str          # ADJUSTED | UNADJUSTED | IMMATERIAL | UNCHECKABLE
+    observed_ratio: float | None
+    expected_if_raw: float | None
+    detail: str
+
+    @property
+    def failed(self) -> bool:
+        return self.verdict == "UNADJUSTED"
+
+
+def _split_map(raw_rows: list[dict[str, Any]],
+               splits: Mapping[str, float] | Iterable[tuple[str, float]] | None,
+               ) -> dict[str, float]:
+    """Split ratios by effective date, from an explicit map or off the rows."""
+    if splits is None:
+        return {r["date"]: float(r["split"]) for r in raw_rows
+                if r.get("date") and r.get("split")}
+    items = splits.items() if isinstance(splits, Mapping) else splits
+    return {str(d): float(r) for d, r in items if r}
+
+
+def check_split_adjustment(
+    raw_rows: list[dict[str, Any]],
+    splits: Mapping[str, float] | Iterable[tuple[str, float]] | None = None,
+    *,
+    materiality: float = SPLIT_MATERIALITY,
+    tolerance: float = SPLIT_MATCH_TOLERANCE,
+) -> list[SplitCheck]:
+    """Report, for every known split, whether the bars look split-adjusted.
+
+    Pure: takes rows and ratios, touches no network. `splits` defaults to the
+    `split` key on the rows themselves, which is what the live fetch attaches.
+    """
+    dated = [r for r in raw_rows if r.get("date") is not None]
+    position = {r["date"]: i for i, r in enumerate(dated)}
+    out: list[SplitCheck] = []
+
+    for day, ratio in sorted(_split_map(raw_rows, splits).items()):
+        if day not in position:
+            continue                      # split outside the fetched window
+        if not (ratio > 0):
+            out.append(SplitCheck(day, ratio, "UNCHECKABLE", None, None,
+                                  f"non-positive split ratio {ratio}"))
+            continue
+        if 1.0 / materiality < ratio < materiality:
+            out.append(SplitCheck(day, ratio, "IMMATERIAL", None, 1.0 / ratio,
+                                  f"ratio {ratio:g} is inside {1/materiality:g}..{materiality:g}; "
+                                  f"an unadjusted series would look like an ordinary "
+                                  f"large move here, so this split cannot discriminate"))
+            continue
+
+        i = position[day]
+        prev = dated[i - 1] if i > 0 else None
+        close, prev_close = dated[i].get("close"), (prev or {}).get("close")
+        usable = (prev is not None
+                  and isinstance(close, (int, float)) and close == close and close > 0
+                  and isinstance(prev_close, (int, float)) and prev_close == prev_close
+                  and prev_close > 0)
+        if not usable:
+            out.append(SplitCheck(day, ratio, "UNCHECKABLE", None, 1.0 / ratio,
+                                  "no usable prior close to compare against"))
+            continue
+
+        observed = close / prev_close
+        expected_if_raw = 1.0 / ratio
+        if abs(observed - expected_if_raw) <= tolerance * expected_if_raw:
+            out.append(SplitCheck(
+                day, ratio, "UNADJUSTED", observed, expected_if_raw,
+                f"close moved {observed - 1:+.1%} across a {ratio:g}-for-1 split, "
+                f"which is the {expected_if_raw - 1:+.1%} a RAW series produces. "
+                f"Yahoo's Close appears to be no longer split-adjusted; "
+                f"daily_total_return() has no split term and would score this as "
+                f"a real move."))
+        else:
+            out.append(SplitCheck(
+                day, ratio, "ADJUSTED", observed, expected_if_raw,
+                f"close moved {observed - 1:+.1%} across a {ratio:g}-for-1 split, "
+                f"nothing like the {expected_if_raw - 1:+.1%} of a raw series"))
+    return out
+
+
+def normalize_bars(raw_rows: list[dict[str, Any]], ticker: str,
+                   splits: Mapping[str, float] | Iterable[tuple[str, float]] | None = None,
+                   ) -> list[dict[str, Any]]:
     """
     Convert raw provider rows into records carrying the four-timestamp contract.
 
@@ -97,7 +224,19 @@ def normalize_bars(raw_rows: list[dict[str, Any]], ticker: str) -> list[dict[str
     Missing or unusable values are marked UNKNOWN. Nothing is interpolated,
     carried forward, or estimated - see the module docstring in the ingestion
     package. A gap is reported, never patched.
+
+    SPLITS. When split ratios are available - passed in, or carried on the rows
+    as `split`, which is what the live fetch attaches - each material one is
+    checked against the bars around it. A date whose move matches the signature
+    of an UNADJUSTED series keeps its prices but loses its return, marked
+    SPLIT_UNADJUSTED, because that return would otherwise be a fabricated ~-90%
+    crash that the label contract scores as real. The chain continues through
+    it: only the straddling return is unusable, the days either side of the
+    split are each priced consistently within their own regime.
     """
+    checks = check_split_adjustment(raw_rows, splits)
+    suspect = {c.date: c for c in checks if c.failed}
+
     out: list[dict[str, Any]] = []
     prev_close: float | None = None
     for row in raw_rows:
@@ -123,7 +262,7 @@ def normalize_bars(raw_rows: list[dict[str, Any]], ticker: str) -> list[dict[str
             except ValueError:
                 ret = None
 
-        out.append({
+        record = {
             "ticker": ticker,
             "date": date,
             "event_time": bar_event_time(date),
@@ -134,7 +273,14 @@ def normalize_bars(raw_rows: list[dict[str, Any]], ticker: str) -> list[dict[str
             "dividend": row.get("dividend", 0.0) or 0.0,
             "daily_total_return": ret,
             "status": "OK" if ret is not None else "NO_PRIOR_CLOSE",
-        })
+        }
+        if date in suspect:
+            c = suspect[date]
+            record["daily_total_return"] = None
+            record["status"] = "SPLIT_UNADJUSTED"
+            record["split_ratio"] = c.ratio
+            record["reason"] = c.detail
+        out.append(record)
         prev_close = close
     return out
 
@@ -155,10 +301,19 @@ def fetch_daily_bars_yfinance(ticker: str, start: str, end: str) -> list[dict[st
     if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
         df.columns = df.columns.get_level_values(0)
 
+    tk = yf.Ticker(ticker)
     try:
-        divs = yf.Ticker(ticker).dividends
+        divs = tk.dividends
     except Exception:
         divs = None
+
+    # Splits are fetched for the guard above, not for price maths - there is no
+    # split term in daily_total_return() and there should not be one while Close
+    # stays adjusted. They are the evidence that it still is.
+    try:
+        spl = tk.splits
+    except Exception:
+        spl = None
 
     rows = []
     for idx, r in df.iterrows():
@@ -170,10 +325,17 @@ def fetch_daily_bars_yfinance(ticker: str, start: str, end: str) -> list[dict[st
                 div = float(m.iloc[0]) if len(m) else 0.0
             except Exception:
                 div = 0.0
+        split = 0.0
+        if spl is not None and len(spl):
+            try:
+                m = spl[spl.index.strftime("%Y-%m-%d") == d]
+                split = float(m.iloc[0]) if len(m) else 0.0
+            except Exception:
+                split = 0.0
         rows.append({
             "date": d, "open": float(r["Open"]), "high": float(r["High"]),
             "low": float(r["Low"]), "close": float(r["Close"]),
             "volume": int(r["Volume"]) if r["Volume"] == r["Volume"] else None,
-            "dividend": div,
+            "dividend": div, "split": split,
         })
     return rows

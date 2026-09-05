@@ -351,7 +351,6 @@ def only_the_sheets_meant_to_have_formulas_have_them():
     if not HAVE_OPENPYXL:
         print("        (skipped: openpyxl not installed)")
         return
-    import re
     import zipfile
 
     # Long enough that the trailing-window formulas actually appear; they start
@@ -376,8 +375,12 @@ def only_the_sheets_meant_to_have_formulas_have_them():
                 assert not found, f"{name} has unintended formula cells: {found[:5]}"
 
         # And at the XML level, which is what Excel actually parses.
-        z = zipfile.ZipFile(out)
-        readme_part = z.read("xl/worksheets/sheet1.xml").decode()
+        # Context-managed on purpose: an open handle here makes the shutil.rmtree
+        # in the finally block raise PermissionError on Windows, which deletes an
+        # open file happily on Linux and refuses on Windows. CI runs ubuntu only,
+        # so this failed for the first time on a real Windows machine.
+        with zipfile.ZipFile(out) as z:
+            readme_part = z.read("xl/worksheets/sheet1.xml").decode()
         assert "<f>" not in readme_part, "README part still contains a formula record"
 
         # The line that caused it must survive intact as readable text.

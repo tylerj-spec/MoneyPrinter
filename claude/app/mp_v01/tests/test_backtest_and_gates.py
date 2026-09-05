@@ -2,20 +2,51 @@ from __future__ import annotations
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 
 from harness import test, assert_raises, run_all
-from backtest.walkforward import make_splits, Split, LeakageError, assert_no_future_features
+from backtest.walkforward import (make_splits, Split, TradingCalendar,
+                                  LeakageError, assert_no_future_features)
 from backtest.costs import CostModel
 from gates.risk import evaluate, Decision, RiskLimits
 
 D = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+S = lambda s: date.fromisoformat(s)   # a session is a day, not an instant
 
 
 # ---------- walk-forward ----------
+def _weekday_sessions(start: str, end: str, closed: tuple = ()) -> TradingCalendar:
+    """Fixture: every weekday between two dates, minus the named closures.
+
+    A fixture, NOT a holiday table. `src/` deliberately has no closure list -
+    see TradingCalendar's docstring - so any test that depends on a specific
+    market closure names it here, where the assumption is visible in the test
+    that relies on it.
+    """
+    from datetime import date, timedelta
+    d, last = date.fromisoformat(start), date.fromisoformat(end)
+    shut = {date.fromisoformat(c) for c in closed}
+    days = []
+    while d <= last:
+        if d.weekday() < 5 and d not in shut:
+            days.append(d)
+        d += timedelta(days=1)
+    return TradingCalendar(tuple(days))
+
+
+# 2024-11-28 was Thanksgiving and the NYSE was shut; the 29th traded (early
+# close, still a session). 2024-12-25 was Christmas.
+THANKSGIVING = _weekday_sessions("2024-11-01", "2024-12-31",
+                                 closed=("2024-11-28", "2024-12-25"))
+# 2024-07-04 was Independence Day. Named so the split boundaries can be checked
+# against a calendar that actually knows the market was shut.
+FOUR_YEARS = _weekday_sessions("2022-01-01", "2026-01-01",
+                               closed=("2024-07-04", "2024-11-28", "2024-12-25"))
+
+
 @test
 def splits_are_chronological_and_non_overlapping():
-    sp = make_splits(D("2024-01-01"), D("2026-01-01"))
+    sp = make_splits(FOUR_YEARS)
     assert len(sp) > 1
     for a, b in zip(sp, sp[1:]):
         assert a.test_start < b.test_start, "splits must roll forward"
@@ -23,17 +54,90 @@ def splits_are_chronological_and_non_overlapping():
         assert s.train_end < s.test_start
 
 @test
-def purge_gap_prevents_label_horizon_bleed():
-    """train_end + 5d label horizon must not reach into the test window."""
-    bad = Split(0, D("2024-01-01"), D("2024-06-01"), D("2024-06-02"), D("2024-07-01"))
-    assert_raises(LeakageError, bad.validate, 5)   # only 1 day gap, need 5
-    ok = Split(0, D("2024-01-01"), D("2024-06-01"), D("2024-06-06"), D("2024-07-01"))
-    ok.validate(5)
+def every_split_boundary_lands_on_a_real_session():
+    """The calendar-arithmetic version ended training on Saturday 2024-06-29 and
+    opened testing on Thursday 2024-07-04, a market holiday. Laying the splits
+    out in session-index space makes that unrepresentable."""
+    known = set(FOUR_YEARS.sessions)
+    for s in make_splits(FOUR_YEARS):
+        for name in ("train_start", "train_end", "test_start", "test_end"):
+            day = getattr(s, name)
+            assert day in known, f"split {s.index}.{name} {day} is not a session"
+            assert day.weekday() < 5, f"split {s.index}.{name} {day} is a weekend"
+
+@test
+def purge_gap_is_counted_in_sessions_not_calendar_days():
+    """The rewritten version of purge_gap_prevents_label_horizon_bleed.
+
+    That test asserted a 5-CALENDAR-day gap was a sufficient purge for a
+    5-TRADING-day horizon, so the guard and the test proving the guard worked
+    shared one wrong assumption. Here the gap that used to pass is rejected,
+    and no holiday is needed to show it - an ordinary weekend is enough.
+    """
+    cal = _weekday_sessions("2024-03-01", "2024-04-30")
+    # Fri 2024-03-15 -> Fri 2024-03-22 is 7 calendar days, which comfortably
+    # cleared the old >= 5 check. It is 4 sessions: Mar 18, 19, 20, 21.
+    too_close = Split(0, S("2024-03-01"), S("2024-03-15"), S("2024-03-22"), S("2024-04-19"))
+    assert (too_close.test_start - too_close.train_end).days == 7
+    assert cal.sessions_strictly_between(too_close.train_end, too_close.test_start) == 4
+    assert_raises(LeakageError, too_close.validate, 5, cal)
+    # Mon 2024-03-25 is the sixth session after the 15th, so five whole sessions
+    # sit in the gap and the label decided on the 15th resolves on the 22nd.
+    ok = Split(0, S("2024-03-01"), S("2024-03-15"), S("2024-03-25"), S("2024-04-19"))
+    assert cal.sessions_strictly_between(ok.train_end, ok.test_start) == 5
+    ok.validate(5, cal)
+
+@test
+def thanksgiving_week_purge_that_calendar_arithmetic_called_safe():
+    """The headline regression, reproduced from the 2026-09-02 review.
+
+    train_end 2024-11-27 (Wed), test_start 2024-12-02 (Mon): exactly 5 calendar
+    days, so the old guard passed it. One of those days was a session - the
+    market was shut on the 28th and the weekend follows - so a label decided on
+    the 27th resolves on 2024-12-05, three sessions INSIDE the test window.
+    """
+    leaky = Split(0, S("2024-11-01"), S("2024-11-27"), S("2024-12-02"), S("2024-12-20"))
+    assert (leaky.test_start - leaky.train_end).days == 5, "the old guard's 5-day gap"
+    assert THANKSGIVING.sessions_strictly_between(leaky.train_end, leaky.test_start) == 1
+    assert_raises(LeakageError, leaky.validate, 5, THANKSGIVING)
+
+    # Where the label actually resolves: five sessions past 2024-11-27.
+    i = THANKSGIVING.index_of(S("2024-11-27"))
+    assert THANKSGIVING[i + 5].isoformat() == "2024-12-05"
+    # So the earliest honest test open is the session after that, and the one
+    # before it is still a leak.
+    Split(0, S("2024-11-01"), S("2024-11-27"), S("2024-12-06"), S("2024-12-20")).validate(5, THANKSGIVING)
+    still_leaky = Split(0, S("2024-11-01"), S("2024-11-27"), S("2024-12-05"), S("2024-12-20"))
+    assert_raises(LeakageError, still_leaky.validate, 5, THANKSGIVING)
+
+@test
+def a_purge_cannot_be_certified_outside_the_calendar():
+    """Sessions the calendar has never heard of must not be counted as zero and
+    reported as a violation, nor silently treated as a clean gap."""
+    s = Split(0, S("2019-01-02"), S("2019-06-03"), S("2019-06-14"), S("2019-07-01"))
+    assert_raises(LeakageError, s.validate, 5, THANKSGIVING)
+
+@test
+def a_day_the_market_was_shut_is_not_a_session():
+    assert_raises(LeakageError, THANKSGIVING.index_of, S("2024-11-28"))
+    assert THANKSGIVING.index_of(S("2024-11-29")) >= 0
+
+@test
+def a_session_date_is_read_in_new_york_not_utc():
+    """16:00 ET on the 27th is 21:00 UTC on the 27th, so a real bar timestamp
+    round-trips. A UTC-midnight instant is genuinely the evening before in New
+    York and resolves to the 27th, which is why nothing here builds a session
+    out of one."""
+    from backtest.walkforward import as_session_date
+    assert as_session_date(datetime.fromisoformat("2024-11-28T21:00:00+00:00")) == S("2024-11-28")
+    assert as_session_date(datetime.fromisoformat("2024-11-28T15:45:00-05:00")) == S("2024-11-28")
+    assert as_session_date(datetime.fromisoformat("2024-11-28T00:00:00+00:00")) == S("2024-11-27")
+    assert as_session_date("2024-11-28") == S("2024-11-28")
 
 @test
 def overlapping_train_test_rejected():
-    bad = Split(0, D("2024-01-01"), D("2024-07-01"), D("2024-06-01"), D("2024-08-01"))
-    assert_raises(LeakageError, bad.validate, 0)
+    bad = Split(0, S("2024-01-01"), S("2024-07-01"), S("2024-06-01"), S("2024-08-01"))
+    assert_raises(LeakageError, bad.validate, 0, FOUR_YEARS)
 
 @test
 def future_features_rejected():
@@ -44,7 +148,8 @@ def future_features_rejected():
 
 @test
 def too_short_range_raises_rather_than_silently_returning_nothing():
-    assert_raises(ValueError, make_splits, D("2026-01-01"), D("2026-02-01"))
+    short = _weekday_sessions("2026-01-01", "2026-02-01")
+    assert_raises(ValueError, make_splits, short)
 
 
 # ---------- costs ----------

@@ -25,6 +25,28 @@ jobs:
       - name: Run the test suite
         run: python run_tests.py
 
+  # Windows is the platform this project is actually USED on - run_gui.bat, the
+  # tzdata note in the README, the machine the workbooks are opened on. Running
+  # CI only on Linux missed a real defect: a test left a zipfile handle open,
+  # which Linux tolerates when deleting the file and Windows refuses, so
+  # shutil.rmtree raised PermissionError. It failed for the first time on a real
+  # Windows machine rather than in CI. This job closes that gap.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # tzdata is genuinely required here, not a convenience: Windows ships no
+      # IANA timezone database, so zoneinfo cannot resolve America/New_York and
+      # the label contract's 15:45 ET decision clock will not build. This is the
+      # same `pip install tzdata` the README tells a Windows user to run.
+      - name: Install what a Windows user actually needs
+        run: pip install tzdata openpyxl
+      - name: Run every suite
+        run: python run_tests.py
+
   excel:
     runs-on: ubuntu-latest
     steps:
