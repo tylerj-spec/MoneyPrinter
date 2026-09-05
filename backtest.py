@@ -87,6 +87,9 @@ def _plain(obj):
     if isinstance(obj, ICResult):
         return {"component": obj.component, "mean": obj.mean, "stdev": obj.stdev,
                 "hit_rate": obj.hit_rate, "t_stat": obj.t_stat,
+                "median_universe": obj.median_universe,
+                "universe_is_too_small": obj.universe_is_too_small,
+                "daily_readings": obj.daily_readings,
                 "per_fold": list(obj.per_fold)}
     if is_dataclass(obj) and not isinstance(obj, type):
         return {k: _plain(getattr(obj, k)) for k in obj.__dataclass_fields__}
@@ -177,18 +180,29 @@ def main(argv: list[str] | None = None) -> int:
           f"  test {splits[-1].test_start}..{splits[-1].test_end}")
 
     print("\n" + "-" * 78)
-    print("RANK IC PER COMPONENT - out of sample, one reading per test window")
+    print("CROSS-SECTIONAL RANK IC PER COMPONENT - out of sample")
     print("-" * 78)
-    print("Does the component's RANKING of instruments match the ranking of their")
-    print("forward excess returns? This is the measurement that justifies or")
-    print("retires a component on its own, rather than inside a blend.\n")
+    print("On each decision date the instruments are ranked by the component and")
+    print("by their forward excess return, and those rankings are correlated. The")
+    print("daily figures are averaged over each test window. It answers: on any")
+    print("given day, does this component pick which name will do better?\n")
     print(f"  {'component':<20} {'mean IC':>9} {'stdev':>8} {'sign held':>10} {'t':>7} {'folds':>6}")
     for r in study["rank_ic"]:
-        m, s, h, t = r.mean, r.stdev, r.hit_rate, r.t_stat
-        print(f"  {r.component:<20} {_num(m, '+.4f'):>9} {_num(s, '.4f'):>8} "
+        m, sd, h, t = r.mean, r.stdev, r.hit_rate, r.t_stat
+        print(f"  {r.component:<20} {_num(m, '+.4f'):>9} {_num(sd, '.4f'):>8} "
               f"{_pct(h):>10} {_num(t, '+.2f'):>7} {len(r.per_fold):>6}")
     print("\n  A mean IC whose sign does not hold across folds is not a weak edge.")
     print("  It is no edge, measured several times.")
+
+    thin = [r for r in study["rank_ic"] if r.universe_is_too_small]
+    if thin:
+        n = thin[0].median_universe
+        print(f"\n  *** READ THE NUMBERS ABOVE WITH THIS IN MIND: the universe is {n}")
+        print(f"      instrument(s) on a typical date. A rank correlation over {n} names")
+        print(f"      can only take a few distinct values, so each daily reading is")
+        print(f"      almost pure noise - and averaging noise produces a stable-looking")
+        print(f"      mean with a large t. Fetch 20+ tickers before treating any IC here")
+        print(f"      as a finding. This is a property of the DATA, not of the code.")
 
     print("\n" + "-" * 78)
     print("WALK-FORWARD RESULT PER VARIANT")
@@ -206,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     path.write_text(json.dumps({
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "kind": "signal_layer_walk_forward",
+        "ic_definition": "cross_sectional: ranked across instruments within each decision date, then averaged over the test window",
         "not_an_options_backtest": (
             "No historical option chains exist in this data. This measures the "
             "underlying forecast only; the options layer is tested forward."),

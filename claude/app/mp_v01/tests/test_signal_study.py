@@ -169,13 +169,18 @@ def a_fold_with_an_empty_half_is_dropped_rather_than_evaluated():
 # ---------- rank IC ----------
 @test
 def a_component_that_ranks_perfectly_reads_ic_one_and_a_reversed_one_reads_minus_one():
+    # Five instruments per date: a rank IC is a correlation ACROSS instruments
+    # within a date, so a one-instrument fixture cannot express one. The
+    # earlier version of this test used a single ticker and so was measuring
+    # the pooled statistic under the cross-sectional name.
     cal = _weekdays("2024-01-01", "2024-12-31")
     splits = make_splits(cal, train_sessions=20, test_sessions=10)
     obs = []
-    for i, d in enumerate(cal.sessions):
-        r = (i % 7) / 7.0 - 0.5
-        obs.append(Observation("X", d.isoformat(),
-                               {"aligned": r, "backwards": -r}, 1 if r > 0 else 0, r))
+    for d in cal.sessions:
+        for j, tk in enumerate("ABCDE"):
+            r = j / 4.0 - 0.5
+            obs.append(Observation(tk, d.isoformat(),
+                                   {"aligned": r, "backwards": -r}, 1 if r > 0 else 0, r))
     ic = {r.component: r for r in rank_ic_by_component(obs, splits, ["aligned", "backwards"])}
     assert abs(ic["aligned"].mean - 1.0) < 1e-9, ic["aligned"].mean
     assert abs(ic["backwards"].mean + 1.0) < 1e-9, ic["backwards"].mean
@@ -243,6 +248,80 @@ def every_variant_is_measured_on_the_same_folds():
                       train_sessions=120, test_sessions=30, n_permutations=10)
     counts = {v.variant: (v.n_train, v.n_test) for v in study["variants"]}
     assert len(set(counts.values())) == 1, counts
+
+
+@test
+def rank_ic_ranks_within_a_date_not_across_the_pooled_window():
+    """The cross-sectional IC asks "on this day, which name will do better?".
+
+    Pooling every (instrument, date) pair into one correlation asks something
+    else, and answers it badly: with a few names and thirty dates the ranking is
+    driven by which DATES had large excess moves, so a market-wide selloff reads
+    as signal. This fixture has NO cross-sectional information - within every
+    date the feature ordering is unrelated to the outcome ordering - but a
+    strong pooled one, because feature and outcome both rise with time.
+    """
+    cal = _weekdays("2024-01-01", "2024-06-28")
+    obs = []
+    for i, d in enumerate(cal.sessions):
+        for j, tk in enumerate(("A", "B", "C", "D", "E")):
+            # Feature and outcome both climb with the DATE; within a date the
+            # feature ordering (j) is the reverse of the outcome ordering.
+            obs.append(Observation(tk, d.isoformat(), {"f": i + j * 0.01},
+                                   1, i * 0.01 - j * 0.001))
+    splits = make_splits(cal, train_sessions=40, test_sessions=20,
+                         label_horizon_sessions=5, embargo_sessions=2)
+    xs = rank_ic_by_component(obs, splits, ["f"])[0]
+    pooled = rank_ic_by_component(obs, splits, ["f"], cross_sectional=False)[0]
+    assert xs.mean < -0.9, f"within a date the feature is backwards; got {xs.mean}"
+    assert pooled.mean > 0.9, f"pooled, the time trend dominates; got {pooled.mean}"
+
+@test
+def a_universe_too_thin_for_a_cross_section_says_so():
+    """Three names give a daily rank correlation only a handful of reachable
+    values, so its average looks stable and means nothing. The result has to
+    carry that, or a large t gets read as a finding."""
+    cal = _weekdays("2024-01-01", "2024-06-28")
+    thin = [Observation(tk, d.isoformat(), {"f": float(j)}, 1, float(j))
+            for d in cal.sessions for j, tk in enumerate(("A", "B", "C"))]
+    wide = [Observation(tk, d.isoformat(), {"f": float(j)}, 1, float(j))
+            for d in cal.sessions for j, tk in enumerate("ABCDEFGH")]
+    splits = make_splits(cal, train_sessions=40, test_sessions=20,
+                         label_horizon_sessions=5, embargo_sessions=2)
+    assert rank_ic_by_component(thin, splits, ["f"])[0].universe_is_too_small
+    assert rank_ic_by_component(thin, splits, ["f"])[0].median_universe == 3
+    assert not rank_ic_by_component(wide, splits, ["f"])[0].universe_is_too_small
+
+@test
+def the_study_finds_a_signal_that_is_genuinely_there():
+    """The mirror of the noise test, and just as load-bearing.
+
+    An instrument that reads NO_EDGE on everything is as useless as one that
+    reads SIGNAL_CANDIDATE on everything - it is only trustworthy if it does
+    both. Here the feature carries the label with added noise, so a procedure
+    that cannot find it cannot find anything.
+    """
+    class V:
+        name, description = "planted", "the feature carries the label"
+        weights = {"a": 1.0}
+        def normalised_weights(self): return dict(self.weights)
+
+    rng = random.Random(31)
+    cal = _weekdays("2023-01-02", "2025-06-30")
+    obs = []
+    for d in cal.sessions:
+        for tk in ("A", "B", "C", "D", "E"):
+            y = rng.randint(0, 1)
+            # Separated means, heavily overlapping - a real but noisy signal.
+            obs.append(Observation(tk, d.isoformat(),
+                                   {"a": rng.gauss(0.6 if y else -0.6, 1.0)},
+                                   y, (0.01 if y else -0.01) + rng.gauss(0, 0.005)))
+    study = run_study(obs, cal, [V()], train_sessions=120, test_sessions=30,
+                      n_permutations=40, seed=5)
+    rep = study["variants"][0].report
+    assert "SIGNAL_CANDIDATE" in rep.verdict(), rep.render()
+    assert rep.accuracy > rep.majority_class_rate, rep.render()
+    assert rep.z_vs_noise > 2, rep.render()
 
 
 if __name__ == "__main__":

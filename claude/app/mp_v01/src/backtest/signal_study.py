@@ -233,6 +233,25 @@ def spearman(xs: Sequence[float], ys: Sequence[float]) -> float | None:
 class ICResult:
     component: str
     per_fold: list[float] = field(default_factory=list)
+    # How the number was actually built, carried alongside it so a reader can
+    # tell whether it means anything. A cross-sectional IC over three names is
+    # arithmetic, not evidence, and only these fields reveal that.
+    daily_readings: int = 0
+    instruments_per_date: list[int] = field(default_factory=list)
+
+    @property
+    def median_universe(self) -> int | None:
+        if not self.instruments_per_date:
+            return None
+        s = sorted(self.instruments_per_date)
+        return s[len(s) // 2]
+
+    @property
+    def universe_is_too_small(self) -> bool:
+        """Below five names a daily rank correlation has too few distinct
+        values to carry information, however stable its average looks."""
+        m = self.median_universe
+        return m is not None and m < 5
 
     @property
     def mean(self) -> float | None:
@@ -274,19 +293,65 @@ class ICResult:
 
 def rank_ic_by_component(observations: Sequence[Observation],
                          splits: Sequence[Split],
-                         components: Sequence[str]) -> list[ICResult]:
-    """Out-of-sample rank IC per component, one reading per test window."""
+                         components: Sequence[str],
+                         *, cross_sectional: bool = True) -> list[ICResult]:
+    """Out-of-sample rank IC per component, one reading per test window.
+
+    TWO DIFFERENT STATISTICS WEAR THIS NAME, AND THEY ARE NOT INTERCHANGEABLE.
+
+    CROSS-SECTIONAL (the default, and what "rank IC" means in the literature):
+    on each decision date, rank the instruments by the component and by their
+    forward excess return, correlate those two rankings, then average the daily
+    figures over the test window. It answers "on any given day, does this
+    component pick which name will do better?" - which is the question a
+    portfolio built from it would actually be asking.
+
+    POOLED: throw every (instrument, date) pair in the window into one
+    correlation. This is what the first version of this function did, and it is
+    a DIFFERENT question, badly posed: with a handful of instruments and thirty
+    dates, the ranking is dominated by which DATES had large excess moves rather
+    than which instruments led on a given date. A market-wide selloff shows up
+    as signal. It is kept behind the flag only so the two can be compared.
+
+    THE UNIVERSE SIZE IS THE BINDING CONSTRAINT, and the caller must look at it.
+    A cross-sectional correlation over three names can only take a handful of
+    values, so its per-date reading is almost pure noise even when the average
+    over many dates is stable. `instruments_per_date` on the result exists so
+    that fact cannot be read past.
+    """
     results = {c: ICResult(c) for c in components}
     for sp in splits:
         test = [o for o in observations
                 if sp.test_start.isoformat() <= o.decision_date <= sp.test_end.isoformat()]
         if len(test) < 3:
             continue
-        forward = [o.excess_log_return for o in test]
+
+        if not cross_sectional:
+            forward = [o.excess_log_return for o in test]
+            for c in components:
+                ic = spearman([o.features[c] for o in test], forward)
+                if ic is not None:
+                    results[c].per_fold.append(ic)
+            continue
+
+        by_date: dict[str, list[Observation]] = {}
+        for o in test:
+            by_date.setdefault(o.decision_date, []).append(o)
+        widths = sorted(len(v) for v in by_date.values())
         for c in components:
-            ic = spearman([o.features[c] for o in test], forward)
-            if ic is not None:
-                results[c].per_fold.append(ic)
+            daily = []
+            for day in sorted(by_date):
+                rows = by_date[day]
+                if len(rows) < 3:        # a correlation over two points is 1 or -1
+                    continue
+                ic = spearman([o.features[c] for o in rows],
+                              [o.excess_log_return for o in rows])
+                if ic is not None:
+                    daily.append(ic)
+            if daily:
+                results[c].per_fold.append(sum(daily) / len(daily))
+                results[c].daily_readings += len(daily)
+                results[c].instruments_per_date.append(widths[len(widths) // 2])
     return [results[c] for c in components]
 
 

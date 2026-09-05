@@ -344,6 +344,8 @@ def backtest_section(bt: dict | None, path: Path | None) -> str:
         })
     ic = [{"component": r.get("component"), "mean": r.get("mean"), "stdev": r.get("stdev"),
            "hit_rate": r.get("hit_rate"), "t": r.get("t_stat"),
+           "universe": r.get("median_universe"),
+           "thin": bool(r.get("universe_is_too_small")),
            "folds": len(r.get("per_fold") or [])} for r in (bt.get("rank_ic") or [])]
 
     s = bt.get("settings", {})
@@ -386,18 +388,33 @@ def backtest_section(bt: dict | None, path: Path | None) -> str:
                    f'<td>{verdict_chip(v["verdict"])}</td></tr>')
     out.append("</tbody></table></div></div>")
 
-    out.append('<div class="card" style="margin-top:12px"><h3>Rank IC per component</h3>'
-               '<p class="sub">Does the component&rsquo;s ranking of instruments match the ranking '
-               'of their forward excess returns? Measured out of sample, once per test window. This '
-               'is what justifies or retires a component on its own rather than inside a blend.</p>'
-               + ic_chart(ic))
+    out.append('<div class="card" style="margin-top:12px">'
+               '<h3>Cross-sectional rank IC per component</h3>'
+               '<p class="sub">On each decision date the instruments are ranked by the component '
+               'and by their forward excess return, and those two rankings are correlated; the '
+               'daily figures are averaged over each test window. It asks: on any given day, does '
+               'this component pick which name will do better?</p>')
+    thin = next((r for r in ic if r["thin"]), None)
+    if thin:
+        n = thin["universe"]
+        out.append(
+            f'<div class="note" style="margin:10px 0"><b>Read every number below with this '
+            f'in mind: the universe is {n} instrument(s) on a typical date.</b> A rank '
+            f'correlation over {n} names can only take a handful of distinct values, so each '
+            f'daily reading is close to pure noise &mdash; and averaging noise produces a '
+            f'stable-looking mean with a large t. Fetch 20+ tickers before treating anything '
+            f'here as a finding. This is a property of the data, not of the code.</div>')
+    out.append(ic_chart(ic))
     out.append('<div class="scroll" style="margin-top:12px"><table><thead><tr><th>Component</th>'
                '<th>Mean IC</th><th>Std dev</th><th>Sign held</th><th>t</th><th>Folds</th>'
-               '</tr></thead><tbody>')
+               '<th>Names/date</th></tr></thead><tbody>')
     for r in ic:
+        flag = ' <span class="chip warn">THIN</span>' if r["thin"] else ""
+        uni = esc(r["universe"]) if r["universe"] is not None else "&mdash;"
         out.append(f'<tr><td>{esc(r["component"])}</td><td>{num(r["mean"], "+.4f")}</td>'
                    f'<td>{num(r["stdev"], ".4f")}</td><td>{num(r["hit_rate"], ".0%")}</td>'
-                   f'<td>{num(r["t"], "+.2f")}</td><td>{r["folds"]}</td></tr>')
+                   f'<td>{num(r["t"], "+.2f")}</td><td>{r["folds"]}</td>'
+                   f'<td>{uni}{flag}</td></tr>')
     out.append('</tbody></table></div><p class="sub" style="margin-top:10px">A mean IC whose sign '
                'does not hold across folds is not a weak edge. It is no edge, measured several '
                'times. The t column assumes folds are independent, which they are not &mdash; '
@@ -515,8 +532,8 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(a.out).expanduser().resolve()
     out.write_text(render(picks, pp if picks else None, bt, bp if bt else None), encoding="utf-8")
 
-    print(f"Picks    : {pp if picks else 'none found — run generate_picks.py'}")
-    print(f"Backtest : {bp if bt else 'none found — run backtest.py'}")
+    print(f"Picks    : {pp if picks else 'none found - run generate_picks.py'}")
+    print(f"Backtest : {bp if bt else 'none found - run backtest.py'}")
     print(f"Written  : {out}")
     print("\nOne file, no external assets. Copy it anywhere and it still renders.")
     if a.open:

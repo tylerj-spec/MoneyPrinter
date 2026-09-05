@@ -1003,8 +1003,34 @@ def _write_simple(ws, columns, rows) -> None:
     _finish(ws, columns, len(rows))
 
 
-def write_workbook(data: dict[str, Any], out_path: Path) -> Path:
-    """Render collected data to .xlsx. Requires openpyxl; nothing else does."""
+DATA_SECTIONS = "data"      # bars, labels, option chains - the audit trail
+PICK_SECTIONS = "picks"     # the pick record and its outcomes
+ALL_SECTIONS = "all"
+
+
+def write_workbook(data: dict[str, Any], out_path: Path,
+                   sections: str = ALL_SECTIONS) -> Path:
+    """Render collected data to .xlsx. Requires openpyxl; nothing else does.
+
+    `sections` splits the workbook by what it is FOR, because the two halves are
+    read on different schedules and at different sizes. The data half is the
+    audit trail - thousands of bar rows you sort and check arithmetic against,
+    rebuilt whenever you fetch. The picks half is the record - a few dozen rows
+    you revisit as outcomes resolve, and which grows one run at a time.
+
+    Writing both into one file every time meant a pick run rebuilt megabytes of
+    bar sheets to append four rows, and left the picks buried behind twelve
+    sheets of prices. They are separate files now, and separate folders.
+
+    Both keep the README, because a workbook that cannot say what its own
+    columns mean is a liability rather than an audit trail.
+    """
+    if sections not in (ALL_SECTIONS, DATA_SECTIONS, PICK_SECTIONS):
+        raise ValueError(f"sections must be one of "
+                         f"{ALL_SECTIONS!r}, {DATA_SECTIONS!r}, {PICK_SECTIONS!r}; "
+                         f"got {sections!r}")
+    want_data = sections in (ALL_SECTIONS, DATA_SECTIONS)
+    want_picks = sections in (ALL_SECTIONS, PICK_SECTIONS)
     try:
         from openpyxl import Workbook
     except ImportError as e:  # pragma: no cover - depends on the local machine
@@ -1020,15 +1046,16 @@ def write_workbook(data: dict[str, Any], out_path: Path) -> Path:
 
     _write_summary(wb.create_sheet("Summary"), data["summaries"])
 
-    for ticker in sorted(data["rows"]):
-        _write_bars(wb.create_sheet(_sheet_name("Bars_", ticker)), data["rows"][ticker])
+    if want_data:
+        for ticker in sorted(data["rows"]):
+            _write_bars(wb.create_sheet(_sheet_name("Bars_", ticker)), data["rows"][ticker])
 
-    all_labels: list[dict[str, Any]] = []
-    for ticker in sorted(data["labels"]):
-        all_labels.extend(data["labels"][ticker])
-    _write_labels(wb.create_sheet("Labels"), all_labels)
+        all_labels: list[dict[str, Any]] = []
+        for ticker in sorted(data["labels"]):
+            all_labels.extend(data["labels"][ticker])
+        _write_labels(wb.create_sheet("Labels"), all_labels)
 
-    if data.get("options"):
+    if want_data and data.get("options"):
         _write_options_summary(wb.create_sheet("Options_Summary"),
                                data.get("option_summaries", []))
         for ticker in sorted(data["options"]):
@@ -1036,7 +1063,7 @@ def write_workbook(data: dict[str, Any], out_path: Path) -> Path:
                            data["options"][ticker])
 
     hist = data.get("pick_history") or {}
-    if hist.get("outcomes") or hist.get("abstentions"):
+    if want_picks and (hist.get("outcomes") or hist.get("abstentions")):
         _write_pick_history(wb.create_sheet("Pick_History"), hist.get("outcomes", []))
         _write_pick_justifications(wb.create_sheet("Pick_Justifications"),
                                    hist.get("rationales", []))
@@ -1069,6 +1096,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="comma-separated subset; default is everything in the store")
     ap.add_argument("--picks-dir", default=str(DEFAULT_PICKS_DIR),
                     help="frozen pick files to build the history sheets from")
+    ap.add_argument("--sections", default=ALL_SECTIONS,
+                    choices=[ALL_SECTIONS, DATA_SECTIONS, PICK_SECTIONS],
+                    help="which half of the workbook to write: 'data' is the "
+                         "audit trail (bars, labels, chains), 'picks' is the "
+                         "pick record and its outcomes, 'all' is both")
     ap.add_argument("--risk-free-rate", type=float, default=DEFAULT_RISK_FREE_RATE,
                     help=f"annualised, for option pricing (default {DEFAULT_RISK_FREE_RATE}). "
                          f"An assumption, not observed data.")
@@ -1112,7 +1144,7 @@ def main(argv: list[str] | None = None) -> int:
         res = sum(1 for o in hist["outcomes"] if o["status"] == "RESOLVED")
         op = sum(1 for o in hist["outcomes"] if o["status"] == "OPEN")
         print(f"\n  Pick history: {len(hist['outcomes'])} picks across "
-              f"{len(hist['files'])} run(s) — {res} resolved, {op} still open")
+              f"{len(hist['files'])} run(s) - {res} resolved, {op} still open")
         for row in hist.get("performance", []):
             hr = f"{row['direction_hit_rate']:.0%}" if row["direction_hit_rate"] is not None else "n/a"
             mr = f"{row['mean_return_on_premium']:+.1%}" if row["mean_return_on_premium"] is not None else "n/a"
@@ -1125,7 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Nothing was substituted. Re-fetch including {BENCHMARK}.")
 
     out_path = Path(a.out).expanduser() if a.out else default_out_path(DEFAULT_OUT_DIR)
-    written = write_workbook(data, out_path.resolve())
+    written = write_workbook(data, out_path.resolve(), sections=a.sections)
 
     print(f"\nWorkbook written: {written}")
     print("Every export is a new timestamped file, so edits you make are never overwritten.")
