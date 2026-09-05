@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from adapters.yahoo_daily import (normalize_bars, fetch_daily_bars_yfinance,  # noqa: E402
-                                  check_split_adjustment)
+                                  check_split_adjustment, normalize_option_row)
 
 UNIVERSE = ["SPY", "QQQ", "MSFT"]          # approved first slice (INDEX_PLUS_ONE)
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_store")
@@ -112,24 +112,20 @@ def snapshot_chains(tickers: list[str]) -> int:
         try:
             tk = yf.Ticker(t)
             expiries = list(tk.options or [])[:6]      # nearest 6 expiries
-            blocks = []
+            blocks, skipped = [], 0
             for exp in expiries:
                 ch = tk.option_chain(exp)
                 for side, df in (("CALL", ch.calls), ("PUT", ch.puts)):
                     for _, r in df.iterrows():
-                        bid, ask = float(r.get("bid", 0) or 0), float(r.get("ask", 0) or 0)
-                        usable = bid > 0 and ask > 0 and ask >= bid
-                        blocks.append({
-                            "type": side, "expiration": exp,
-                            "strike": float(r.get("strike", 0) or 0),
-                            "bid": bid if usable else None,
-                            "ask": ask if usable else None,
-                            "mid": round((bid + ask) / 2, 4) if usable else None,
-                            "volume": int(r.get("volume") or 0),
-                            "open_interest": int(r.get("openInterest") or 0),
-                            "implied_volatility": float(r.get("impliedVolatility") or 0) or None,
-                            "status": "OK" if usable else "UNKNOWN",
-                        })
+                        # Per ROW, not per ticker. One malformed contract used to
+                        # abort the whole chain - which is exactly what happened:
+                        # a NaN volume raised, and four tickers snapshotted zero
+                        # contracts while the bars beside them succeeded.
+                        try:
+                            blocks.append(normalize_option_row(
+                                r, side=side, expiration=exp))
+                        except Exception:
+                            skipped += 1
         except Exception as e:
             print(f"FAILED: {type(e).__name__}: {e}")
             continue
@@ -146,11 +142,13 @@ def snapshot_chains(tickers: list[str]) -> int:
                 "expiries": expiries,
                 "contract_count": len(blocks),
                 "usable_quotes": ok,
+                "unreadable_rows": skipped,
                 "note": ("Observed snapshot, not a vendor reconstruction. "
                          "available_time is the true observation moment."),
                 "contracts": blocks,
-            }, f, indent=2)
-        print(f"{len(blocks)} contracts, {ok} usable -> {os.path.basename(path)}")
+            }, f, indent=2, allow_nan=False)
+        note = f", {skipped} unreadable" if skipped else ""
+        print(f"{len(blocks)} contracts, {ok} usable{note} -> {os.path.basename(path)}")
         total += len(blocks)
     return total
 
@@ -160,8 +158,10 @@ def main() -> int:
     ap.add_argument("--start", default="2019-01-01")
     ap.add_argument("--end", default=datetime.now().strftime("%Y-%m-%d"))
     ap.add_argument("--tickers", default=",".join(UNIVERSE))
-    ap.add_argument("--chains", action="store_true",
-                    help="also snapshot today's option chains (run daily to accumulate history)")
+    ap.add_argument("--chains", action=argparse.BooleanOptionalAction, default=True,
+                    help="snapshot today's option chains as well as bars (default: yes). "
+                         "--no-chains fetches bars only. Yahoo has no HISTORICAL chains, "
+                         "so a snapshot missed today cannot be taken later at any price.")
     a = ap.parse_args()
     tickers = [t.strip().upper() for t in a.tickers.split(",") if t.strip()]
 

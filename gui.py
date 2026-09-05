@@ -148,11 +148,11 @@ class MoneyPrinterGUI(tk.Tk):
         self.tickers_var = tk.StringVar(value=saved.get("tickers", "SPY,QQQ,MSFT"))
         self.start_var = tk.StringVar(value=saved.get("start", "2019-01-01"))
         self.end_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
-        # Default ON. Off, step 1 succeeds and step 3 then correctly refuses for
-        # want of a chain - a setup whose failure surfaces two steps from its
-        # cause. Chains are what the picks are FOR; the slower fetch is the
-        # cheaper mistake.
-        self.chains_var = tk.BooleanVar(value=bool(saved.get("chains", True)))
+        # No longer a setting. Chains ARE what this app is for, and a checkbox
+        # that can be left off produces a run which looks successful and then
+        # fails two steps later - which it did, twice, to the same user. Bars
+        # without a chain cannot make a pick, and Yahoo has no historical
+        # chains, so a snapshot not taken today is gone for good.
         self.outdir_var = tk.StringVar(value=saved.get("outdir", str(DEFAULT_OUT_DIR)))
         self.picksdir_var = tk.StringVar(
             value=saved.get("picks_outdir", str(DEFAULT_PICKS_OUT_DIR)))
@@ -208,8 +208,8 @@ class MoneyPrinterGUI(tk.Tk):
         ttk.Entry(row, textvariable=self.start_var, width=12).pack(side=tk.LEFT, padx=(6, 16))
         ttk.Label(row, text="End").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.end_var, width=12).pack(side=tk.LEFT, padx=(6, 16))
-        ttk.Checkbutton(row, text="also snapshot option chains (needed for Greeks and picks)",
-                        variable=self.chains_var).pack(side=tk.LEFT)
+        ttk.Label(row, text="option chains snapshotted automatically",
+                  foreground="#777777").pack(side=tk.LEFT)
 
         ttk.Label(
             box,
@@ -403,7 +403,6 @@ class MoneyPrinterGUI(tk.Tk):
             SETTINGS_FILE.write_text(json.dumps({
                 "tickers": self.tickers_var.get(),
                 "start": self.start_var.get(),
-                "chains": self.chains_var.get(),
                 "outdir": self.outdir_var.get(),
                 "picks_outdir": self.picksdir_var.get(),
                 "mie_tickers": self.mie_tickers_var.get(),
@@ -466,28 +465,20 @@ class MoneyPrinterGUI(tk.Tk):
         self._start_time = None
         self._log(f"\n<process exited {code}>\n", "info")
 
-        # A step that fails for want of a chain has a one-click fix, and saying
-        # so here is the difference between a bug report and a re-run. The
-        # underlying script already explains itself; what it cannot do is tick
-        # the box or press the button, so the GUI offers to.
+        # A step that fails for want of a chain still names its own fix, but
+        # there is no box to tick any more: step 1 always snapshots chains, so
+        # a missing one means the snapshot FAILED rather than that it was
+        # skipped, and the console line above it says why.
         if code != 0 and self._saw_missing_chain:
             self._saw_missing_chain = False
-            if not self.chains_var.get():
-                self.chains_var.set(True)
-                self._save_settings()
-                self._log(
-                    "\nThe data store has bars but no option chain snapshots, which is\n"
-                    "why this step stopped. 'also snapshot option chains' was OFF in\n"
-                    "step 1; it has now been TICKED FOR YOU.\n\n"
-                    "Press '1 - Fetch market data' again, then this step. Yahoo has no\n"
-                    "historical chains, so a snapshot can only ever be taken today -\n"
-                    "which is also why running step 1 daily is worth doing.\n", "warning")
-            else:
-                self._log(
-                    "\nThe data store has bars but no option chain snapshots. The box is\n"
-                    "ticked, so the last fetch should have taken them - re-run step 1 and\n"
-                    "watch for a 'chains' line per ticker. If none appears, run\n"
-                    "'Check setup' and send me what it prints.\n", "warning")
+            self._log(
+                "\nThe data store has bars but no option chain snapshots, which is why\n"
+                "this step stopped. Step 1 always snapshots chains, so this means the\n"
+                "snapshot FAILED rather than that it was skipped - scroll up to the\n"
+                "'Option chain snapshots' lines from your last fetch and read the\n"
+                "reason beside each ticker.\n\n"
+                "Run step 1 again, then this step. A chain can only ever be snapshotted\n"
+                "today; Yahoo keeps no history, so a day missed is a day gone.\n", "warning")
 
         if code == 0 and self._pending_dashboard is not None:
             page = self._pending_dashboard
@@ -535,8 +526,7 @@ class MoneyPrinterGUI(tk.Tk):
 
         args = [FETCH_SCRIPT, "--tickers", ",".join(tickers),
                 "--start", self.start_var.get().strip(), "--end", self.end_var.get().strip()]
-        if self.chains_var.get():
-            args.append("--chains")
+
 
         self._banner("Fetching daily bars from Yahoo (free, no API key)")
         self._log("Needs yfinance:  pip install yfinance\n"

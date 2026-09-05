@@ -3,7 +3,7 @@ import sys, os, random
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 from harness import test, assert_raises, run_all
-from adapters.yahoo_daily import (check_split_adjustment, normalize_bars, bar_available_time, bar_event_time,
+from adapters.yahoo_daily import (check_split_adjustment, normalize_option_row, normalize_bars, bar_available_time, bar_event_time,
                                   daily_total_return)
 from backtest.evaluate import Fold, block_permute, evaluate_walk_forward
 from backtest.walkforward import LeakageError
@@ -54,6 +54,73 @@ def nothing_is_interpolated_or_carried_forward():
     out = normalize_bars(rows, "SPY")
     assert all(r["daily_total_return"] is None for r in out[1:])
     assert all(r["status"] == "UNKNOWN" for r in out[1:])
+
+# ---------- option chain rows ----------
+@test
+def a_nan_volume_does_not_abort_the_contract():
+    """The bug that snapshotted zero contracts for all four tickers on a live run.
+
+    Yahoo reports NaN volume and open interest on illiquid contracts routinely.
+    The old code wrote `int(row.get("volume") or 0)`, and NaN is TRUTHY - so
+    `NaN or 0` is NaN and int(NaN) raises. The raise escaped a try that wrapped
+    the entire ticker, so one unquoted contract discarded a whole chain.
+    """
+    nan = float("nan")
+    row = {"contractSymbol": "SPY261016C00450000", "strike": 450.0,
+           "bid": nan, "ask": nan, "volume": nan, "openInterest": nan,
+           "impliedVolatility": nan}
+    out = normalize_option_row(row, side="CALL", expiration="2026-10-16")
+    assert out["volume"] is None and out["open_interest"] is None, out
+    assert out["bid"] is None and out["ask"] is None and out["mid"] is None, out
+    assert out["implied_volatility"] is None, out
+    assert out["status"] == "UNKNOWN", out
+    assert out["strike"] == 450.0, "a real strike survives an unquoted contract"
+
+@test
+def a_missing_count_is_unknown_rather_than_zero():
+    """Calling an unreported volume zero invents an observation. The liquidity
+    screen treats missing as failing, so nothing is loosened by refusing to."""
+    live = normalize_option_row({"strike": 100.0, "bid": 1.0, "ask": 1.1,
+                                 "volume": 0, "openInterest": 0},
+                                side="PUT", expiration="2026-10-16")
+    assert live["volume"] == 0 and live["open_interest"] == 0, "a real zero is a zero"
+    absent = normalize_option_row({"strike": 100.0, "bid": 1.0, "ask": 1.1},
+                                  side="PUT", expiration="2026-10-16")
+    assert absent["volume"] is None and absent["open_interest"] is None, absent
+
+@test
+def a_quoted_contract_survives_the_normaliser_intact():
+    out = normalize_option_row(
+        {"contractSymbol": "X", "strike": 100.0, "bid": 2.00, "ask": 2.10,
+         "volume": 350, "openInterest": 4200, "impliedVolatility": 0.2841},
+        side="CALL", expiration="2026-10-16")
+    assert out["status"] == "OK" and out["mid"] == 2.05, out
+    assert out["volume"] == 350 and out["open_interest"] == 4200
+    assert abs(out["implied_volatility"] - 0.2841) < 1e-12
+
+@test
+def a_crossed_or_zero_quote_is_unusable_but_still_recorded():
+    """A contract nobody is quoting is an observation about liquidity, not a
+    row to drop - the abstention reasons are built from these."""
+    for bid, ask in ((0.0, 0.0), (2.10, 2.00), (-1.0, 2.0)):
+        out = normalize_option_row({"strike": 100.0, "bid": bid, "ask": ask},
+                                   side="CALL", expiration="2026-10-16")
+        assert out["status"] == "UNKNOWN", (bid, ask, out)
+        assert out["mid"] is None, (bid, ask, out)
+
+@test
+def every_normalised_row_is_valid_json():
+    """NaN is not valid JSON. A chain file carrying one is readable by Python
+    and rejected by everything else, which is the worst of both."""
+    import json
+    nan = float("nan")
+    rows = [normalize_option_row({"strike": s, "bid": nan, "ask": nan,
+                                  "volume": nan, "openInterest": nan,
+                                  "impliedVolatility": nan},
+                                 side="CALL", expiration="2026-10-16")
+            for s in (90.0, 100.0, nan)]
+    json.dumps(rows, allow_nan=False)      # raises if any NaN survived
+
 
 # ---------- split-adjustment guard (section 3.1 of the 2026-09-02 review) ----------
 # The shape of NVDA's real 10-for-1 split, effective 2024-06-10. The adjusted

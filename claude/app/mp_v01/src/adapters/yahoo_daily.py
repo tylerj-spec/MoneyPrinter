@@ -285,6 +285,75 @@ def normalize_bars(raw_rows: list[dict[str, Any]], ticker: str,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Option chain rows
+# ---------------------------------------------------------------------------
+# Lives here, pure, for the same reason normalize_bars() does: the correctness
+# is testable offline against fixtures, and only the fetching needs a network.
+# It was previously inline in fetch_data.py, where it could not be tested and
+# where a single malformed row aborted an entire ticker's chain.
+
+def _finite(value: Any) -> float | None:
+    """A real number, or None. NaN and non-numerics become None.
+
+    `x != x` is true only for NaN under IEEE 754, and that holds for every
+    numeric type likely to arrive here - float, numpy scalars, pandas NA - so
+    it catches NaN without an isinstance check that numpy.float32 would slip
+    past.
+
+    The trap this exists for: NaN is TRUTHY, so the natural-looking
+    `float(row.get("volume") or 0)` evaluates to NaN rather than 0, and the
+    int() of that raises. Yahoo returns NaN volume and open interest on
+    illiquid contracts routinely, so that is not an edge case, it is Tuesday.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def _count(value: Any) -> int | None:
+    """A non-negative whole count, or None when it was not reported.
+
+    None rather than 0: a contract Yahoo declines to report volume for has
+    UNKNOWN volume, and calling that zero is inventing an observation. The
+    liquidity screen treats missing as failing, so nothing is loosened by it.
+    """
+    f = _finite(value)
+    return int(f) if f is not None and f >= 0 else None
+
+
+def normalize_option_row(row: Any, *, side: str, expiration: str) -> dict[str, Any]:
+    """One contract from a Yahoo chain, with every number coerced or refused.
+
+    `row` is anything with .get() - a pandas Series or a plain dict - so the
+    tests do not need pandas.
+    """
+    get = row.get
+    strike = _finite(get("strike"))
+    bid, ask = _finite(get("bid")), _finite(get("ask"))
+    usable = (bid is not None and ask is not None
+              and bid > 0 and ask > 0 and ask >= bid and strike is not None)
+    return {
+        "contract_symbol": get("contractSymbol") or None,
+        "type": side,
+        "expiration": expiration,
+        "strike": strike,
+        "bid": bid if usable else None,
+        "ask": ask if usable else None,
+        "mid": round((bid + ask) / 2, 4) if usable else None,
+        "volume": _count(get("volume")),
+        "open_interest": _count(get("openInterest")),
+        # Yahoo's own IV, kept for comparison only. The Greeks are solved from
+        # the quote in options/greeks.py rather than trusting this field.
+        "implied_volatility": _finite(get("impliedVolatility")) or None,
+        "status": "OK" if usable else "UNKNOWN",
+    }
+
+
 def fetch_daily_bars_yfinance(ticker: str, start: str, end: str) -> list[dict[str, Any]]:
     """
     Live fetch. Requires network + `pip install yfinance`. Run on Tyler's machine.

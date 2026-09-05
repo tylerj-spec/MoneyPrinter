@@ -161,12 +161,20 @@ def the_missing_chain_marker_matches_what_generate_picks_actually_prints():
         f"in generate_picks.py, so the GUI will stop offering the fix")
 
 @test
-def option_chains_are_fetched_by_default():
-    """Off by default, step 1 succeeds and step 3 refuses two steps later for
-    want of a chain - a failure that surfaces nowhere near its cause, and the
-    exact shape of the first bug reported against this app."""
-    src = (ROOT / "gui.py").read_text(encoding="utf-8")
-    assert 'saved.get("chains", True)' in src, "the chains checkbox must default to on"
+def option_chains_are_not_optional():
+    """There is no chains setting any more, in either surface.
+
+    A checkbox that can be left off produced a run which looked successful and
+    then failed two steps later - twice, to the same user. Bars without a chain
+    cannot make a pick, and Yahoo keeps no historical chains, so a snapshot not
+    taken today is gone. The GUI must not offer the choice, and fetch_data must
+    default to taking them.
+    """
+    gui_src = (ROOT / "gui.py").read_text(encoding="utf-8")
+    assert "chains_var" not in gui_src, "the chains checkbox must be gone entirely"
+    fetch_src = (ROOT / "claude/app/mp_v01/fetch_data.py").read_text(encoding="utf-8")
+    assert "BooleanOptionalAction" in fetch_src and "default=True" in fetch_src, (
+        "fetch_data.py must snapshot chains unless --no-chains is passed")
 
 @test
 def the_picks_workbook_has_a_folder_of_its_own():
