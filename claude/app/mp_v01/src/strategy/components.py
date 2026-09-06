@@ -20,17 +20,50 @@ propagates all the way to an abstention, never to a zero.
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from typing import Any, Sequence
 
+from labels.contract import decision_time_utc_for
 
-def slice_available(bars: Sequence[dict[str, Any]], decision_date: str) -> list[dict[str, Any]]:
+
+def _aware_time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return dt if dt.tzinfo is not None else None
+
+
+def slice_available(bars: Sequence[dict[str, Any]], decision_date: str,
+                    decision_time: datetime | str | None = None) -> list[dict[str, Any]]:
     """Bars a decision on `decision_date` may legitimately see.
 
-    Strictly before the decision date. Including the decision day's own bar
-    would be one full day of lookahead in every component below.
+    A record must be both from before the decision date and consumable by the
+    decision timestamp. Missing or naive availability timestamps fail closed.
+    Legacy rows without availability metadata remain usable only when their bar
+    date is strictly earlier; adapters already enforce the conservative daily
+    availability lag for newly fetched rows.
     """
-    return [b for b in bars
-            if b.get("date") and b["date"] < decision_date and b.get("close") is not None]
+    cutoff = _aware_time(decision_time) if decision_time is not None \
+        else decision_time_utc_for(decision_date)
+    if cutoff is None:
+        raise ValueError("decision_time must be timezone-aware")
+    out = []
+    for bar in bars:
+        if not bar.get("date") or bar["date"] >= decision_date or bar.get("close") is None:
+            continue
+        raw_available = bar.get("available_time")
+        if raw_available is not None:
+            available = _aware_time(raw_available)
+            if available is None or available > cutoff:
+                continue
+        out.append(bar)
+    return out
 
 
 def _closes(bars: Sequence[dict[str, Any]], n: int) -> list[float] | None:
@@ -111,14 +144,15 @@ def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def compute(bars: Sequence[dict[str, Any]], decision_date: str) -> dict[str, Any]:
+def compute(bars: Sequence[dict[str, Any]], decision_date: str,
+            decision_time: datetime | str | None = None) -> dict[str, Any]:
     """All components for one instrument at one decision date.
 
     Raw values are kept alongside the scaled ones so a reader can check the
     transform rather than trust it. Scaling constants are stated, arbitrary,
     and unvalidated - they set the units, not the conclusion.
     """
-    avail = slice_available(bars, decision_date)
+    avail = slice_available(bars, decision_date, decision_time)
     r20 = trailing_return(avail, 20)
     r60 = trailing_return(avail, 60)
     sma50 = distance_from_sma(avail, 50)

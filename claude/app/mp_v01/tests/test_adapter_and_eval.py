@@ -5,7 +5,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from harness import test, assert_raises, run_all
 from adapters.yahoo_daily import (check_split_adjustment, normalize_option_row, normalize_bars, bar_available_time, bar_event_time,
                                   daily_total_return)
-from backtest.evaluate import Fold, block_permute, evaluate_walk_forward
+from backtest.evaluate import (Fold, block_permute, evaluate_walk_forward,
+                               grouped_date_block_permute)
 from backtest.walkforward import LeakageError
 from datetime import datetime
 
@@ -348,6 +349,14 @@ def block_permutation_preserves_autocorrelation_that_iid_shuffling_destroys():
 @test
 def block_size_must_be_at_least_one():
     assert_raises(ValueError, block_permute, [0, 1, 0], 0, random.Random(1))
+
+@test
+def grouped_permutation_never_splits_a_decision_date():
+    labels = [10, 11, 12, 20, 21, 22, 30, 31, 32, 40, 41, 42]
+    dates = ["d1"] * 3 + ["d2"] * 3 + ["d3"] * 3 + ["d4"] * 3
+    got = grouped_date_block_permute(labels, dates, 2, random.Random(4))
+    chunks = [got[i:i + 3] for i in range(0, len(got), 3)]
+    assert all(len({value // 10 for value in chunk}) == 1 for chunk in chunks), chunks
 
 @test
 def perfect_foresight_is_detected_as_signal():

@@ -1,0 +1,43 @@
+{
+  "schema_version": "moneyprinter.optionscalc-export.v1",
+  "source": "OptionsCalc connector",
+  "observed_date_utc": "2026-09-06",
+  "symbol": "SPY",
+  "underlying_price": 770.03,
+  "expiration_count_total": 32,
+  "selected_expiration": {
+    "expiration": "2026-10-02",
+    "dte": 27,
+    "atm_strike": 770,
+    "atm_iv": 0.1054,
+    "call_30d_strike": 784,
+    "put_30d_strike": 761,
+    "call_16d_strike": 795,
+    "put_16d_strike": 751,
+    "available_call_strikes": [746, 747, 748, 749, 750, 751, 752, 753, 754, 755, 756, 757, 758, 759, 760, 761, 762, 763, 764, 765, 766, 767, 768, 769, 770, 771, 772, 773, 774, 775, 776, 777, 778, 779, 780, 781, 782, 783, 784, 785, 786, 787, 788, 789, 790, 791, 792, 793, 794, 795],
+    "available_put_strikes": [746, 747, 748, 749, 750, 751, 752, 753, 754, 755, 756, 757, 758, 759, 760, 761, 762, 763, 764, 765, 766, 767, 768, 769, 770, 771, 772, 773, 774, 775, 776, 777, 778, 779, 780, 781, 782, 783, 784, 785, 786, 787, 788, 789, 790, 791, 792, 793, 794, 795]
+  },
+  "refreshed_marks": [
+    {
+      "contract_symbol": "SPY261002C00784000",
+      "type": "CALL",
+      "expiration": "2026-10-02",
+      "strike": 784,
+      "approximate_delta": 0.30,
+      "price": 3.73
+    },
+    {
+      "contract_symbol": "SPY261002P00761000",
+      "type": "PUT",
+      "expiration": "2026-10-02",
+      "strike": 761,
+      "approximate_delta": -0.30,
+      "price": 6.63
+    }
+  ],
+  "limitations": [
+    "The connector response did not include bid, ask, volume, open interest, or quote timestamps.",
+    "These marks are useful for local inspection but deliberately cannot satisfy MoneyPrinter's tradeability screen.",
+    "This is a current snapshot, not historical options data and not evidence of an executable fill."
+  ]
+}
