@@ -18,10 +18,17 @@ steps = [
     ("End-to-end demo (synthetic data)",   ["demo/run_demo.py"]),
     ("Noise-floor harness validation",     ["demo/run_noise_floor.py"]),
 ]
+STEP_TIMEOUT_SECONDS = 180
 fail = 0
 for title, args in steps:
-    r = subprocess.run([sys.executable] + [os.path.join(HERE, a) for a in args])
-    if r.returncode != 0:
+    try:
+        r = subprocess.run([sys.executable] + [os.path.join(HERE, a) for a in args],
+                           timeout=STEP_TIMEOUT_SECONDS)
+        code = r.returncode
+    except subprocess.TimeoutExpired:
+        code = 124
+        print(f"\n!! TIMEOUT after {STEP_TIMEOUT_SECONDS}s: {title}")
+    if code != 0:
         print(f"\n!! FAILED: {title}")
         fail += 1
 print("\n" + "="*72)

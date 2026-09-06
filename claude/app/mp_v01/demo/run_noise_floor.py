@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys, os, random
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from backtest.evaluate import Fold, evaluate_walk_forward
+from backtest.signal_study import best_threshold
 
 random.seed(11)
 
@@ -65,12 +66,8 @@ def fitted_threshold(train_X, train_y, test_X):
     inside every permutation, so its capacity to fit noise is priced into the
     null where it belongs.
     """
-    best_cut, best_hit = 0.0, -1
-    for cand in (f["momentum"] for f in train_X):
-        hits = sum(1 for f, y in zip(train_X, train_y)
-                   if (1 if f["momentum"] > cand else 0) == y)
-        if hits > best_hit:
-            best_cut, best_hit = cand, hits
+    scores = [f["momentum"] for f in train_X]
+    best_cut = best_threshold(scores, train_y)
     return [1 if f["momentum"] > best_cut else 0 for f in test_X]
 
 
