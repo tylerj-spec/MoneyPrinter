@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Offline pick review: a short explanation with clickable indicator and source details."""
+"""Offline pick review with short justification, indicators and exact input drill-down."""
 from __future__ import annotations
 import argparse
 import html
 import json
+import re
 from pathlib import Path
 import sys
 from app_paths import get_paths
 sys.path.insert(0, str(Path(__file__).resolve().parent / "claude/app/mp_v01/src"))
+from common.validation import digest
 from strategy.explain import attach_explanation, verify_explanation
 from strategy.picks import verify
 
@@ -28,6 +30,11 @@ def esc(value) -> str:
     return html.escape(str(value) if value is not None else "UNKNOWN")
 
 
+def input_name(record):
+    name = record.get("source_files", {}).get("decision_inputs_file", "")
+    return name if isinstance(name, str) and re.fullmatch(r"inputs_[a-f0-9]{64}\.json", name) else None
+
+
 def render(record: dict, source: str) -> str:
     if not verify(record):
         raise ValueError("Pick record integrity failed")
@@ -38,6 +45,9 @@ def render(record: dict, source: str) -> str:
               "Explanations describe frozen inputs, never later outcomes.</p>",
               f"<p>Decision: <b>{esc(record.get('decision_date'))}</b> | Source: {esc(source)}<br>"
               f"Record checksum: <code>{esc(record.get('record_sha256', 'legacy picks-only hash'))}</code></p>"]
+    name = input_name(record)
+    if name:
+        chunks.append(f"<p><a href='{name}'>Open exact decision-time input slice</a></p>")
     for index, original in enumerate(record.get("picks", [])):
         p = original if original.get("explanation") else attach_explanation(original, record.get("source_files"))
         e = p["explanation"]
@@ -75,15 +85,31 @@ def main(argv=None) -> int:
     candidates = sorted(paths.picks.glob("picks_*.json"))
     path = args.file or (candidates[-1] if candidates else None)
     if path is None:
-        print("No frozen picks yet. Generate picks or select a historical replay pick file."); return 1
+        print("No frozen picks yet. Generate picks or select a historical replay pick file.")
+        return 1
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
         page = render(record, path.name)
         target = args.out or paths.root / "reviews" / (path.stem + ".html")
         target.parent.mkdir(parents=True, exist_ok=True)
+        name = input_name(record)
+        if name:
+            source = path.parent / name
+            value = json.loads(source.read_text("utf-8"))
+            if digest(value) != record["source_files"]["visible_input_sha256"]:
+                raise ValueError("Decision input checksum failed")
+            destination = target.parent / name
+            if destination.resolve() != source.resolve():
+                encoded = source.read_bytes()
+                if destination.exists() and destination.read_bytes() != encoded:
+                    raise ValueError("Refusing to replace a different decision input file")
+                if not destination.exists():
+                    with destination.open("xb") as output:
+                        output.write(encoded)
         target.write_text(page, encoding="utf-8")
     except (OSError, ValueError, TypeError, KeyError) as exc:
-        print(f"ERROR: {exc}"); return 1
+        print(f"ERROR: {exc}")
+        return 1
     print(f"Review written: {target}")
     return 0
 
