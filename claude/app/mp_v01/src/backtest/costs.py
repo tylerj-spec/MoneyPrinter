@@ -41,9 +41,15 @@ class CostModel:
         direction = 1 if side.upper() == "BUY" else -1
         return round(mid + direction * half * self.spread_capture, 4)
 
+    def conservative_option_fill_price(self, bid: float, ask: float, side: str) -> float:
+        """Executable baseline used by picks: buy at ask and sell at bid."""
+        if bid <= 0 or ask <= 0 or ask < bid:
+            raise ValueError(f"Unusable quote bid={bid} ask={ask}")
+        return float(ask if side.upper() == "BUY" else bid)
+
     def option_round_trip_cost(self, bid: float, ask: float, contracts: int) -> float:
-        entry = self.option_fill_price(bid, ask, "BUY")
-        exit_ = self.option_fill_price(bid, ask, "SELL")
+        entry = self.conservative_option_fill_price(bid, ask, "BUY")
+        exit_ = self.conservative_option_fill_price(bid, ask, "SELL")
         spread_cost = (entry - exit_) * 100 * contracts
         fees = 2 * contracts * (
             self.option_commission_per_contract + self.option_exchange_fees_per_contract

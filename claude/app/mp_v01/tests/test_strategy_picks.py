@@ -58,6 +58,13 @@ def components_fail_closed_without_enough_history():
     assert out["scaled"]["momentum_60d"] is None
     assert out["scaled"]["trend_50d"] is None
 
+@test
+def components_reject_a_bar_not_available_at_the_decision_time():
+    rows = bars(3, first_date="2026-02-25")
+    rows[0]["available_time"] = "2026-03-03T00:00:00+00:00"
+    available = C.slice_available(rows, "2026-03-02")
+    assert rows[0] not in available
+
 
 # --- variants ---------------------------------------------------------------
 
@@ -242,6 +249,9 @@ def _fwd(closes, start="2026-03-03"):
         d += timedelta(days=1)
     return out
 
+def _label_series(closes, decision_close=100.0):
+    return [{"date": "2026-03-02", "close": decision_close}] + _fwd(closes)
+
 
 @test
 def bars_after_excludes_the_decision_day_itself():
@@ -295,7 +305,8 @@ def the_dte_floor_closes_a_contract_that_has_decayed_too_far():
 def the_horizon_measurement_is_kept_separate_from_how_the_position_closed():
     """'Was the call right' and 'did the trade make money' are different
     questions. A stop-out must not erase the directional answer."""
-    o = resolve_pick(_pick(), _fwd([99, 90, 85, 96, 130]))
+    o = resolve_pick(_pick(), _label_series([99, 90, 85, 96, 130]),
+                     benchmark_bars=_label_series([100, 100, 100, 100, 100]))
     assert o["exit_trigger"] == "STOP_LOSS"
     assert o["horizon_date"] == _fwd([1, 2, 3, 4, 5])[4]["date"]
     # Underlying finished up, so a BULLISH call was directionally right even
@@ -308,7 +319,8 @@ def the_horizon_measurement_is_kept_separate_from_how_the_position_closed():
 @test
 def a_bearish_pick_is_scored_against_a_falling_underlying():
     o = resolve_pick(_pick(kind="PUT", direction="BEARISH"),
-                     _fwd([99, 98, 97, 96, 95]))
+                     _label_series([99, 98, 97, 96, 95]),
+                     benchmark_bars=_label_series([100, 100, 100, 100, 100]))
     assert o["underlying_move_pct"] < 0 and o["direction_correct"] is True
 
 
@@ -364,6 +376,18 @@ def the_summary_reports_which_exit_rules_fired():
     assert "PROFIT_TARGET:1" in row["exit_triggers"], row
     assert "TIME_STOP:1" in row["exit_triggers"], row
     assert row["wins"] + row["losses"] == 2
+
+@test
+def summaries_never_blend_observed_and_modelled_paths():
+    observed = {"status": "RESOLVED", "variant": "v", "direction_correct": False,
+                "exit_return_on_premium": -0.5, "exit_mark_method": "MARKET",
+                "exit_path_provenance": "OBSERVED_ONLY", "exit_trigger": "TIME_STOP"}
+    modelled = {"status": "RESOLVED", "variant": "v", "direction_correct": True,
+                "exit_return_on_premium": 1.0, "exit_mark_method": "MODELLED",
+                "exit_path_provenance": "MODELLED_ONLY", "exit_trigger": "TIME_STOP"}
+    rows = summarise([observed, modelled])
+    assert len(rows) == 2
+    assert {r["mean_return_on_premium"] for r in rows} == {-0.5, 1.0}
 
 
 if __name__ == "__main__":

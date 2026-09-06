@@ -137,6 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     print("\nThis tests the SIGNAL on the underlying, not the options picks.")
     print("No historical option chains exist in this data, so an options equity")
     print("curve would be fabricated. The options layer is tested FORWARD.\n")
+    print("Bar provenance : CURRENT_VENDOR_RECONSTRUCTION_NOT_CAPTURED_AS_OF_DECISION")
+    print("Availability timestamps are enforced, but this is today's downloaded")
+    print("historical vintage - not proof of the revision seen on each decision date.\n")
 
     data = ex.collect(data_dir, only)
     if not data["rows"]:
@@ -228,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
             "No historical option chains exist in this data. This measures the "
             "underlying forecast only; the options layer is tested forward."),
         "data_dir": str(data_dir),
+        "bar_vintage_mode": "CURRENT_VENDOR_RECONSTRUCTION_NOT_CAPTURED_AS_OF_DECISION",
         "source_files": data["files"],
         "label_contract_version": ex.LABEL_CONTRACT_VERSION,
         "benchmark": ex.BENCHMARK,

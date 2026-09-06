@@ -866,6 +866,7 @@ PICK_HISTORY_COLUMNS = [
     ("status", 13, None), ("exit_trigger", 15, None),
     ("exit_date", 12, "yyyy-mm-dd"), ("days_held", 10, "0"),
     ("exit_price", 11, "#,##0.0000"), ("exit_mark_method", 17, None),
+    ("exit_path_provenance", 20, None),
     ("exit_return_on_premium", 21, "0.0%"),
     ("exit_pnl_per_contract", 21, "$#,##0.00"),
     ("horizon_date", 13, "yyyy-mm-dd"), ("underlying_move_pct", 19, "0.00%"),
@@ -877,7 +878,7 @@ PICK_HISTORY_COLUMNS = [
 ]
 
 PICK_PERF_COLUMNS = [
-    ("variant", 21, None), ("resolved", 10, "0"), ("direction_scored", 17, "0"),
+    ("variant", 21, None), ("provenance", 18, None), ("resolved", 10, "0"), ("direction_scored", 17, "0"),
     ("direction_correct", 18, "0"), ("direction_hit_rate", 19, "0.0%"),
     ("mean_return_on_premium", 23, "0.0%"), ("best_return", 12, "0.0%"),
     ("worst_return", 13, "0.0%"), ("wins", 7, "0"), ("losses", 8, "0"),
@@ -971,7 +972,8 @@ def load_pick_history(picks_dir: Path, data: dict[str, Any],
             ticker = pick.get("ticker")
             if ticker not in chain_cache:
                 chain_cache[ticker] = load_chains_by_date(data_dir, ticker)
-            o = resolve_pick(pick, data["rows"].get(ticker, []), chain_cache[ticker], costs)
+            o = resolve_pick(pick, data["rows"].get(ticker, []), chain_cache[ticker], costs,
+                             benchmark_bars=data["rows"].get("SPY"))
             o["integrity"] = "OK" if ok else "VOID"
             o["source_file"] = path.name
             outcomes.append(o)

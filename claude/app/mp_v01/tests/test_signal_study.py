@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, os, random
+import sys, os, random, math
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 from datetime import date, timedelta
@@ -53,7 +53,8 @@ def the_threshold_sweep_matches_an_exhaustive_scan_including_ties():
     times per fold. If it ever disagrees with the naive scan it is not an
     optimisation, it is a different model."""
     def naive(scores, labels):
-        cands = sorted(set(scores)) or [0.0]
+        cands = ([math.nextafter(min(scores), -math.inf)] + sorted(set(scores))) \
+            if scores else [0.0]
         best_t, best_acc = cands[0], -1
         for t in cands:
             acc = sum(int((s > t) == bool(y)) for s, y in zip(scores, labels))
@@ -68,6 +69,13 @@ def the_threshold_sweep_matches_an_exhaustive_scan_including_ties():
                   for _ in range(n)]
         labels = [rng.randint(0, 1) for _ in range(n)]
         assert naive(scores, labels) == best_threshold(scores, labels), (scores, labels)
+
+@test
+def threshold_can_select_every_observation_as_positive():
+    scores = [0.1, 0.2, 0.3]
+    threshold = best_threshold(scores, [1, 1, 1])
+    assert threshold < min(scores)
+    assert all(score > threshold for score in scores)
 
 @test
 def a_learner_that_ignores_labels_would_make_the_null_decorative():

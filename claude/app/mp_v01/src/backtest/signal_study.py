@@ -128,6 +128,8 @@ def folds_from_splits(observations: Sequence[Observation],
             sp.index,
             [o.features for o in tr], [o.y for o in tr],
             [o.features for o in te], [o.y for o in te],
+            train_groups=[o.decision_date for o in tr],
+            test_groups=[o.decision_date for o in te],
         ))
     return folds
 
@@ -173,9 +175,16 @@ def best_threshold(scores: Sequence[float], labels: Sequence[int]) -> float:
     """
     if not scores:
         return 0.0
+    if len(scores) != len(labels):
+        raise ValueError(f"length mismatch: {len(scores)} scores vs {len(labels)} labels")
+    if any(not isinstance(s, (int, float)) or not math.isfinite(float(s)) for s in scores):
+        raise ValueError("scores must be finite numbers")
     pairs = sorted(zip(scores, labels), key=lambda p: p[0])
     total_ones = sum(1 for _, y in pairs if y)
-    best_t, best_correct = pairs[0][0], -1
+    # The candidate immediately below the minimum represents an all-positive
+    # classifier. nextafter avoids an arbitrary epsilon and works at any scale.
+    best_t = math.nextafter(float(pairs[0][0]), -math.inf)
+    best_correct = total_ones
     zeros_le = ones_le = 0
     i, n = 0, len(pairs)
     while i < n:

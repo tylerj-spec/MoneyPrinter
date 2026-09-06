@@ -81,6 +81,8 @@ class Fold:
     test_y: Sequence[int]
     train_times: Sequence[datetime] | None = None
     test_times: Sequence[datetime] | None = None
+    train_groups: Sequence[Any] | None = None
+    test_groups: Sequence[Any] | None = None
 
     def __post_init__(self) -> None:
         if len(self.train_X) != len(self.train_y):
@@ -91,6 +93,11 @@ class Fold:
             raise ValueError(
                 f"fold {self.index}: {len(self.test_X)} test rows vs "
                 f"{len(self.test_y)} test labels")
+        for name, groups, labels in (("train", self.train_groups, self.train_y),
+                                     ("test", self.test_groups, self.test_y)):
+            if groups is not None and len(groups) != len(labels):
+                raise ValueError(f"fold {self.index}: {len(groups)} {name} groups vs "
+                                 f"{len(labels)} {name} labels")
 
 
 def _assert_fold_is_chronological(fold: Fold, label_horizon: int,
@@ -150,6 +157,31 @@ def block_permute(labels: Sequence[int], block_size: int, rng: random.Random) ->
     blocks = [list(labels[i:i + block_size]) for i in range(0, len(labels), block_size)]
     rng.shuffle(blocks)
     return [y for b in blocks for y in b][:len(labels)]
+
+
+def grouped_date_block_permute(labels: Sequence[int], groups: Sequence[Any],
+                               block_size: int, rng: random.Random) -> list[int]:
+    """Permute blocks of complete decision dates, keeping ticker rows together.
+
+    ``groups`` is one date key per observation. Observations must already be in
+    date/ticker order. No date is ever split across two blocks, so the null
+    preserves both cross-sectional dependence and the intended session-length
+    autocorrelation.
+    """
+    if len(labels) != len(groups):
+        raise ValueError("labels and groups must have the same length")
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
+    dated: list[list[int]] = []
+    prior = object()
+    for label, group in zip(labels, groups):
+        if not dated or group != prior:
+            dated.append([])
+            prior = group
+        dated[-1].append(label)
+    blocks = [dated[i:i + block_size] for i in range(0, len(dated), block_size)]
+    rng.shuffle(blocks)
+    return [label for block in blocks for date_group in block for label in date_group]
 
 
 @dataclass
@@ -284,8 +316,14 @@ def evaluate_walk_forward(
     for _ in range(n_permutations):
         correct = total = 0
         for fold in folds:
-            train_perm = block_permute(fold.train_y, block_size, rng)
-            test_perm = block_permute(fold.test_y, block_size, rng)
+            train_perm = (grouped_date_block_permute(fold.train_y, fold.train_groups,
+                                                     block_size, rng)
+                          if fold.train_groups is not None else
+                          block_permute(fold.train_y, block_size, rng))
+            test_perm = (grouped_date_block_permute(fold.test_y, fold.test_groups,
+                                                    block_size, rng)
+                         if fold.test_groups is not None else
+                         block_permute(fold.test_y, block_size, rng))
             preds = fit_predict_fn(fold.train_X, train_perm, fold.test_X)
             correct += sum(int(p == y) for p, y in zip(preds, test_perm))
             total += len(test_perm)

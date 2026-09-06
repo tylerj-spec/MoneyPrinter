@@ -38,7 +38,7 @@ from gates.risk import RiskLimits, evaluate as evaluate_gate
 from labels.contract import HORIZON_TRADING_DAYS
 from strategy.variants import Variant, score as score_variant
 
-PICK_CONTRACT_VERSION = "0.2.0"
+PICK_CONTRACT_VERSION = "0.3.0"
 
 # Required keys on an option row handed to this module. Stated so the coupling
 # to whatever produced the chain is explicit rather than discovered at runtime.
@@ -283,6 +283,7 @@ def generate_picks(
                 },
                 "selection_reason": why,
                 "entry_fill_estimate": row["ask"],   # a buyer crosses the spread
+                "fill_convention": "CONSERVATIVE_ASK_ENTRY_BID_EXIT",
                 "round_trip_cost_1x": row["round_trip_cost_1x"],
                 "breakeven_move_pct": round(be, 6) if be is not None else None,
                 "exit_policy": exit_policy.to_dict(),

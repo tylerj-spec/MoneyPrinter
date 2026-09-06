@@ -81,7 +81,7 @@ def main(argv=None) -> int:
     results = [resolve_pick(p, data["rows"].get(p["ticker"], []),
                             ex.load_chains_by_date(Path(a.data_dir).expanduser().resolve(),
                                                    p["ticker"]),
-                            costs)
+                            costs, benchmark_bars=data["rows"].get("SPY"))
                for p in proposed]
 
     print("\n" + "-" * 78)
@@ -102,14 +102,14 @@ def main(argv=None) -> int:
     resolved = [r for r in results if r["status"] == "RESOLVED"]
     if resolved:
         print("-" * 78)
-        print(f"{'variant':<20}{'n':>4}{'dir ok':>9}{'mean':>9}{'best':>9}{'worst':>9}"
+        print(f"{'variant':<20}{'provenance':<16}{'n':>4}{'dir ok':>9}{'mean':>9}{'best':>9}{'worst':>9}"
               f"   exit triggers")
         for row in summarise(results):
             hr = f"{row['direction_hit_rate']:.0%}" if row["direction_hit_rate"] is not None else "—"
             mean = f"{row['mean_return_on_premium']:+.1%}" if row["mean_return_on_premium"] is not None else "—"
             best = f"{row['best_return']:+.0%}" if row["best_return"] is not None else "—"
             worst = f"{row['worst_return']:+.0%}" if row["worst_return"] is not None else "—"
-            print(f"{row['variant']:<20}{row['resolved']:>4}{hr:>9}{mean:>9}{best:>9}"
+            print(f"{row['variant']:<20}{row['provenance']:<16}{row['resolved']:>4}{hr:>9}{mean:>9}{best:>9}"
                   f"{worst:>9}   {row['exit_triggers']}")
 
         modelled = sum(1 for r in resolved if r["exit_mark_method"] == "MODELLED")

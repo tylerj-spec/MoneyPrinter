@@ -38,6 +38,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from backtest.costs import CostModel
+from labels.contract import build_label
 from options.greeks import black_scholes_price, years_to_expiry
 
 # Used only for the Black-Scholes fallback mark. Recorded in the output so a
@@ -75,7 +76,8 @@ def mark_on(date_str: str, contract: dict[str, Any], spot: float,
     quote = market_quote((chains_by_date or {}).get(date_str), contract)
     if quote is not None:
         try:
-            return costs.option_fill_price(float(quote["bid"]), float(quote["ask"]), "SELL"), "MARKET"
+            return costs.conservative_option_fill_price(
+                float(quote["bid"]), float(quote["ask"]), "SELL"), "MARKET"
         except ValueError:
             pass          # unusable quote; fall through to the model
     T = years_to_expiry(date_str, contract.get("expiration"))
@@ -97,7 +99,8 @@ def _return_on_premium(exit_price: float, entry: float, costs: CostModel) -> flo
 def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
                  chains_by_date: dict[str, dict[str, Any]] | None = None,
                  costs: CostModel | None = None,
-                 rate: float = DEFAULT_MARK_RATE) -> dict[str, Any]:
+                 rate: float = DEFAULT_MARK_RATE,
+                 benchmark_bars: Sequence[dict[str, Any]] | None = None) -> dict[str, Any]:
     """One pick's outcome. Never raises on thin data; reports status instead."""
     costs = costs or CostModel()
     c = pick.get("contract") or {}
@@ -131,6 +134,7 @@ def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
         "status": "OPEN",
         "exit_trigger": None, "exit_date": None, "days_held": None,
         "exit_price": None, "exit_mark_method": None,
+        "exit_path_provenance": None,
         "exit_return_on_premium": None, "exit_pnl_per_contract": None,
         "horizon_date": None, "underlying_move_pct": None,
         "direction_correct": None, "horizon_return_on_premium": None,
@@ -148,12 +152,14 @@ def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
         return out
 
     # Walk the path. Close on the first pre-registered rule that fires.
+    path_methods: list[str] = []
     for i, bar in enumerate(forward[:horizon], start=1):
         d, spot = bar["date"], bar["close"]
         price, method = mark_on(d, c, spot, chains_by_date, costs, rate)
         if price is None:
             out.update(status="UNMARKABLE", detail=f"could not mark on {d}: {method}")
             return out
+        path_methods.append(method)
         rop = _return_on_premium(price, float(entry), costs)
         # Actual calendar days left, computed from this bar's date. Decrementing
         # the entry DTE by elapsed trading days would drift by a day every
@@ -178,6 +184,10 @@ def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
                        exit_price=round(price, 4), exit_mark_method=method,
                        exit_return_on_premium=round(rop, 4) if rop is not None else None,
                        exit_pnl_per_contract=round((price - float(entry)) * 100.0 - fees, 2))
+            unique_methods = set(path_methods)
+            out["exit_path_provenance"] = (
+                "OBSERVED_ONLY" if unique_methods == {"MARKET"} else
+                "MODELLED_ONLY" if unique_methods == {"MODELLED"} else "MIXED")
             break
     else:
         out["detail"] = (f"{len(forward)} of {horizon} trading days elapsed; "
@@ -192,15 +202,53 @@ def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
         hb = forward[horizon - 1]
         out["horizon_date"] = hb["date"]
         out["underlying_move_pct"] = hb["close"] / float(entry_spot) - 1.0
-        up = out["underlying_move_pct"] > 0
-        out["direction_correct"] = ((up and pick.get("direction") == "BULLISH")
-                                    or ((not up) and pick.get("direction") == "BEARISH"))
+        label = _direction_label(pick.get("ticker"), pick.get("decision_date"),
+                                 bars, benchmark_bars, horizon)
+        if label is not None:
+            out["target_excess_log_return"] = label.excess_log_return
+            out["label_contract_version"] = label.contract_version
+            predicted = 1 if pick.get("direction") == "BULLISH" else 0
+            out["direction_correct"] = predicted == label.y
         hp, hm = mark_on(hb["date"], c, hb["close"], chains_by_date, costs, rate)
         if hp is not None:
             out["horizon_mark_method"] = hm
             hr = _return_on_premium(hp, float(entry), costs)
             out["horizon_return_on_premium"] = round(hr, 4) if hr is not None else None
     return out
+
+
+def _forward_returns(rows: Sequence[dict[str, Any]], decision_date: str,
+                     horizon: int) -> list[float]:
+    ordered = sorted((r for r in rows if r.get("date")), key=lambda r: r["date"])
+    by_date = {r["date"]: r for r in ordered}
+    if decision_date not in by_date or by_date[decision_date].get("close") is None:
+        return []
+    later = [r for r in ordered if r["date"] > decision_date and r.get("close") is not None]
+    prev = float(by_date[decision_date]["close"])
+    returns = []
+    for row in later[:horizon]:
+        value = row.get("daily_total_return")
+        if not isinstance(value, (int, float)):
+            value = float(row["close"]) / prev - 1.0
+        returns.append(float(value))
+        prev = float(row["close"])
+    return returns
+
+
+def _direction_label(ticker: str | None, decision_date: str | None,
+                     bars: Sequence[dict[str, Any]],
+                     benchmark_bars: Sequence[dict[str, Any]] | None,
+                     horizon: int):
+    """Build the resolver target through the same approved label contract."""
+    if not ticker or not decision_date or horizon != 5:
+        return None
+    instrument = _forward_returns(bars, decision_date, horizon)
+    benchmark_source = bars if ticker.upper() == "SPY" else benchmark_bars
+    if benchmark_source is None:
+        return None
+    benchmark = _forward_returns(benchmark_source, decision_date, horizon)
+    label = build_label(ticker.upper(), decision_date, instrument, benchmark)
+    return label if label.is_usable() else None
 
 
 def summarise(outcomes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -216,28 +264,33 @@ def summarise(outcomes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             by.setdefault(o.get("variant") or "unknown", []).append(o)
 
     rows = []
-    for variant, rs in sorted(by.items()):
-        dirs = [r for r in rs if r.get("direction_correct") is not None]
-        hits = sum(1 for r in dirs if r["direction_correct"])
-        rets = [r["exit_return_on_premium"] for r in rs
-                if r.get("exit_return_on_premium") is not None]
-        modelled = sum(1 for r in rs if r.get("exit_mark_method") == "MODELLED")
-        triggers = {}
-        for r in rs:
-            triggers[r.get("exit_trigger")] = triggers.get(r.get("exit_trigger"), 0) + 1
-        rows.append({
-            "variant": variant,
-            "resolved": len(rs),
-            "direction_scored": len(dirs),
-            "direction_correct": hits,
-            "direction_hit_rate": (hits / len(dirs)) if dirs else None,
-            "mean_return_on_premium": (sum(rets) / len(rets)) if rets else None,
-            "best_return": max(rets) if rets else None,
-            "worst_return": min(rets) if rets else None,
-            "wins": sum(1 for r in rets if r > 0),
-            "losses": sum(1 for r in rets if r <= 0),
-            "modelled_marks": modelled,
-            "exit_triggers": ", ".join(f"{k}:{v}" for k, v in sorted(
-                triggers.items(), key=lambda kv: str(kv[0]))),
-        })
+    for variant, variant_rows in sorted(by.items()):
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in variant_rows:
+            grouped.setdefault(row.get("exit_path_provenance") or "UNKNOWN", []).append(row)
+        for provenance, rs in sorted(grouped.items()):
+            dirs = [r for r in rs if r.get("direction_correct") is not None]
+            hits = sum(1 for r in dirs if r["direction_correct"])
+            rets = [r["exit_return_on_premium"] for r in rs
+                    if r.get("exit_return_on_premium") is not None]
+            modelled = sum(1 for r in rs if r.get("exit_mark_method") == "MODELLED")
+            triggers = {}
+            for r in rs:
+                triggers[r.get("exit_trigger")] = triggers.get(r.get("exit_trigger"), 0) + 1
+            rows.append({
+                "variant": variant,
+                "provenance": provenance,
+                "resolved": len(rs),
+                "direction_scored": len(dirs),
+                "direction_correct": hits,
+                "direction_hit_rate": (hits / len(dirs)) if dirs else None,
+                "mean_return_on_premium": (sum(rets) / len(rets)) if rets else None,
+                "best_return": max(rets) if rets else None,
+                "worst_return": min(rets) if rets else None,
+                "wins": sum(1 for r in rets if r > 0),
+                "losses": sum(1 for r in rets if r <= 0),
+                "modelled_marks": modelled,
+                "exit_triggers": ", ".join(f"{k}:{v}" for k, v in sorted(
+                    triggers.items(), key=lambda kv: str(kv[0]))),
+            })
     return rows
