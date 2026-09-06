@@ -114,6 +114,8 @@ def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
     out: dict[str, Any] = {
         "decision_date": pick.get("decision_date"),
         "variant": pick.get("variant"),
+        "selection_policy": pick.get("selection_policy", {}),
+        "pick_contract_version": pick.get("contract_version", "legacy"),
         "ticker": pick.get("ticker"),
         "direction": pick.get("direction"),
         "action": pick.get("action"),
@@ -138,6 +140,9 @@ def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
         "exit_return_on_premium": None, "exit_pnl_per_contract": None,
         "horizon_date": None, "underlying_move_pct": None,
         "direction_correct": None, "horizon_return_on_premium": None,
+        "absolute_direction_correct": None, "relative_direction_correct": None,
+        "direction_correct_definition": "legacy benchmark-relative label; SPY uses absolute sign",
+        "absolute_direction_basis": "stored entry underlying close; may precede decision",
         "horizon_mark_method": None,
         "detail": None,
     }
@@ -202,6 +207,8 @@ def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
         hb = forward[horizon - 1]
         out["horizon_date"] = hb["date"]
         out["underlying_move_pct"] = hb["close"] / float(entry_spot) - 1.0
+        out["absolute_direction_correct"] = ((out["underlying_move_pct"] > 0) ==
+                                             (pick.get("direction") == "BULLISH"))
         label = _direction_label(pick.get("ticker"), pick.get("decision_date"),
                                  bars, benchmark_bars, horizon)
         if label is not None:
@@ -209,6 +216,7 @@ def resolve_pick(pick: dict[str, Any], bars: Sequence[dict[str, Any]],
             out["label_contract_version"] = label.contract_version
             predicted = 1 if pick.get("direction") == "BULLISH" else 0
             out["direction_correct"] = predicted == label.y
+            out["relative_direction_correct"] = predicted == label.y if pick.get("ticker", "").upper() != "SPY" else None
         hp, hm = mark_on(hb["date"], c, hb["close"], chains_by_date, costs, rate)
         if hp is not None:
             out["horizon_mark_method"] = hm
@@ -246,6 +254,10 @@ def _direction_label(ticker: str | None, decision_date: str | None,
     benchmark_source = bars if ticker.upper() == "SPY" else benchmark_bars
     if benchmark_source is None:
         return None
+    instrument_dates = [r["date"] for r in bars_after(bars, decision_date)[:horizon]]
+    benchmark_dates = [r["date"] for r in bars_after(benchmark_source, decision_date)[:horizon]]
+    if instrument_dates != benchmark_dates or len(set(instrument_dates)) != horizon:
+        return None  # Never align different missing-session windows by row number.
     benchmark = _forward_returns(benchmark_source, decision_date, horizon)
     label = build_label(ticker.upper(), decision_date, instrument, benchmark)
     return label if label.is_usable() else None
@@ -258,13 +270,16 @@ def summarise(outcomes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     outcome yet is not a zero, and averaging it in as one would drag every
     variant toward the middle and understate both winners and losers.
     """
-    by: dict[str, list[dict[str, Any]]] = {}
+    by: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for o in outcomes:
         if o.get("status") == "RESOLVED":
-            by.setdefault(o.get("variant") or "unknown", []).append(o)
+            identity = (o.get("variant") or "unknown",
+                        (o.get("selection_policy") or {}).get("mode", "legacy"),
+                        o.get("pick_contract_version", "legacy"))
+            by.setdefault(identity, []).append(o)
 
     rows = []
-    for variant, variant_rows in sorted(by.items()):
+    for (variant, policy, version), variant_rows in sorted(by.items()):
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in variant_rows:
             grouped.setdefault(row.get("exit_path_provenance") or "UNKNOWN", []).append(row)
@@ -278,7 +293,7 @@ def summarise(outcomes: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             for r in rs:
                 triggers[r.get("exit_trigger")] = triggers.get(r.get("exit_trigger"), 0) + 1
             rows.append({
-                "variant": variant,
+                "variant": variant, "selection_policy": policy, "pick_contract_version": version,
                 "provenance": provenance,
                 "resolved": len(rs),
                 "direction_scored": len(dirs),
