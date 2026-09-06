@@ -20,6 +20,7 @@ independent trials in any significance test is wrong.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,10 @@ def score(variant: Variant, scaled: dict[str, float | None]) -> tuple[float | No
     over whatever happens to be present would silently change the strategy
     being tested from run to run.
     """
-    missing = [k for k in variant.weights if scaled.get(k) is None]
+    missing = [k for k in variant.weights
+               if isinstance(scaled.get(k), bool)
+               or not isinstance(scaled.get(k), (int, float))
+               or not math.isfinite(scaled[k])]
     if missing:
         return None, missing
     w = variant.normalised_weights()
