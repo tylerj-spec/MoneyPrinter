@@ -311,11 +311,13 @@ class ThemeTests(unittest.TestCase):
                 patch.object(gui, "SETTINGS_FILE", Path(tmp) / "settings.json"):
             app = gui.MoneyPrinterGUI()
             try:
-                app.update_idletasks()
+                # Process native window-map events too; idle-only updates leave
+                # newly-created Windows widgets at their placeholder 1px size.
+                app.update()
                 for theme in ("dark", "light"):
                     app.theme_var.set(theme)
                     app._change_theme()
-                    app.update_idletasks()
+                    app.update()
                     self.assertEqual(app.text.cget("background"), ui_theme.palette_for(theme)["surface"])
                     self.assertGreater(app.stop_btn.winfo_width(), 30)
                     self.assertLess(app.stop_btn.winfo_rootx() + app.stop_btn.winfo_width(),
