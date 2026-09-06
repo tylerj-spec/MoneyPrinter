@@ -9,6 +9,9 @@ The diagnostic uses at most five paced calls and never prints the API key.
 from __future__ import annotations
 
 import argparse
+import getpass
+import os
+import warnings
 import json
 import sys
 from datetime import datetime, timezone
@@ -26,7 +29,8 @@ from adapters import massive_options as mv  # noqa: E402
 
 def _write(path: Path, doc: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(doc, indent=2, default=str, allow_nan=False), encoding="utf-8")
+    with path.open("x", encoding="utf-8") as output:
+        json.dump(doc, output, indent=2, default=str, allow_nan=False)
     return path
 
 
@@ -90,10 +94,16 @@ def do_diagnose(args) -> int:
     elif v == "UNVERIFIED":
         print("Nothing contradicted the request, but this sample did not demonstrate the")
         print("capability. Treat history as unavailable until a stronger canary verifies it.")
+    elif v == "AUTH_FAILED":
+        print("Authentication failed. Check the key; this is not proof of a missing subscription.")
+    elif v == "RATE_LIMITED":
+        print("Rate limit reached. Stop concurrent requests; do not retry automatically or upgrade based on this alone.")
     elif v == "NOT_ENTITLED":
-        print("The service refused this data for the key/plan. Do not attempt a backfill.")
+        print("HTTP 402/403 denied access. Check permissions and plan; a valid key is not established by this alone.")
     elif v == "UNREACHABLE":
         print("No HTTP answer reached the adapter: check DNS, network, TLS, or proxy settings.")
+    elif v in ("INVALID_RESPONSE", "REDIRECT_REFUSED"):
+        print("Malformed data or a refused redirect. No historical capability was established.")
     else:
         print("The service returned an error that the adapter could not safely classify further.")
     return 1
@@ -115,7 +125,7 @@ def do_probe(args) -> int:
 def do_fetch(args) -> int:
     data_dir = Path(args.data_dir).expanduser().resolve()
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     total_contracts = total_bars = failures = 0
     for t in tickers:
@@ -133,6 +143,8 @@ def do_fetch(args) -> int:
             "ingested_time": now, "source": "massive_options_contracts",
             "endpoint": mv.CONTRACTS_PATH, "contract_count": len(contracts),
             "usable": len(usable), "contracts": contracts,
+            "point_in_time_status": "VENDOR_AS_OF_REQUESTED_NOT_INDEPENDENTLY_VERIFIED",
+            "note": "Reference metadata, not a historical bid/ask chain or proof of listing dates.",
         })
         total_contracts += len(contracts)
         if not args.bars:
@@ -149,6 +161,7 @@ def do_fetch(args) -> int:
             "underlying": t, "as_of": args.as_of, "vintage_id": stamp,
             "ingested_time": now, "source": "massive_option_aggregates",
             "endpoint": mv.AGGS_PATH, "row_count": len(rows), "usable": ok, "rows": rows,
+            "note": "Trade aggregates, not executable bid/ask quotes; not consumed by the pick resolver.",
         })
         total_bars += len(rows)
     print(f"{total_contracts} contracts, {total_bars} bars written under {data_dir}")
@@ -157,8 +170,10 @@ def do_fetch(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    ap.add_argument("--diagnose", action="store_true")
-    ap.add_argument("--probe", action="store_true")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--diagnose", action="store_true", help="at most five paced reference calls; no data saved")
+    mode.add_argument("--probe", action="store_true", help="legacy one-call reference smoke test")
+    ap.add_argument("--prompt-key", action="store_true", help="hidden session-only key prompt; never an argv secret")
     ap.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     ap.add_argument("--tickers", default="SPY")
     ap.add_argument("--as-of", default=None)
@@ -167,13 +182,53 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-contracts", type=int, default=25)
     ap.add_argument("--max-pages", type=int, default=20)
     a = ap.parse_args(argv)
-    if a.diagnose:
-        return do_diagnose(a)
-    if a.probe:
-        return do_probe(a)
-    if not a.as_of:
-        ap.error("--as-of is required (or use --diagnose). A fetch without a point-in-time date would be survivorship-biased.")
-    return do_fetch(a)
+    try:
+        tickers = [mv._underlying(t) for t in a.tickers.split(",")]
+        if (a.diagnose or a.probe) and len(tickers) != 1:
+            raise ValueError("diagnostics require exactly one ticker")
+        if a.as_of:
+            mv._date(a.as_of)
+        if a.bars_from:
+            mv._date(a.bars_from)
+            if not a.as_of or a.bars_from > a.as_of:
+                raise ValueError("--bars-from requires --as-of and must not be later")
+        if a.max_pages < 1 or a.max_contracts < 1:
+            raise ValueError("--max-pages and --max-contracts must be positive")
+        if (a.diagnose or a.probe) and (a.bars or a.bars_from):
+            raise ValueError("diagnostics cannot be combined with bar-download flags")
+        if not (a.diagnose or a.probe or a.as_of):
+            raise ValueError("--as-of is required for a fetch; use --diagnose first")
+    except ValueError as exc:
+        ap.error(str(exc))
+    a.tickers = ",".join(tickers)
+    previous_key = os.environ.get(mv.TOKEN_ENV_VAR)
+    try:
+        if a.prompt_key:
+            # getpass normally falls back to echoing when no secure terminal
+            # exists. Turn that warning into an error BEFORE fallback input.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                secret = getpass.getpass("Massive API key (hidden, this run only): ").strip()
+            if not secret:
+                print("No key entered; no request sent.")
+                return 1
+            os.environ[mv.TOKEN_ENV_VAR] = secret
+            del secret
+        if a.diagnose:
+            return do_diagnose(a)
+        if a.probe:
+            return do_probe(a)
+        return do_fetch(a)
+    except (getpass.GetPassWarning, EOFError):
+        print("A hidden terminal prompt is unavailable. Use the masked GUI key box.")
+        return 1
+    finally:
+        if a.prompt_key:
+            if previous_key is None:
+                os.environ.pop(mv.TOKEN_ENV_VAR, None)
+            else:
+                os.environ[mv.TOKEN_ENV_VAR] = previous_key
+
 
 
 if __name__ == "__main__":

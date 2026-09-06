@@ -24,7 +24,9 @@ The key is read from MASSIVE_API_KEY, which is the vendor client's own default
 variable name. It is never written to a file, never logged, never passed as an
 argument that could surface in a traceback.
 
-    setx MASSIVE_API_KEY "your-key-here"        (Windows; open a NEW terminal)
+    python fetch_massive.py --diagnose --prompt-key
+
+The hidden prompt is session-only; do not put secrets in shell history or setx.
 
 Two properties make this safer than the EODHD path, and both are the vendor's
 doing rather than ours:
@@ -45,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -77,15 +80,14 @@ class MassiveError(RuntimeError):
 
 
 def _token() -> str:
-    tok = os.environ.get(TOKEN_ENV_VAR)
+    tok = os.environ.get(TOKEN_ENV_VAR, "").strip()
     if not tok:
         raise MissingCredential(
-            f"{TOKEN_ENV_VAR} is not set. Set it with:\n"
-            f'    setx {TOKEN_ENV_VAR} "your-key"\n'
-            f"then open a new terminal. Or paste it into the app's key box, which\n"
-            f"passes it to this process without writing it anywhere.\n"
-            f"Do not hardcode it and do not paste it into chat."
+            f"{TOKEN_ENV_VAR} is not set. Use --prompt-key in a terminal, or the "
+            "masked key box in the app. Do not paste the key into chat or shell history."
         )
+    if any(ord(ch) < 33 or ord(ch) > 126 for ch in tok):
+        raise MissingCredential("API key contains invalid whitespace or non-ASCII characters")
     return tok
 
 
@@ -108,23 +110,24 @@ def bar_available_time(bar_date: str) -> datetime:
 
 
 def _finite(value: Any) -> float | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return f if f == f and f not in (float("inf"), float("-inf")) else None
 
 
 def _count(value: Any) -> int | None:
     f = _finite(value)
-    return int(f) if f is not None and f >= 0 else None
+    return int(f) if f is not None and f >= 0 and f.is_integer() else None
 
 
 def normalize_contract(row: dict[str, Any], *, as_of: str) -> dict[str, Any]:
     strike = _finite(row.get("strike_price"))
-    kind = (row.get("contract_type") or "").upper() or None
+    kind = row.get("contract_type")
+    kind = kind.upper() if isinstance(kind, str) else None
     return {
         "contract_symbol": row.get("ticker") or None,
         "underlying": row.get("underlying_ticker") or None,
@@ -142,8 +145,11 @@ def normalize_contract(row: dict[str, Any], *, as_of: str) -> dict[str, Any]:
 
 def normalize_agg(row: dict[str, Any], *, contract_symbol: str) -> dict[str, Any]:
     ts = _finite(row.get("t"))
-    day = (datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).astimezone(NY).date().isoformat()
-           if ts is not None else None)
+    try:
+        day = (datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).astimezone(NY).date().isoformat()
+               if ts is not None else None)
+    except (OverflowError, OSError, ValueError):
+        day = None
     close = _finite(row.get("c"))
     return {
         "contract_symbol": contract_symbol,
@@ -170,42 +176,77 @@ def contract_symbol(underlying: str, expiration: str, kind: str, strike: float) 
     return f"O:{underlying.strip().upper()}{y[2:]}{m}{d}{k[0]}{thousandths:08d}"
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # An API credential is never forwarded to a redirected host or scheme.
+        raise MassiveError("HTTP redirect refused; credential was not forwarded", "REDIRECT_REFUSED")
+
+
+def _rows(doc: dict) -> list[dict]:
+    if not isinstance(doc, dict):
+        raise MassiveError("Response must be a JSON object", "INVALID_RESPONSE")
+    rows = doc.get("results", [])  # Vendor permits an absent array for an empty response.
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise MassiveError("Response results must be an array of objects", "INVALID_RESPONSE")
+    return rows
+
+
+def _date(value: str) -> date:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("date must be YYYY-MM-DD")
+    return date.fromisoformat(value)
+
+
+def _underlying(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,19}", value.strip()):
+        raise ValueError("underlying must be one non-empty ticker, not a path or list")
+    return value.strip().upper()
+
+
 def _get(path: str, params: dict[str, Any] | None = None,
          *, timeout: int = 30) -> dict[str, Any]:
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+        raise MassiveError("Invalid API path", "INVALID_RESPONSE")
     url = BASE_URL + path
     if params:
         clean = {k: v for k, v in params.items() if v is not None}
         if clean:
-            url += "?" + urllib.parse.urlencode(clean)
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(clean)
     req = urllib.request.Request(url, headers={
-        "Authorization": "Bearer " + _token(),
-        "Accept": "application/json",
-        "User-Agent": "moneyprinter/0.1",
+        "Accept": "application/json", "User-Agent": "moneyprinter/0.4",
     })
+    req.add_unredirected_header("Authorization", "Bearer " + _token())
+    opener = urllib.request.build_opener(_RejectRedirects())
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            doc = json.loads(resp.read().decode("utf-8"))
+        with opener.open(req, timeout=timeout) as resp:
+            body = resp.read(8 * 1024 * 1024 + 1)
+            if len(body) > 8 * 1024 * 1024:
+                raise MassiveError("Response exceeded size limit", "INVALID_RESPONSE")
+            doc = json.loads(body.decode("utf-8"))
             if not isinstance(doc, dict) or doc.get("status") not in ("OK", "DELAYED"):
                 raise MassiveError("Response did not report an OK/DELAYED data status",
                                    "INVALID_RESPONSE")
+            _rows(doc)
             return doc
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", "replace")[:400]
-        except Exception:
-            pass
-        kind = "NOT_ENTITLED" if e.code in (401, 402, 403) else "HTTP_ERROR"
-        raise MassiveError(redact(f"HTTP {e.code} on {path}: {body}"), kind) from None
-    except urllib.error.URLError as e:
-        raise MassiveError(redact(f"cannot reach {BASE_URL}: {e.reason}"),
+    except urllib.error.HTTPError as exc:
+        kind = {401: "AUTH_FAILED", 402: "NOT_ENTITLED", 403: "NOT_ENTITLED",
+                429: "RATE_LIMITED"}.get(exc.code, "HTTP_ERROR")
+        # Do not echo untrusted error bodies or URLs: they may contain a full
+        # key, an encoded key, or a key truncated before it could be redacted.
+        raise MassiveError(f"HTTP {exc.code}; response body omitted for credential safety", kind) from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise MassiveError("No usable HTTP response: network, DNS, TLS, proxy or timeout",
                            "UNREACHABLE") from None
+    except (ValueError, UnicodeError):
+        raise MassiveError("Response was not valid UTF-8 JSON", "INVALID_RESPONSE") from None
 
 
 def _paginate(path: str, params: dict[str, Any], *, max_pages: int = 20) -> Iterator[dict]:
+    if type(max_pages) is not int or max_pages < 1:
+        raise ValueError("max_pages must be a positive integer")
     page = _get(path, params)
     for page_index in range(max_pages):
-        for row in page.get("results") or []:
+        for row in _rows(page):
             yield row
         nxt = page.get("next_url")
         if not nxt:
@@ -213,7 +254,7 @@ def _paginate(path: str, params: dict[str, Any], *, max_pages: int = 20) -> Iter
         if page_index + 1 == max_pages:
             raise MassiveError(f"Response exceeds max_pages={max_pages}; incomplete history rejected",
                                "INCOMPLETE_RESPONSE")
-        if not nxt.startswith(BASE_URL + "/"):
+        if not isinstance(nxt, str) or not nxt.startswith(BASE_URL + "/"):
             raise MassiveError("Unexpected pagination URL", "INVALID_RESPONSE")
         page = _get(nxt[len(BASE_URL):] if nxt.startswith(BASE_URL) else nxt)
 
@@ -221,14 +262,18 @@ def _paginate(path: str, params: dict[str, Any], *, max_pages: int = 20) -> Iter
 def _validate_contracts(rows, underlying: str, as_of: str) -> list[dict[str, Any]]:
     """An HTTP success is insufficient: verify explicit scope before saving."""
     expected = underlying.strip().upper()
-    day = date.fromisoformat(as_of)
+    day = _date(as_of)
     normalized = []
     for row in rows:
+        if not isinstance(row, dict):
+            raise MassiveError("Contract response row is not an object", "INVALID_CONTRACT_RESPONSE")
         contract = normalize_contract(row, as_of=as_of)
         try:
             valid = (contract["status"] == "OK" and contract["underlying"] == expected
                      and contract["strike"] > 0
-                     and date.fromisoformat(contract["expiration"]) >= day)
+                     and isinstance(contract["contract_symbol"], str)
+                     and contract["contract_symbol"].startswith("O:")
+                     and _date(contract["expiration"]) >= day)
         except (ValueError, TypeError):
             valid = False
         if not valid:
@@ -244,6 +289,10 @@ def _validate_contracts(rows, underlying: str, as_of: str) -> list[dict[str, Any
 def list_contracts_as_of(underlying: str, as_of: str, *, expired: bool = True,
                          limit: int = 1000, max_pages: int = 20) -> list[dict[str, Any]]:
     """Request contracts as of `as_of`, with an independently checkable expiry floor."""
+    _date(as_of)
+    underlying = _underlying(underlying)
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("limit must be between 1 and 1000")
     rows = _paginate(CONTRACTS_PATH, {
         "underlying_ticker": underlying.strip().upper(),
         "as_of": as_of, "expired": str(bool(expired)).lower(), "limit": limit,
@@ -254,16 +303,28 @@ def list_contracts_as_of(underlying: str, as_of: str, *, expired: bool = True,
 
 def contract_daily_bars(symbol: str, start: str, end: str,
                         *, adjusted: bool = True) -> list[dict[str, Any]]:
+    if _date(start) > _date(end):
+        raise ValueError("bars start must not be after end")
     path = AGGS_PATH.format(ticker=urllib.parse.quote(symbol, safe=""),
                             multiplier=1, timespan="day", from_=start, to=end)
     doc = _get(path, {"adjusted": str(bool(adjusted)).lower(), "limit": 50000})
-    return [normalize_agg(r, contract_symbol=symbol) for r in (doc.get("results") or [])]
+    return [normalize_agg(r, contract_symbol=symbol) for r in _rows(doc)]
 
 
 def _row_scope(rows: list[dict[str, Any]]) -> tuple[set[str], list[str], set[str]]:
-    underlyings = {str(r.get("underlying_ticker") or "?") for r in rows}
-    expirations = sorted({str(r.get("expiration_date") or "?") for r in rows})
-    tickers = {str(r.get("ticker") or "?") for r in rows}
+    for row in rows:
+        if any(not isinstance(row.get(key), str) or not row[key]
+               for key in ("underlying_ticker", "expiration_date", "ticker")):
+            raise MassiveError("Contract sample lacks a ticker, underlying or expiration", "INVALID_RESPONSE")
+        try:
+            _date(row["expiration_date"])
+        except ValueError:
+            raise MassiveError("Contract sample has an invalid expiration date", "INVALID_RESPONSE") from None
+    underlyings = {r["underlying_ticker"] for r in rows}
+    expirations = sorted({r["expiration_date"] for r in rows})
+    tickers = {r["ticker"] for r in rows}
+    if len(tickers) != len(rows):
+        raise MassiveError("Duplicate contracts in diagnostic sample", "INVALID_RESPONSE")
     return underlyings, expirations, tickers
 
 
@@ -271,7 +332,8 @@ def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
                     pause_seconds: float = 13.0) -> list[dict[str, Any]]:
     """Five-rung, fail-closed access diagnostic.
 
-    Constant sort/order parameters make the three-row samples deterministic.
+    A unique ticker sort avoids expiry ties; samples can still change if the
+    vendor updates its data. A changed sample is not proof of listing history.
     Each rung then adds one capability-bearing query parameter:
       1 bare control
       2 underlying_ticker
@@ -279,8 +341,8 @@ def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
       4 expiration_date.gte=<as_of>
       5 as_of=<as_of>
 
-    `OK` means the response directly proves the parameter did what can be
-    mechanically checked. `CONSISTENT` means the final point-in-time response
+    `OK` means the returned sample passes the stated mechanical check, not
+    proof that every server-side filter or every historical date works. `CONSISTENT` means the final point-in-time response
     changed in a way consistent with `as_of`; it is stronger than a blind 200
     but deliberately not called proof of the vendor's full historical semantics.
     `UNVERIFIED` means the sample did not contradict the request but also did not
@@ -288,9 +350,11 @@ def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
     UNVERIFIED final rung.
     """
     as_of = as_of or (datetime.now(NY).date() - timedelta(days=400)).isoformat()
-    date.fromisoformat(as_of)  # reject malformed dates before spending a call
-    want = underlying.strip().upper()
-    base = {"sort": "expiration_date", "order": "asc", "limit": 3}
+    _date(as_of)  # reject malformed dates before spending a call
+    want = _underlying(underlying)
+    if _finite(pause_seconds) is None or pause_seconds < 0:
+        raise ValueError("pause_seconds must be finite and nonnegative")
+    base = {"sort": "ticker", "order": "asc", "limit": 3}
     rungs = [
         ("bare", dict(base), "does the endpoint answer this key at all?"),
         ("underlying filter", {**base, "underlying_ticker": want},
@@ -320,12 +384,13 @@ def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
         }
         try:
             doc = _get(CONTRACTS_PATH, params)
+            rows = _rows(doc)
+            scope = _row_scope(rows) if rows else None
         except MassiveError as e:
             step.update(verdict=e.kind, detail=str(e))
             out.append(step)
             break
 
-        rows = doc.get("results") or []
         step["returned"] = len(rows)
         if not rows:
             step["verdict"] = "EMPTY"
@@ -333,7 +398,7 @@ def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
             previous_tickers = set()
             continue
 
-        underlyings, expirations, tickers = _row_scope(rows)
+        underlyings, expirations, tickers = scope
         step["underlyings_returned"] = sorted(underlyings)[:5]
         step["expirations_returned"] = expirations[:5]
 
@@ -355,7 +420,7 @@ def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
                 step["detail"] = ("expired=true returned rows, but this three-row sample "
                                   "contains no contract expired today; do not infer history access")
         elif name == "point in time":
-            if previous_tickers is not None and tickers != previous_tickers:
+            if previous_tickers and tickers != previous_tickers:
                 step["verdict"] = "CONSISTENT"
                 step["detail"] = ("adding as_of changed the deterministic contract sample while "
                                   "all explicit scope checks still passed")
@@ -368,7 +433,7 @@ def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
             step["verdict"] = "OK"
 
         out.append(step)
-        previous_tickers = tickers
+        previous_tickers = tickers if step["verdict"] == "OK" else None
 
     return out
 
@@ -382,7 +447,7 @@ def probe(underlying: str = "SPY", as_of: str | None = None) -> dict[str, Any]:
         doc = _get(CONTRACTS_PATH, {"underlying_ticker": underlying.upper(),
                                     "as_of": as_of, "expired": "true", "limit": 5,
                                     "expiration_date.gte": as_of})
-        contracts = _validate_contracts(doc.get("results") or [], underlying, as_of)
+        contracts = _validate_contracts(_rows(doc), underlying, as_of)
     except MissingCredential as e:
         out.update(ok=False, reason="NO_KEY", detail=str(e))
         return out
@@ -390,7 +455,7 @@ def probe(underlying: str = "SPY", as_of: str | None = None) -> dict[str, Any]:
         out.update(ok=False, detail=str(e), reason=e.kind)
         return out
 
-    rows = doc.get("results") or []
+    rows = _rows(doc)
     if not rows:
         out.update(ok=False, reason="NO_MATCHING_CONTRACTS",
                    detail="No matching reference contracts returned; access is inconclusive.")

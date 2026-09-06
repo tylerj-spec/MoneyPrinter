@@ -103,7 +103,7 @@ def ladder_uses_deterministic_samples_and_one_capability_parameter_per_rung():
         set(), {"underlying_ticker"}, {"underlying_ticker", "expired"},
         {"underlying_ticker", "expired", "expiration_date.gte"},
         {"underlying_ticker", "expired", "expiration_date.gte", "as_of"}]
-    assert all(c["sort"] == "expiration_date" and c["order"] == "asc" for c in calls)
+    assert all(c["sort"] == "ticker" and c["order"] == "asc" for c in calls)
     assert steps[-1]["verdict"] == "UNVERIFIED", steps[-1]
 
 @test
