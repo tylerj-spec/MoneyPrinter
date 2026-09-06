@@ -37,8 +37,12 @@ from typing import Any, Sequence
 from gates.risk import RiskLimits, evaluate as evaluate_gate
 from labels.contract import HORIZON_TRADING_DAYS
 from strategy.variants import Variant, score as score_variant
+from strategy.contract_selection import (
+    ContractSelectionPolicy, DEFAULT_POLICY, eligible, rank_contracts,
+    selection_audit, selection_metrics, _num,
+)
 
-PICK_CONTRACT_VERSION = "0.3.0"
+PICK_CONTRACT_VERSION = "0.4.0"
 
 # Required keys on an option row handed to this module. Stated so the coupling
 # to whatever produced the chain is explicit rather than discovered at runtime.
@@ -88,22 +92,13 @@ class ExitPolicy:
 
 
 def select_contract(option_rows: Sequence[dict[str, Any]], *, kind: str,
-                    target_abs_delta: float) -> tuple[dict | None, str]:
-    """Closest liquid contract to the variant's delta target.
-
-    Returns (row, reason). A None row always carries a reason, so an abstention
-    is never silent.
-    """
-    missing_keys = [k for k in REQUIRED_OPTION_KEYS
-                    if option_rows and k not in option_rows[0]]
-    if missing_keys:
-        return None, f"option rows are missing required keys: {', '.join(missing_keys)}"
-
-    candidates = [r for r in option_rows
-                  if r.get("type") == kind
-                  and r.get("model_status") == "OK"
-                  and r.get("liquidity_screen") == "PASS"
-                  and isinstance(r.get("delta"), (int, float))]
+                    target_abs_delta: float,
+                    selection_policy: ContractSelectionPolicy = DEFAULT_POLICY,
+                    limits: RiskLimits = RiskLimits()) -> tuple[dict | None, str]:
+    """Select a numerically valid liquid contract under a versioned policy."""
+    # A corrupt row must not approve itself by carrying an upstream PASS flag.
+    candidates = [r for r in option_rows if eligible(r, kind, limits)]
+    option_rows = [r for r in option_rows if isinstance(r, dict)]
     if not candidates:
         n_kind = sum(1 for r in option_rows if r.get("type") == kind)
         matching = [r for r in option_rows if r.get("type") == kind]
@@ -113,16 +108,21 @@ def select_contract(option_rows: Sequence[dict[str, Any]], *, kind: str,
                                        ("screen_open_interest", "open interest"),
                                        ("screen_volume", "volume"))}
         failures["unmodellable Greeks"] = sum(r.get("model_status") != "OK" for r in matching)
+        failures["invalid contract fields"] = sum(
+            r.get("model_status") == "OK" and r.get("liquidity_screen") == "PASS"
+            and not eligible(r, kind, limits) for r in matching)
         detail = "; ".join(f"{label}: {count}/{n_kind}" for label, count in failures.items()
                            if count)
         return None, (f"no {kind} passed the liquidity screen with modellable Greeks "
                       f"({n_kind} {kind}s in the snapshot)" +
                       (f". Failed checks (can overlap): {detail}" if detail else ""))
 
-    best = min(candidates, key=lambda r: (abs(abs(r["delta"]) - target_abs_delta),
-                                          r["relative_spread"] if r.get("relative_spread")
-                                          is not None else 9.9))
-    return best, "closest liquid strike to the variant's delta target"
+    best = rank_contracts(candidates, target_abs_delta, selection_policy)[0]
+    reason = ("closest liquid strike to the variant's delta target"
+              if selection_policy.mode == "delta" else
+              "cost-aware research policy: execution drag within delta tolerance; "
+              "nearest-delta fallback outside tolerance; not a learned optimum")
+    return best, reason
 
 
 def breakeven_move_pct(row: dict[str, Any]) -> float | None:
@@ -130,20 +130,21 @@ def breakeven_move_pct(row: dict[str, Any]) -> float | None:
 
     cost / (|delta| x 100) is the dollar move the underlying must make for the
     contract to gain the cost back, to first order. Expressed as a fraction of
-    spot. First-order only: it ignores gamma, and it ignores theta, so the real
-    hurdle over a five-day hold is HIGHER than this figure, not lower.
+    spot. First-order only: it ignores gamma, theta and changes in IV.
+    It is an execution-cost hurdle, not an expiry or holding-period breakeven.
     """
     delta, cost, spot = row.get("delta"), row.get("round_trip_cost_1x"), row.get("underlying_close")
-    if not all(isinstance(v, (int, float)) for v in (delta, cost, spot)):
+    if any(_num(v) is None for v in (delta, cost, spot)):
         return None
-    if not delta or not spot:
+    if not delta or spot <= 0 or cost < 0:
         return None
     return abs(cost / (abs(delta) * 100.0) / spot)
 
 
 def build_rationale(ticker: str, variant: Variant, composite: float,
                     comps: dict[str, Any], row: dict[str, Any],
-                    breakeven: float | None) -> str:
+                    breakeven: float | None,
+                    selection_policy: ContractSelectionPolicy = DEFAULT_POLICY) -> str:
     """One paragraph, assembled from the numbers actually used.
 
     Every figure quoted here is computed above, not asserted. The closing
@@ -178,8 +179,8 @@ def build_rationale(ticker: str, variant: Variant, composite: float,
         f"realised volatility {mag(raw.get('realised_vol_20d'))} annualised, "
         f"{pct(raw.get('drawdown_from_252d_high'))} from its 252-day high.",
         f"The proposal is the {row['expiration']} {row['strike']:g} {kind} at "
-        f"{row['delta']:+.2f} delta ({row['dte']} DTE), the closest liquid strike to this "
-        f"variant's {variant.target_abs_delta:.2f} delta target, quoted "
+        f"{row['delta']:+.2f} delta ({row['dte']} DTE), selected by the "
+        f"{selection_policy.mode} policy against a {variant.target_abs_delta:.2f} delta target, quoted "
         f"{row['bid']:.2f}/{row['ask']:.2f} — a {row['relative_spread']:.1%} spread with "
         f"{row['open_interest']:,} open interest and {row['volume']:,} contracts traded.",
     ]
@@ -187,8 +188,8 @@ def build_rationale(ticker: str, variant: Variant, composite: float,
         parts.append(
             f"Round-trip execution cost is ${row['round_trip_cost_1x']:.2f} per contract, so "
             f"{ticker} must move about {breakeven:.1%} in the chosen direction simply to break "
-            f"even on costs — before any theta decay over the holding period, which makes the "
-            f"real hurdle higher still.")
+            f"even on execution costs alone. This first-order estimate excludes theta, gamma "
+            f"and changing IV; it is not a profit forecast or expiry breakeven.")
     parts.append(
         "No edge has been demonstrated for any of these components: none has a measured rank "
         "information coefficient against forward excess return in this project. This is a "
@@ -204,6 +205,7 @@ def generate_picks(
     variants: Sequence[Variant],
     exit_policy: ExitPolicy,
     limits: RiskLimits | None = None,
+    selection_policy: ContractSelectionPolicy = DEFAULT_POLICY,
 ) -> list[dict[str, Any]]:
     """One pick per (variant, ticker) that clears its conviction floor.
 
@@ -228,6 +230,7 @@ def generate_picks(
                 "weights": variant.normalised_weights(),
                 "ticker": ticker,
                 "contract_version": PICK_CONTRACT_VERSION,
+                "selection_policy": selection_policy.to_dict(),
             }
 
             if payload.get("precondition_reason"):
@@ -253,7 +256,8 @@ def generate_picks(
 
             kind = "CALL" if composite > 0 else "PUT"
             row, why = select_contract(rows, kind=kind,
-                                       target_abs_delta=variant.target_abs_delta)
+                                       target_abs_delta=variant.target_abs_delta,
+                                       selection_policy=selection_policy, limits=limits)
             if row is None:
                 out.append({**base, "action": "ABSTAIN", "reason": why})
                 continue
@@ -282,6 +286,10 @@ def generate_picks(
                     "underlying_close_date": row.get("underlying_close_date"),
                 },
                 "selection_reason": why,
+                "selection_metrics": selection_metrics(row, variant.target_abs_delta, selection_policy),
+                "selection_audit": selection_audit(
+                    [r for r in rows if eligible(r, kind, limits)],
+                    variant.target_abs_delta, selection_policy),
                 "entry_fill_estimate": row["ask"],   # a buyer crosses the spread
                 "fill_convention": "CONSERVATIVE_ASK_ENTRY_BID_EXIT",
                 "round_trip_cost_1x": row["round_trip_cost_1x"],
@@ -290,7 +298,7 @@ def generate_picks(
                 "gate_decision": verdict.decision.value,
                 "gate_failed": verdict.failed_gates,
                 "edge_status": "NOT_DEMONSTRATED",
-                "rationale": build_rationale(ticker, variant, composite, comps, row, be),
+                "rationale": build_rationale(ticker, variant, composite, comps, row, be, selection_policy),
             })
     return out
 

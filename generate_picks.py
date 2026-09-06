@@ -30,6 +30,7 @@ excess return. The picks are hypotheses. The forward record is the experiment.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -50,6 +51,7 @@ from strategy import components                 # noqa: E402
 from strategy.picks import (                    # noqa: E402
     ExitPolicy, approximate_assessment_date, freeze, generate_picks,
 )
+from strategy.contract_selection import ContractSelectionPolicy
 from strategy.variants import BY_NAME, VARIANTS  # noqa: E402
 from common.timezones import US_EASTERN
 from labels.contract import decision_time_utc_for as decision_time_utc
@@ -89,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tickers", default=None, help="comma-separated subset")
     ap.add_argument("--variants", default=None,
                     help=f"comma-separated subset of: {', '.join(BY_NAME)}")
+    ap.add_argument("--selection-policy", choices=("delta", "cost_aware"), default="delta",
+                    help="delta preserves the baseline; cost_aware is an unvalidated paper experiment")
     now = datetime.now(timezone.utc)
     today = now.astimezone(US_EASTERN).date().isoformat()
     ap.add_argument("--decision-date", default=today,
@@ -134,7 +138,8 @@ def main(argv: list[str] | None = None) -> int:
 
     policy = ExitPolicy()
     picks = generate_picks(a.decision_date, per_ticker, variants=chosen,
-                           exit_policy=policy, limits=RiskLimits())
+                           exit_policy=policy, limits=RiskLimits(),
+                           selection_policy=ContractSelectionPolicy(mode=a.selection_policy))
 
     frozen = freeze(
         a.decision_date, picks, exit_policy=policy,
@@ -142,7 +147,11 @@ def main(argv: list[str] | None = None) -> int:
         generated_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         source_files={"bars": data["files"], "chains": data["chain_files"],
                       "risk_free_rate": a.risk_free_rate,
-                      "decision_cutoff_utc": cutoff.isoformat()},
+                      "decision_cutoff_utc": cutoff.isoformat(),
+                      "selection_policy": a.selection_policy,
+                      "prepared_inputs_sha256": hashlib.sha256(json.dumps(
+                          per_ticker, sort_keys=True, default=str, allow_nan=False
+                      ).encode("utf-8")).hexdigest()},
     )
 
     proposed = [p for p in picks if p["action"] != "ABSTAIN"]

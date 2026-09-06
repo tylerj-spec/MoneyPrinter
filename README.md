@@ -6,9 +6,37 @@ An AI-agent-coordinated market-intelligence and options-research project. Built 
 
 ## Status
 
-163 tests passing (Run → Run the test suite, or `python run_tests.py`): 131 in `claude/app/mp_v01/`, 32 covering the Excel export and GUI. CI runs on Linux **and Windows**. Zero external dependencies on Linux/macOS; on Windows, `pip install tzdata` is needed once.
+Run `python run_tests.py` for the current test totals. CI covers Linux and Windows; a virtual-display check exercises actual Tk widgets as well as headless logic. Windows needs `tzdata`; Excel checks additionally use `openpyxl`.
 
 **NEW**: Market Intelligence Engine (DEVELOPMENT ONLY — see CODE_REVIEW_2026-08-13.md)
+
+## PR #11: diagnostics, appearance and research records
+
+Use **Appearance** in the desktop app to choose light or dark mode. The choice
+is saved; API credentials are not. OS-native window decorations and dialogs
+retain their operating-system appearance.
+
+The default contract policy is still nearest delta. An opt-in `cost_aware`
+research policy records execution drag, theta burden, DTE, liquidity and
+baseline/challenger choices. It is **not a trained profitability predictor**.
+New pick envelopes are version 0.4.0; original files are never rewritten.
+
+```powershell
+py -3 -X utf8 .\fetch_massive.py --diagnose --tickers SPY --as-of 2025-08-01 --prompt-key
+py -3 -X utf8 .\generate_picks.py --selection-policy cost_aware
+py -3 -X utf8 .\export_research.py
+```
+
+The diagnostic's hidden prompt is session-only. It makes at most five paced
+reference calls, never an automatic backfill. `CONSISTENT` is not historical
+verification; `UNVERIFIED` is not a failed subscription. Read the
+[PR #11 code review and verdict guide](CODE_REVIEW_PR11.md) before using a key.
+
+**Run -> Export research inputs and outcomes** writes separate JSONL files plus
+a checksummed manifest under the output root's `research` directory. Frozen
+inputs are not recomputed from future bars; outcomes retain model/market path
+provenance. Rejected, duplicate, abstaining and unresolved records are reported.
+This is an audit/export tool, not automatic weight tuning or an options backtester.
 
 ## Why this exists
 
@@ -387,7 +415,7 @@ above asks for **≥200 non-overlapping decisions** before any of it means anyth
 ## Installation
 
 1. **Python 3.10 or newer.** On Windows install from python.org with
-   **"Add python.exe to PATH"** ticked. Verified working on 3.10 through 3.14.
+   **"Add python.exe to PATH"** ticked. CI covers 3.10, 3.11 and 3.12; PR #11 was also tested locally on 3.13.5.
 2. **Clone or download this repository.**
 3. **Start the app** — `run_gui.bat` on Windows, `python gui.py` elsewhere.
 4. **Press "Install required packages"** inside the app.
@@ -421,5 +449,5 @@ the PATH box ticked.
 
 ---
 
-**Last Updated**: August 29, 2026  
-**Version**: 2.8.0 (Every step behind a button, Windows CI, 163 tests)
+**Last Updated**: September 5, 2026 (US Central)  
+**Research records**: new pick envelopes are version 0.4.0; see the PR #11 review for test scope and limitations.

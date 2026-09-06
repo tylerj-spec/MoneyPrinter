@@ -19,6 +19,7 @@ STEPS = [
     ("Dashboard (offline HTML)", "tests/test_dashboard.py"),
     ("GUI (headless)", "tests/test_gui.py"),
     ("Run output regressions", "tests/test_run_regressions.py"),
+    ("PR11 diagnostics, selection, research and themes", "tests/test_pr11.py"),
 ]
 
 failed = []

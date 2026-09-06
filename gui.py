@@ -34,6 +34,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, scrolledtext, ttk
 
 from app_paths import get_paths, migrate_legacy, SETTINGS_FILE, OUTPUT_ENV
+from ui_theme import apply_theme, log_styles, normalise_theme, palette_for
 
 PATHS = get_paths()
 HERE = Path(__file__).resolve().parent
@@ -50,6 +51,7 @@ BACKTEST_SCRIPT = HERE / "backtest.py"
 BACKTESTS_DIR = PATHS.backtests
 DASHBOARD_SCRIPT = HERE / "dashboard.py"
 DASHBOARD_FILE = PATHS.dashboard
+RESEARCH_SCRIPT = HERE / "export_research.py"
 
 # Everything a first run needs. Kept here rather than in a document so the
 # "Install required packages" button and the docs cannot drift apart.
@@ -150,7 +152,7 @@ class MoneyPrinterGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("MoneyPrinter — market data to Excel")
-        self.geometry("1020x720")
+        self.geometry("1020x760")
         self.minsize(860, 560)
 
         self._runner: SubprocessRunner | None = None
@@ -163,6 +165,7 @@ class MoneyPrinterGUI(tk.Tk):
         self._out_q: queue.Queue = queue.Queue()
 
         saved = self._load_settings()
+        self.theme_var = tk.StringVar(value=normalise_theme(saved.get("theme")))
         self.paths = get_paths()
         migration = migrate_legacy(self.paths, settings=saved)
         self.tickers_var = tk.StringVar(value=saved.get("tickers", "SPY,QQQ,MSFT"))
@@ -186,6 +189,7 @@ class MoneyPrinterGUI(tk.Tk):
         self.mie_tickers_var = tk.StringVar(value=saved.get("mie_tickers", "AAPL,MSFT,GOOGL"))
 
         self._build_ui()
+        self._apply_theme()
         self._log(f"Output folder: {self.paths.root}\n", "info")
         if migration["copied"]:
             self._log(f"Copied {migration['copied']} existing output files. Originals preserved.\n", "info")
@@ -210,12 +214,19 @@ class MoneyPrinterGUI(tk.Tk):
 
         head = ttk.Frame(self, padding=(12, 10, 12, 0))
         head.pack(fill=tk.X)
-        ttk.Label(head, text="MoneyPrinter", font=("Segoe UI", 16, "bold")).pack(anchor=tk.W)
+        heading = ttk.Frame(head)
+        heading.pack(fill=tk.X)
+        theme_box = ttk.Combobox(heading, textvariable=self.theme_var,
+                                values=("light", "dark"), state="readonly", width=8)
+        theme_box.pack(side=tk.RIGHT, anchor=tk.N)
+        theme_box.bind("<<ComboboxSelected>>", self._change_theme)
+        ttk.Label(heading, text="Appearance").pack(side=tk.RIGHT, padx=6)
+        ttk.Label(heading, text="MoneyPrinter", font=("Segoe UI", 16, "bold")).pack(anchor=tk.W)
         ttk.Label(
             head,
             text="Fetch point-in-time market data, price the option chain, and log frozen "
                  "paper picks. Paper/simulation research only — nothing here places an order.",
-            foreground="#555555", wraplength=980, justify=tk.LEFT,
+            style="Muted.TLabel", wraplength=980, justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(2, 8))
 
         # --- setup: the two things that used to require a terminal ----------
@@ -227,7 +238,7 @@ class MoneyPrinterGUI(tk.Tk):
         self.diag_btn = ttk.Button(setup, text="Check setup", command=self.check_setup)
         self.diag_btn.pack(side=tk.LEFT, padx=6)
         ttk.Label(setup, text="Run these once, or any time something looks wrong.",
-                  foreground="#777777").pack(side=tk.LEFT, padx=8)
+                  style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
 
         # --- what to fetch --------------------------------------------------
         box = ttk.LabelFrame(self, text=" What to fetch ", padding=10)
@@ -241,7 +252,7 @@ class MoneyPrinterGUI(tk.Tk):
         ttk.Label(row, text="End").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.end_var, width=12).pack(side=tk.LEFT, padx=(6, 16))
         ttk.Label(row, text="option chains snapshotted automatically",
-                  foreground="#777777").pack(side=tk.LEFT)
+                  style="Muted.TLabel").pack(side=tk.LEFT)
 
         key_row = ttk.Frame(box)
         key_row.pack(fill=tk.X, pady=(8, 0))
@@ -256,14 +267,14 @@ class MoneyPrinterGUI(tk.Tk):
                    command=self.diagnose_massive_key).pack(side=tk.LEFT, padx=6)
         ttk.Button(key_row, text="Historical options",
                    command=self.fetch_massive).pack(side=tk.LEFT, padx=6)
-        self.key_status = ttk.Label(key_row, text="", foreground="#777777")
+        self.key_status = ttk.Label(key_row, text="", style="Muted.TLabel")
         self.key_status.pack(side=tk.LEFT, padx=8)
 
         ttk.Label(
             box,
             text=f"Keep {BENCHMARK} in the list — the label is excess return vs {BENCHMARK}, "
                  f"so without it no labels can be built for anything else.",
-            foreground="#777777",
+            style="Muted.TLabel",
         ).pack(anchor=tk.W, pady=(6, 0))
 
         # --- the workflow, in order -----------------------------------------
@@ -290,6 +301,13 @@ class MoneyPrinterGUI(tk.Tk):
         self.stop_btn = ttk.Button(steps, text="Stop", command=self.stop_running,
                                    state=tk.DISABLED)
         self.stop_btn.pack(side=tk.RIGHT)
+        # Wrap the workflow instead of hiding Open/Stop beyond the right edge.
+        workflow_buttons = steps.winfo_children()
+        for button in workflow_buttons:
+            button.pack_forget()
+        for index, button in enumerate(workflow_buttons):
+            button.grid(row=index // 4, column=index % 4, sticky="ew", padx=3, pady=3)
+            steps.columnconfigure(index % 4, weight=1)
 
         root_row = ttk.Frame(self, padding=(12, 8))
         root_row.pack(fill=tk.X)
@@ -324,13 +342,13 @@ class MoneyPrinterGUI(tk.Tk):
         bar.pack(fill=tk.X)
         ttk.Label(bar, text="Console", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
         ttk.Label(bar, text="   every command this app runs is echoed here",
-                  foreground="#777777").pack(side=tk.LEFT)
-        self.elapsed_label = ttk.Label(bar, text="", foreground="#777777")
+                  style="Muted.TLabel").pack(side=tk.LEFT)
+        self.elapsed_label = ttk.Label(bar, text="", style="Muted.TLabel")
         self.elapsed_label.pack(side=tk.RIGHT)
         ttk.Button(bar, text="Clear", command=self.clear_console).pack(side=tk.RIGHT, padx=6)
 
         self.text = scrolledtext.ScrolledText(con, wrap=tk.WORD, font=("Consolas", 9),
-                                              height=16, background="#FBFBFB")
+                                              height=10)
         self.text.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
         self.text.configure(state=tk.DISABLED)
         for tag, cfg in self._tag_styles.items():
@@ -338,7 +356,7 @@ class MoneyPrinterGUI(tk.Tk):
 
         # --- status ---------------------------------------------------------
         status = ttk.Frame(self)
-        status.pack(side=tk.BOTTOM, fill=tk.X)
+        status.pack(side=tk.BOTTOM, fill=tk.X, before=con)
         self.status = ttk.Label(status, text="Ready", relief=tk.SUNKEN, anchor=tk.W, padding=4)
         self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.progress = ttk.Progressbar(status, mode="indeterminate", length=120)
@@ -379,10 +397,17 @@ class MoneyPrinterGUI(tk.Tk):
         m_run.add_separator()
         m_run.add_command(label="Score a specific pick file…", command=self.score_picks_choose)
         m_run.add_command(label="Run the test suite", command=self.run_tests)
+        m_run.add_command(label="Export research inputs and outcomes", command=self.export_research)
         m_run.add_separator()
         m_run.add_command(label="Market Intelligence Engine (development only)",
                           command=self.run_mie)
         menubar.add_cascade(label="Run", menu=m_run)
+
+        m_view = tk.Menu(menubar, tearoff=0)
+        for name in ("light", "dark"):
+            m_view.add_radiobutton(label=name.title(), value=name,
+                                   variable=self.theme_var, command=self._change_theme)
+        menubar.add_cascade(label="Appearance", menu=m_view)
 
         m_help = tk.Menu(menubar, tearoff=0)
         m_help.add_command(label="What each button does", command=self.show_help)
@@ -391,14 +416,18 @@ class MoneyPrinterGUI(tk.Tk):
         self.config(menu=menubar)
 
     def _setup_tags(self) -> None:
-        self._tag_styles = {
-            "success": {"foreground": "#0B7A28"},
-            "error": {"foreground": "#C0281C"},
-            "warning": {"foreground": "#B26B00"},
-            "command": {"foreground": "#1F5FBF"},
-            "info": {"foreground": "#777777"},
-            "normal": {"foreground": "#1A1A1A"},
-        }
+        self._tag_styles = log_styles(self.theme_var.get())
+
+    def _apply_theme(self) -> None:
+        apply_theme(self, self.theme_var.get())
+        self._setup_tags()
+        self.status.configure(foreground=palette_for(self.theme_var.get())[
+            getattr(self, "_status_role", "normal")])
+
+    def _change_theme(self, event=None) -> None:
+        self.theme_var.set(normalise_theme(self.theme_var.get()))
+        self._apply_theme()
+        self._save_settings()
 
     # -- small helpers -----------------------------------------------------
 
@@ -416,8 +445,9 @@ class MoneyPrinterGUI(tk.Tk):
         self.text.delete(1.0, tk.END)
         self.text.configure(state=tk.DISABLED)
 
-    def _set_status(self, text: str, color: str = "black") -> None:
-        self.status.config(text=text, foreground=color)
+    def _set_status(self, text: str, color: str = "normal") -> None:
+        self._status_role = color
+        self.status.config(text=text, foreground=palette_for(self.theme_var.get())[color])
 
     def _busy(self, busy: bool) -> None:
         for b in self._job_buttons:
@@ -453,7 +483,8 @@ class MoneyPrinterGUI(tk.Tk):
 
     def _load_settings(self) -> dict:
         try:
-            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            return saved if isinstance(saved, dict) else {}
         except Exception:
             return {}
 
@@ -464,6 +495,7 @@ class MoneyPrinterGUI(tk.Tk):
                 "start": self.start_var.get(),
                 "output_root": str(self.paths.root),
                 "mie_tickers": self.mie_tickers_var.get(),
+                "theme": normalise_theme(self.theme_var.get()),
             }, indent=2), encoding="utf-8")
         except Exception:
             pass          # a settings file we cannot write is not worth a dialog
@@ -543,7 +575,7 @@ class MoneyPrinterGUI(tk.Tk):
 
         if code == 0 and self._pending_dashboard is not None:
             page = self._pending_dashboard
-            self._set_status(f"Dashboard ready — {page.name}", "#0B7A28")
+            self._set_status(f"Dashboard ready — {page.name}", "success")
             self._log(f"\nOpening {page} in your browser.\n", "success")
             try:
                 webbrowser.open(page.as_uri())
@@ -552,13 +584,13 @@ class MoneyPrinterGUI(tk.Tk):
                           f"  {page}\n", "warning")
         elif code == 0 and self._pending_workbook is not None:
             self._last_workbook = self._pending_workbook
-            self._set_status(f"Workbook ready — {self._last_workbook.name}", "#0B7A28")
+            self._set_status(f"Workbook ready — {self._last_workbook.name}", "success")
             self._log(f"\nOpen it with 'Open output folder', or double-click:\n"
                       f"  {self._last_workbook}\n", "success")
         elif code == 0:
-            self._set_status("Finished", "#0B7A28")
+            self._set_status("Finished", "success")
         else:
-            self._set_status(f"Last run failed (exit {code}) — see console", "#C0281C")
+            self._set_status(f"Last run failed (exit {code}) — see console", "error")
         self._pending_workbook = None
         self._pending_dashboard = None
         self._save_settings()
@@ -671,7 +703,7 @@ class MoneyPrinterGUI(tk.Tk):
             "A successful reference probe does not verify historical price access.\n\n"
             "The key goes to the child process through the environment, not the\n"
             "command line - the '$ ...' line below will not contain it.\n\n", "info")
-        self.key_status.config(text="testing...", foreground="#777777")
+        self.key_status.config(text="testing...", style="Muted.TLabel")
         self._start([MASSIVE_SCRIPT, "--probe"], "fetch_massive.py --probe",
                     HERE, env_extra=self._massive_env())
 
@@ -872,7 +904,7 @@ class MoneyPrinterGUI(tk.Tk):
             (None, "1 · Fetch market data — downloads daily bars from Yahoo for the tickers "
                    "listed above. Every run writes a new immutable file and overwrites "
                    "nothing.\n\n"
-                   "Tick 'also snapshot option chains' before fetching if you want Greeks or "
+                   "Option chains are snapshotted automatically during step 1 for Greeks and "
                    "picks. Yahoo has no historical chains, so a daily snapshot is the only "
                    "way to accumulate options history — and without a chain there is nothing "
                    "to compute Greeks from or choose a contract out of.\n\n"
@@ -938,9 +970,15 @@ class MoneyPrinterGUI(tk.Tk):
             txt.insert(tk.END, body + "\n", tag or "")
         txt.configure(state=tk.DISABLED)
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+        self._apply_theme()
 
     def open_picks(self) -> None:
         self._reveal(self.paths.picks)
+
+    def export_research(self) -> None:
+        self._banner("Exporting frozen inputs and separate outcomes")
+        self._start([RESEARCH_SCRIPT, "--picks-dir", self.paths.picks,
+                     "--data-dir", self.paths.data], "export_research.py", HERE)
 
     def run_tests(self) -> None:
         self._banner("Running every test suite (no network, no market data)")
