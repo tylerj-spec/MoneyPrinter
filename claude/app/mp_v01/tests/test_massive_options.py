@@ -4,6 +4,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 from datetime import datetime, timezone
+from unittest.mock import patch
 from harness import test, assert_raises, run_all
 from adapters import massive_options as mv
 
@@ -68,15 +69,30 @@ def a_proxy_refusing_a_tunnel_is_not_an_entitlement_verdict():
     assert mv.MassiveError("proxy says 403", "UNREACHABLE").kind == "UNREACHABLE"
 
 
-def _ladder(responses):
+def _ladder(responses, *, now=None):
+    """Freeze the observation clock as well as the network.
+
+    January 2026 is future relative to this fixture's September 2025 clock,
+    not relative to the machine running CI. Do not move expirations forward
+    every year or change the expected verdict to hide clock-dependent tests.
+    """
+    instant = now or datetime(2025, 9, 5, 16, 0, tzinfo=timezone.utc)
     calls = []
+
+    class FixtureClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
     def fake_get(path, params=None, **kw):
-        calls.append(dict(params or {})); r = responses[len(calls)-1]
-        if isinstance(r, Exception): raise r
-        return r
-    original = mv._get; mv._get = fake_get
-    try: return mv.diagnose_access("SPY", "2025-08-01", pause_seconds=0), calls
-    finally: mv._get = original
+        calls.append(dict(params or {}))
+        response = responses[len(calls) - 1]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    with patch.object(mv, "_get", fake_get), patch.object(mv, "datetime", FixtureClock):
+        return mv.diagnose_access("SPY", "2025-08-01", pause_seconds=0), calls
 
 @test
 def ladder_uses_deterministic_samples_and_one_capability_parameter_per_rung():
@@ -100,6 +116,14 @@ def ignored_underlying_is_caught_immediately():
 def expired_true_is_not_claimed_verified_without_an_expired_sample():
     steps, _ = _ladder([{"results":[row()]}]*5)
     assert steps[2]["verdict"] == "UNVERIFIED", steps[2]
+
+@test
+def expiry_verdict_changes_only_when_the_injected_clock_crosses_expiry():
+    docs = [{"results": [row()]}] * 5
+    for year, expected in ((2025, "UNVERIFIED"), (2026, "OK"), (2030, "OK")):
+        steps, _ = _ladder(docs, now=datetime(year, 9, 5, 16, tzinfo=timezone.utc))
+        assert steps[2]["verdict"] == expected, (year, steps[2])
+    assert mv.datetime is datetime, "the test clock must never leak into other tests"
 
 @test
 def expired_true_is_verified_when_sample_contains_an_already_expired_contract():
