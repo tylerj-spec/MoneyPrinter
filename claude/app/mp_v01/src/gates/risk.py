@@ -114,9 +114,7 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
 
     if candidate.get("unresolved_contradictions"):
         failed.append("unresolved_contradictions")
-        reasons.append(
-            f"{len(candidate['unresolved_contradictions'])} contradiction(s) unresolved"
-        )
+        reasons.append("unresolved evidence contradictions")
 
     if candidate.get("cutoff_violations"):
         failed.append("cutoff_violation")
@@ -143,9 +141,9 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
         failed.append("insufficient_volume")
         reasons.append(f"volume {vol} < {limits.min_daily_volume}")
 
-    if limits.require_defined_risk and not candidate.get("defined_risk", False):
+    if limits.require_defined_risk and candidate.get("defined_risk") is not True:
         failed.append("undefined_risk_structure")
-        reasons.append("structure has undefined/unbounded loss")
+        reasons.append("defined_risk must explicitly be the Boolean true")
 
     # --- Expectancy AFTER costs -----------------------------------------
     edge = need("expected_edge_after_costs")
@@ -154,7 +152,7 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
         reasons.append(f"edge after costs {edge:+.4f} is not positive")
 
     # --- Sizing ----------------------------------------------------------
-    size = candidate.get("position_pct")
+    size = need("position_pct")
     if size is not None:
         if not _is_number(size):
             _reject_type("position_pct", size)
@@ -165,7 +163,7 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
             failed.append("position_too_large")
             reasons.append(f"size {size:.1%} > {limits.max_position_pct:.1%}")
 
-    heat = candidate.get("portfolio_heat_pct")
+    heat = need("portfolio_heat_pct")
     if heat is not None:
         if not _is_number(heat):
             _reject_type("portfolio_heat_pct", heat)
@@ -176,7 +174,7 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
             failed.append("portfolio_heat_exceeded")
             reasons.append(f"heat {heat:.1%} > {limits.max_portfolio_heat_pct:.1%}")
 
-    open_n = candidate.get("open_positions")
+    open_n = need("open_positions")
     if open_n is not None:
         if not _is_number(open_n):
             _reject_type("open_positions", open_n)
@@ -186,6 +184,28 @@ def evaluate(candidate: dict, limits: RiskLimits = RiskLimits()) -> GateResult:
         elif open_n >= limits.max_open_positions:
             failed.append("max_positions_reached")
             reasons.append(f"{open_n} open >= {limits.max_open_positions}")
+
+    # Finite values still need valid domains. These are hard failures.
+    for key, value in (("independent_events", n_events), ("dte", dte),
+                       ("open_interest", oi), ("daily_volume", vol),
+                       ("open_positions", open_n)):
+        if value is not None and (value < 0 or value != int(value)):
+            failed.append(f"invalid_numeric:{key}")
+            reasons.append(f"{key} must be a nonnegative whole number")
+    for key, value in (("evidence_confidence", conf), ("position_pct", size),
+                       ("portfolio_heat_pct", heat)):
+        if value is not None and not 0 <= value <= 1:
+            failed.append(f"invalid_numeric:{key}")
+            reasons.append(f"{key} must be between zero and one")
+    if size == 0:
+        failed.append("invalid_numeric:position_pct")
+        reasons.append("a proposed position must have positive risk")
+    if size is not None and heat is not None and heat < size:
+        failed.append("invalid_numeric:portfolio_heat_pct")
+        reasons.append("post-trade portfolio heat cannot be less than proposed risk")
+    if rel_spread is not None and rel_spread < 0:
+        failed.append("invalid_numeric:relative_spread")
+        reasons.append("spread cannot be negative")
 
     # --- Verdict ----------------------------------------------------------
     if not failed:
