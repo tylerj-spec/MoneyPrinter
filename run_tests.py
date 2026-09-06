@@ -16,11 +16,20 @@ STEPS = [
 ]
 
 
+SUITE_TIMEOUT_SECONDS = 420
+
+
 def main():
     failed = []
     for title, script in STEPS:
-        result = subprocess.run([sys.executable, str(ROOT / script)], cwd=str(ROOT))
-        if result.returncode:
+        try:
+            result = subprocess.run([sys.executable, str(ROOT / script)], cwd=str(ROOT),
+                                    timeout=SUITE_TIMEOUT_SECONDS)
+            code = result.returncode
+        except subprocess.TimeoutExpired:
+            code = 124
+            print(f"\n!! TIMEOUT after {SUITE_TIMEOUT_SECONDS}s: {title}")
+        if code:
             failed.append(title)
             print(f"\n!! FAILED: {title}")
     print("\n" + "=" * 72)
