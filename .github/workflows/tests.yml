@@ -54,9 +54,9 @@ jobs:
         run: xvfb-run -a python tests/test_pr11.py
 
   source_review:
-    # A download for reviewing this PR, not a release or a passing-test claim.
-    # git archive includes tracked source only: no .git, keys or runtime files.
-    if: github.event_name == 'pull_request'
+    # Produce the exact review source for both push and PR runs so no check is
+    # intentionally skipped. git archive contains tracked source only: no .git,
+    # credentials or runtime data.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
