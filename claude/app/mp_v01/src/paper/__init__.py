@@ -1,1 +1,1 @@
-"""Paper-only portfolio and execution utilities."""
+"""Local-only paper execution; no broker order submission."""

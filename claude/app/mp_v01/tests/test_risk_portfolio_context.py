@@ -15,3 +15,14 @@ def test_complete_safe_context_can_be_candidate():
 def test_defined_risk_must_be_actual_true():
     r=evaluate({**BASE,"defined_risk":1,"position_pct":0.01,"portfolio_heat_pct":0.03,"open_positions":1})
     assert "undefined_risk_structure" in r.failed_gates
+
+
+def test_invalid_domains_are_not_safe_context():
+    safe = {**BASE, "position_pct": .01, "portfolio_heat_pct": .03, "open_positions": 1}
+    for field, value in (("position_pct", -1), ("position_pct", 0),
+                         ("portfolio_heat_pct", -1), ("open_positions", .5),
+                         ("relative_spread", -.1), ("evidence_confidence", 1.1),
+                         ("independent_events", 2.5)):
+        r = evaluate({**safe, field: value})
+        assert r.decision == Decision.PASS, (field, r)
+    assert evaluate({**safe, "portfolio_heat_pct": .001}).decision == Decision.PASS
