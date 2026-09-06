@@ -20,9 +20,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      # The core tests stay stdlib-only. Excel coverage is exercised below.
-      - name: Run the test suite
-        run: python run_tests.py
+      - name: Install test dependencies
+        run: python -m pip install tzdata openpyxl
+      - name: Run the complete suite including real GUI widgets
+        env:
+          MONEYPRINTER_REQUIRE_GUI_TESTS: "1"
+        run: xvfb-run -a python run_tests.py
 
   windows:
     runs-on: windows-latest
@@ -35,6 +38,22 @@ jobs:
       - name: Install what a Windows user actually needs
         run: python -m pip install tzdata openpyxl
       - name: Run every suite
+        env:
+          MONEYPRINTER_REQUIRE_GUI_TESTS: "1"
+        run: python run_tests.py
+
+  windows_user_python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install test dependencies
+        run: python -m pip install tzdata openpyxl
+      - name: Run on the user's Python generation
+        env:
+          MONEYPRINTER_REQUIRE_GUI_TESTS: "1"
         run: python run_tests.py
 
   excel:
@@ -54,9 +73,8 @@ jobs:
         run: xvfb-run -a python tests/test_pr11.py
 
   source_review:
-    # Produce the exact review source for both push and PR runs so no check is
-    # intentionally skipped. git archive contains tracked source only: no .git,
-    # credentials or runtime data.
+    # A download for reviewing this PR, not a release or a passing-test claim.
+    # git archive includes tracked source only: no .git, keys or runtime files.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
