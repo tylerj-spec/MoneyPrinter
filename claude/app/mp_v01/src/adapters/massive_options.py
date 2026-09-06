@@ -8,16 +8,16 @@ there is no way to ask Yahoo what the SPY chain looked like on 2024-03-05. That
 constraint is why backtest.py measures the signal layer and refuses to draw an
 options equity curve - the numbers for one would have to be invented.
 
-Massive sells exactly that history. If the account's entitlement covers it, the
-options layer becomes testable against the past rather than only forward.
+Massive sells historical option reference and price data. If the account's
+entitlement covers it, the options layer can be tested against the past rather
+than only forward. The adapter still fails closed: an HTTP 200 is not treated as
+proof that a point-in-time filter was honoured.
 
 WHAT WAS VERIFIED, AND HOW
 Every path, parameter and field name below was read out of the vendor's own
-Python client (github.com/massive-com/client-python), not inferred from their
-marketing pages or from Polygon documentation remembered from before the
-2025-10-30 rebrand. What has NOT been verified is what a given account is
-entitled to, because this repository's build environment cannot reach
-api.massive.com at all. Hence probe() - see below.
+Python client and current REST documentation. What has NOT been verified in this
+repository is what a particular account is entitled to, because the build
+environment cannot reach api.massive.com. Hence diagnose_access() below.
 
 CREDENTIAL HANDLING (same rules as adapters/eodhd_options.py)
 The key is read from MASSIVE_API_KEY, which is the vendor client's own default
@@ -33,22 +33,13 @@ doing rather than ours:
   - redact() still scrubs it from any text, because "never" is a property worth
     enforcing twice
 
-THE POINT-IN-TIME SHAPE, WHICH IS NOT THE OBVIOUS ONE
+THE POINT-IN-TIME SHAPE
 There is a snapshot endpoint that returns a chain WITH vendor Greeks, but it is
-a snapshot of NOW - it cannot be asked about a past date, so it is no better
-than Yahoo for history. Historical work goes through two calls instead:
-
-  1. /v3/reference/options/contracts?as_of=D&expired=true
-     the contracts that EXISTED on date D. `as_of` is what makes this
-     point-in-time rather than a survivorship-biased list of what still trades.
-  2. /v2/aggs/ticker/O:SPY240315C00500000/range/1/day/FROM/TO
-     that contract's daily bars.
-
-So the vendor supplies historical PRICES, and the Greeks are solved here, from
-the quote, by options/greeks.py. That is the better arrangement anyway: a
-vendor's Greeks carry their volatility model and their dividend assumption,
-neither of which is stated, whereas a solved IV is reproducible from numbers
-that are in the file.
+a snapshot of NOW. Historical work instead combines contract reference queries
+with historical option bars/quotes. Massive documents `as_of` as a point-in-time
+parameter and expiration_date range filters separately. This adapter therefore
+keeps both: explicit expiration bounds are mechanically verifiable, while
+`as_of` is diagnosed independently before a historical backfill is trusted.
 """
 from __future__ import annotations
 
@@ -66,15 +57,10 @@ from common.timezones import US_EASTERN as NY
 TOKEN_ENV_VAR = "MASSIVE_API_KEY"
 BASE_URL = "https://api.massive.com"
 
-# Verbatim from massive/rest/reference.py and massive/rest/aggs.py in the
-# vendor's client. Kept together so a rebrand or version bump is one edit.
 CONTRACTS_PATH = "/v3/reference/options/contracts"
 AGGS_PATH = "/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_}/{to}"
 CHAIN_SNAPSHOT_PATH = "/v3/snapshot/options/{underlying}"
 
-# A daily bar for session D is final after the 16:00 ET close and published with
-# a lag. Same conservative convention as yahoo_daily: consumable next morning,
-# never on its own date. Tighten only with measured evidence of real latency.
 BAR_AVAILABILITY_LAG_HOURS = 17
 
 
@@ -83,16 +69,7 @@ class MissingCredential(RuntimeError):
 
 
 class MassiveError(RuntimeError):
-    """A call that came back wrong. Carries no key: see redact().
-
-    `kind` is set where the error is RAISED, not sniffed out of the message
-    afterwards. Sniffing got this wrong immediately: an HTTPS proxy refusing to
-    open a tunnel says "403 Forbidden", and a classifier looking for "403" in
-    the text reported NOT_ENTITLED - sending the reader to check a subscription
-    when the real problem was that the host was unreachable. The two need
-    completely different responses, so the distinction is recorded at the only
-    point that actually knows it.
-    """
+    """A call that came back wrong. Carries no key: see redact()."""
 
     def __init__(self, message: str, kind: str = "ERROR"):
         super().__init__(message)
@@ -113,7 +90,6 @@ def _token() -> str:
 
 
 def redact(text: str) -> str:
-    """Scrub the key from any string before it is logged or written anywhere."""
     tok = os.environ.get(TOKEN_ENV_VAR)
     if tok and tok in text:
         text = text.replace(tok, "***REDACTED***")
@@ -131,15 +107,7 @@ def bar_available_time(bar_date: str) -> datetime:
     return (close_et + timedelta(hours=BAR_AVAILABILITY_LAG_HOURS)).astimezone(timezone.utc)
 
 
-# ---------------------------------------------------------------------------
-# Normalisation - pure, and therefore the part that is actually tested
-# ---------------------------------------------------------------------------
-# The chain-NaN bug that emptied four tickers existed because this logic lived
-# inline in a network call where no test could reach it. It does not happen
-# twice: nothing below touches the network.
-
 def _finite(value: Any) -> float | None:
-    """A real number, or None. NaN, infinities and non-numerics become None."""
     if value is None:
         return None
     try:
@@ -155,12 +123,6 @@ def _count(value: Any) -> int | None:
 
 
 def normalize_contract(row: dict[str, Any], *, as_of: str) -> dict[str, Any]:
-    """One row of /v3/reference/options/contracts.
-
-    `as_of` is carried onto the record because it is the entire reason the row
-    is trustworthy: it says the contract existed on that date, rather than that
-    it exists now and might have been listed later.
-    """
     strike = _finite(row.get("strike_price"))
     kind = (row.get("contract_type") or "").upper() or None
     return {
@@ -179,13 +141,6 @@ def normalize_contract(row: dict[str, Any], *, as_of: str) -> dict[str, Any]:
 
 
 def normalize_agg(row: dict[str, Any], *, contract_symbol: str) -> dict[str, Any]:
-    """One daily bar from /v2/aggs. Keys are single letters; see models/aggs.py.
-
-    `t` is epoch MILLISECONDS at the start of the aggregate window. Reading it
-    as seconds would place every bar in 1970, and reading the date in UTC rather
-    than ET would move any late-session bar onto the following day - the same
-    off-by-one the walk-forward calendar had to be taught.
-    """
     ts = _finite(row.get("t"))
     day = (datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).astimezone(NY).date().isoformat()
            if ts is not None else None)
@@ -205,11 +160,6 @@ def normalize_agg(row: dict[str, Any], *, contract_symbol: str) -> dict[str, Any
 
 
 def contract_symbol(underlying: str, expiration: str, kind: str, strike: float) -> str:
-    """OCC-style symbol as Massive spells it: O:SPY240315C00500000.
-
-    Strike is in thousandths, zero-padded to eight digits. Built here rather
-    than assembled at call sites so there is one place to be wrong.
-    """
     k = kind.strip().upper()
     if k not in ("CALL", "PUT"):
         raise ValueError(f"kind must be CALL or PUT, got {kind!r}")
@@ -220,13 +170,8 @@ def contract_symbol(underlying: str, expiration: str, kind: str, strike: float) 
     return f"O:{underlying.strip().upper()}{y[2:]}{m}{d}{k[0]}{thousandths:08d}"
 
 
-# ---------------------------------------------------------------------------
-# The network layer - deliberately thin, and never trusted without a probe
-# ---------------------------------------------------------------------------
-
 def _get(path: str, params: dict[str, Any] | None = None,
          *, timeout: int = 30) -> dict[str, Any]:
-    """One GET. Raises MassiveError with the key scrubbed from the message."""
     url = BASE_URL + path
     if params:
         clean = {k: v for k, v in params.items() if v is not None}
@@ -250,30 +195,22 @@ def _get(path: str, params: dict[str, Any] | None = None,
             body = e.read().decode("utf-8", "replace")[:400]
         except Exception:
             pass
-        # 401/403 is an entitlement answer, not a crash: the free tier is sold
-        # per asset class, so "your key works but not for options" is a real and
-        # likely outcome that the caller needs to be able to read.
         kind = "NOT_ENTITLED" if e.code in (401, 402, 403) else "HTTP_ERROR"
         raise MassiveError(redact(f"HTTP {e.code} on {path}: {body}"), kind) from None
     except urllib.error.URLError as e:
-        # URLError means the request never got an HTTP answer at all - DNS,
-        # TLS, a refused connection, or a proxy declining the tunnel. Whatever
-        # digits appear in the reason, this is not an entitlement verdict.
         raise MassiveError(redact(f"cannot reach {BASE_URL}: {e.reason}"),
                            "UNREACHABLE") from None
 
 
 def _paginate(path: str, params: dict[str, Any], *, max_pages: int = 20) -> Iterator[dict]:
-    """Follow next_url. Bounded, because an unbounded loop against a metered
-    API is how a free tier becomes a surprise bill on a paid one."""
     page = _get(path, params)
-    for _ in range(max_pages):
+    for page_index in range(max_pages):
         for row in page.get("results") or []:
             yield row
         nxt = page.get("next_url")
         if not nxt:
             return
-        if _ + 1 == max_pages:
+        if page_index + 1 == max_pages:
             raise MassiveError(f"Response exceeds max_pages={max_pages}; incomplete history rejected",
                                "INCOMPLETE_RESPONSE")
         if not nxt.startswith(BASE_URL + "/"):
@@ -282,7 +219,7 @@ def _paginate(path: str, params: dict[str, Any], *, max_pages: int = 20) -> Iter
 
 
 def _validate_contracts(rows, underlying: str, as_of: str) -> list[dict[str, Any]]:
-    """An HTTP success is insufficient: verify the returned scope before saving."""
+    """An HTTP success is insufficient: verify explicit scope before saving."""
     expected = underlying.strip().upper()
     day = date.fromisoformat(as_of)
     normalized = []
@@ -306,7 +243,7 @@ def _validate_contracts(rows, underlying: str, as_of: str) -> list[dict[str, Any
 
 def list_contracts_as_of(underlying: str, as_of: str, *, expired: bool = True,
                          limit: int = 1000, max_pages: int = 20) -> list[dict[str, Any]]:
-    """The contracts that existed on `as_of`. This is the point-in-time call."""
+    """Request contracts as of `as_of`, with an independently checkable expiry floor."""
     rows = _paginate(CONTRACTS_PATH, {
         "underlying_ticker": underlying.strip().upper(),
         "as_of": as_of, "expired": str(bool(expired)).lower(), "limit": limit,
@@ -317,107 +254,127 @@ def list_contracts_as_of(underlying: str, as_of: str, *, expired: bool = True,
 
 def contract_daily_bars(symbol: str, start: str, end: str,
                         *, adjusted: bool = True) -> list[dict[str, Any]]:
-    """Daily bars for one option contract."""
     path = AGGS_PATH.format(ticker=urllib.parse.quote(symbol, safe=""),
                             multiplier=1, timespan="day", from_=start, to=end)
     doc = _get(path, {"adjusted": str(bool(adjusted)).lower(), "limit": 50000})
     return [normalize_agg(r, contract_symbol=symbol) for r in (doc.get("results") or [])]
 
 
+def _row_scope(rows: list[dict[str, Any]]) -> tuple[set[str], list[str], set[str]]:
+    underlyings = {str(r.get("underlying_ticker") or "?") for r in rows}
+    expirations = sorted({str(r.get("expiration_date") or "?") for r in rows})
+    tickers = {str(r.get("ticker") or "?") for r in rows}
+    return underlyings, expirations, tickers
+
+
 def diagnose_access(underlying: str = "SPY", as_of: str | None = None,
                     pause_seconds: float = 13.0) -> list[dict[str, Any]]:
-    """Walk up from the barest possible request, one parameter at a time.
+    """Five-rung, fail-closed access diagnostic.
 
-    WHY A LADDER AND NOT ONE CALL
+    Constant sort/order parameters make the three-row samples deterministic.
+    Each rung then adds one capability-bearing query parameter:
+      1 bare control
+      2 underlying_ticker
+      3 expired=true
+      4 expiration_date.gte=<as_of>
+      5 as_of=<as_of>
 
-    A single fully-specified request has one failure mode and five possible
-    causes. The first live probe asked for SPY contracts as of 2025-08-01 and
-    got back CYU contracts that expired in 2012 - an HTTP 200 whose body had
-    nothing to do with the question. That is what an IGNORED query parameter
-    looks like, and no amount of staring at one response can say WHICH
-    parameter was ignored.
-
-    So each rung adds exactly one thing and checks the response against what
-    was asked. The rung that first reports IGNORED or EMPTY names the problem.
-
-    Verdicts:
-      OK       the response matches the request
-      IGNORED  HTTP 200, but the rows contradict the filter - the parameter is
-               not being honoured, which is worse than an error because it
-               looks like data
-      EMPTY    HTTP 200, zero rows. Inconclusive on its own; read it against
-               the rung below, which is the whole point of the ladder
-      HTTP_*   the service refused, with its own reason
-
-    Costs up to five calls, paced for the documented 5-per-minute free tier.
+    `OK` means the response directly proves the parameter did what can be
+    mechanically checked. `CONSISTENT` means the final point-in-time response
+    changed in a way consistent with `as_of`; it is stronger than a blind 200
+    but deliberately not called proof of the vendor's full historical semantics.
+    `UNVERIFIED` means the sample did not contradict the request but also did not
+    demonstrate the capability. Historical backfills should not proceed on an
+    UNVERIFIED final rung.
     """
     as_of = as_of or (datetime.now(NY).date() - timedelta(days=400)).isoformat()
+    date.fromisoformat(as_of)  # reject malformed dates before spending a call
     want = underlying.strip().upper()
+    base = {"sort": "expiration_date", "order": "asc", "limit": 3}
     rungs = [
-        ("bare", {"limit": 3},
-         "does the endpoint answer this key at all?"),
-        ("underlying filter", {"underlying_ticker": want, "limit": 3},
+        ("bare", dict(base), "does the endpoint answer this key at all?"),
+        ("underlying filter", {**base, "underlying_ticker": want},
          "is underlying_ticker honoured?"),
-        ("current only", {"underlying_ticker": want, "expired": "false", "limit": 3},
-         "contracts listed right now"),
-        ("expired included", {"underlying_ticker": want, "expired": "true", "limit": 3},
-         "does this plan expose delisted contracts?"),
-        ("point in time", {"underlying_ticker": want, "expired": "true",
-                           "as_of": as_of, "limit": 3},
-         "is as_of honoured? this is the rung that matters"),
+        ("expired access", {**base, "underlying_ticker": want, "expired": "true"},
+         "can this key return expired contracts?"),
+        ("expiration floor", {**base, "underlying_ticker": want, "expired": "true",
+                              "expiration_date.gte": as_of},
+         "is the explicit historical expiration bound honoured?"),
+        ("point in time", {**base, "underlying_ticker": want, "expired": "true",
+                           "expiration_date.gte": as_of, "as_of": as_of},
+         "does adding as_of have an observable point-in-time effect?"),
     ]
 
     out: list[dict[str, Any]] = []
+    previous_tickers: set[str] | None = None
+    today = datetime.now(NY).date().isoformat()
+
     for i, (name, params, asks) in enumerate(rungs):
         if i:
-            time.sleep(pause_seconds)      # the free tier is 5 calls per MINUTE
-        step: dict[str, Any] = {"step": name, "asks": asks,
-                                "params": {k: v for k, v in params.items() if k != "limit"}}
+            time.sleep(pause_seconds)
+        step: dict[str, Any] = {
+            "step": name,
+            "asks": asks,
+            "params": {k: v for k, v in params.items()
+                       if k not in ("limit", "sort", "order")},
+        }
         try:
             doc = _get(CONTRACTS_PATH, params)
         except MassiveError as e:
             step.update(verdict=e.kind, detail=str(e))
             out.append(step)
-            break                          # a refusal makes every rung above moot
+            break
+
         rows = doc.get("results") or []
         step["returned"] = len(rows)
         if not rows:
             step["verdict"] = "EMPTY"
             out.append(step)
+            previous_tickers = set()
             continue
 
-        underlyings = {str(r.get("underlying_ticker") or "?") for r in rows}
+        underlyings, expirations, tickers = _row_scope(rows)
         step["underlyings_returned"] = sorted(underlyings)[:5]
-        step["expirations_returned"] = sorted(
-            {str(r.get("expiration_date") or "?") for r in rows})[:5]
+        step["expirations_returned"] = expirations[:5]
 
         if "underlying_ticker" in params and underlyings != {want}:
             step["verdict"] = "IGNORED"
             step["detail"] = (f"asked for {want}, got {', '.join(sorted(underlyings))} - "
-                              f"the underlying_ticker filter is not being applied")
-        elif "as_of" in params and all(
-                str(r.get("expiration_date") or "") < as_of for r in rows):
-            # Every contract expired before the as_of date. Not proof on its
-            # own, but combined with the rung below it separates "no history"
-            # from "as_of ignored".
+                              "underlying_ticker is not being applied")
+        elif "expiration_date.gte" in params and any(
+                exp == "?" or exp < as_of for exp in expirations):
             step["verdict"] = "IGNORED"
-            step["detail"] = (f"every contract expired before {as_of}, so as_of "
-                              f"does not appear to be filtering")
+            step["detail"] = (f"asked for expiration_date.gte={as_of}, got "
+                              f"{', '.join(expirations[:5])}")
+        elif name == "expired access":
+            if any(exp != "?" and exp < today for exp in expirations):
+                step["verdict"] = "OK"
+                step["detail"] = "sample includes at least one contract already expired today"
+            else:
+                step["verdict"] = "UNVERIFIED"
+                step["detail"] = ("expired=true returned rows, but this three-row sample "
+                                  "contains no contract expired today; do not infer history access")
+        elif name == "point in time":
+            if previous_tickers is not None and tickers != previous_tickers:
+                step["verdict"] = "CONSISTENT"
+                step["detail"] = ("adding as_of changed the deterministic contract sample while "
+                                  "all explicit scope checks still passed")
+            else:
+                step["verdict"] = "UNVERIFIED"
+                step["detail"] = ("adding as_of did not change this deterministic sample. That is "
+                                  "not proof it was ignored, but it also is not evidence that the "
+                                  "point-in-time filter affected the response")
         else:
             step["verdict"] = "OK"
+
         out.append(step)
+        previous_tickers = tickers
+
     return out
 
 
 def probe(underlying: str = "SPY", as_of: str | None = None) -> dict[str, Any]:
-    """Spend ONE call to find out what this account can actually do.
-
-    The build environment for this repository cannot reach api.massive.com, so
-    nothing above has been executed against the live service. Rather than let a
-    backfill discover that at scale, this makes a single cheap request and
-    reports exactly what came back - entitlement, shape, and whether `as_of`
-    is honoured. Run it before anything else.
-    """
+    """Legacy one-call smoke test. Prefer diagnose_access for capability boundaries."""
     as_of = as_of or (datetime.now(NY).date() - timedelta(days=400)).isoformat()
     out: dict[str, Any] = {"as_of": as_of, "underlying": underlying,
                            "endpoint": CONTRACTS_PATH}
