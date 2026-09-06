@@ -37,12 +37,13 @@ from typing import Any, Sequence
 from gates.risk import RiskLimits, evaluate as evaluate_gate
 from labels.contract import HORIZON_TRADING_DAYS
 from strategy.variants import Variant, score as score_variant
+from strategy.explain import attach_explanation
 from strategy.contract_selection import (
     ContractSelectionPolicy, DEFAULT_POLICY, eligible, rank_contracts,
     selection_audit, selection_metrics, _num,
 )
 
-PICK_CONTRACT_VERSION = "0.4.0"
+PICK_CONTRACT_VERSION = "0.5.0"
 
 # Required keys on an option row handed to this module. Stated so the coupling
 # to whatever produced the chain is explicit rather than discovered at runtime.
@@ -161,7 +162,8 @@ def build_rationale(ticker: str, variant: Variant, composite: float,
         """Unsigned: a volatility is a magnitude, and '+1.0%' reads as a change."""
         return "unknown" if v is None else f"{v:.1%}"
 
-    drivers = sorted(variant.weights.items(), key=lambda kv: -abs(kv[1]))[:3]
+    drivers = sorted(variant.weights.items(),
+                     key=lambda kv: -abs(kv[1] * (comps.get("scaled", {}).get(kv[0]) or 0)))[:3]
     driver_text = ", ".join(
         f"{k.replace('_', ' ')} {comps['scaled'][k]:+.2f}" for k, _w in drivers
         if comps["scaled"].get(k) is not None)
@@ -300,7 +302,7 @@ def generate_picks(
                 "edge_status": "NOT_DEMONSTRATED",
                 "rationale": build_rationale(ticker, variant, composite, comps, row, be, selection_policy),
             })
-    return out
+    return [attach_explanation(p) for p in out]
 
 
 def freeze(decision_date: str, picks: Sequence[dict[str, Any]], *,
@@ -312,6 +314,7 @@ def freeze(decision_date: str, picks: Sequence[dict[str, Any]], *,
     envelope, including dates, source files and exit policy. These are content
     integrity checks, not signatures or independently trusted timestamps.
     """
+    picks = [attach_explanation(p, source_files) for p in picks]
     canonical = json.dumps(picks, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(canonical.encode()).hexdigest()
     proposed = [p for p in picks if p["action"] != "ABSTAIN"]
