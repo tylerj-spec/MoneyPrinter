@@ -54,7 +54,7 @@ def do_diagnose(args) -> int:
     first_problem = None
     for st in steps:
         v = st["verdict"]
-        print(f"  [{v:<14}] {st['step']:<18} {st['asks']}")
+        print(f"  {v:<14}] {st['step']:<18} {st['asks']}")
         if st.get("params"):
             print(f"      sent      : {st['params']}")
         if "returned" in st:
@@ -71,7 +71,7 @@ def do_diagnose(args) -> int:
     final = steps[-1] if steps else None
     if final and final["step"] == "point in time" and final["verdict"] == "CONSISTENT" \
             and first_problem is None:
-        print("DIAGNOSTIC: POINT_IN_TIME_CONSISTENT")
+        print("DIAGNOSTI: POINT_IN_TIME_CONSISTENT")
         print("All directly checkable filters passed and adding as_of changed the")
         print("deterministic sample. Reference history is plausible enough for a small")
         print("canary fetch, but historical price/quote entitlement is still separate.")
@@ -80,7 +80,7 @@ def do_diagnose(args) -> int:
     if first_problem is None:
         first_problem = final
     if first_problem is None:
-        print("DIAGNOSTIC: NO_RESPONSE")
+        print("DIAGNOSTI: NO_RESPONSE")
         return 1
 
     v = first_problem["verdict"]
@@ -131,7 +131,7 @@ def do_fetch(args) -> int:
     for t in tickers:
         print(f"{t} ... ", end="", flush=True)
         try:
-            contracts = mv.list_contracts_as_of(t, args.as_of, max_pages=args.max_pages)
+            contracts = mv.list_contracts_as_of(t, args.as_of, expired=False, max_pages=args.max_pages)
         except mv.MissingCredential as e:
             print("no key"); print(e); return 1
         except mv.MassiveError as e:
