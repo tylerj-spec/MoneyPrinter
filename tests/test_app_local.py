@@ -26,11 +26,19 @@ class AppTests(unittest.TestCase):
                 self.assertEqual(json.loads(z.read("diagnostics.json"))["rejected_pick_files"], 1)
 
     def test_source_key_fields_exist_masked_and_do_not_persist(self):
-        import tkinter as tk
+        require = os.environ.get("MONEYPRINTER_REQUIRE_GUI_TESTS")
+        try:
+            import tkinter as tk
+        except ImportError:
+            # A Python built without Tk is a skip like a missing display is; only
+            # CI, which installs Tk on purpose, treats it as a failure.
+            if require:
+                self.fail("Tk is required but this interpreter has no tkinter")
+            self.skipTest("no tkinter")
         try:
             probe = tk.Tk(); probe.destroy()
         except tk.TclError:
-            if os.environ.get("MONEYPRINTER_REQUIRE_GUI_TESTS"):
+            if require:
                 self.fail("GUI display required")
             self.skipTest("no display")
         import app

@@ -277,5 +277,107 @@ class RunRegressions(unittest.TestCase):
                 wb.close()
 
 
+class HistoricalScopeRegressions(unittest.TestCase):
+    """PR19 changed the historical fetch and the diagnostic banner, and the whole
+    suite still passed. These lock down the two contracts it broke silently."""
+
+    def _params_for(self, **kwargs):
+        sent = {}
+
+        def capture(path, params, max_pages=20):
+            sent.update(params)
+            return []
+
+        with patch.object(mv, "_paginate", capture):
+            mv.list_contracts_as_of("SPY", "2024-01-02", **kwargs)
+        return sent
+
+    def test_point_in_time_fetch_asks_for_contracts_that_have_since_expired(self):
+        """`expired` is evaluated against today, not as_of: the ladder's own OK
+        condition is "includes at least one contract already expired today". So
+        expired=false keeps only contracts still alive now, which is exactly the
+        survivorship-biased sample. The default must stay expired=true."""
+        self.assertEqual(self._params_for()["expired"], "true")
+        self.assertEqual(self._params_for()["expiration_date.gte"], "2024-01-02")
+
+    def test_fetch_cli_does_not_narrow_history_to_contracts_still_alive_today(self):
+        """The regression PR19 shipped lived at the call site, not in the adapter
+        default, so asserting the default alone does not cover it. Drive the real
+        CLI path and check the scope it actually requests."""
+        import fetch_massive as cli
+        with tempfile.TemporaryDirectory() as tmp:
+            args = types.SimpleNamespace(
+                data_dir=tmp, tickers="SPY", as_of="2024-01-02", max_pages=2,
+                bars=False, bars_from=None, max_contracts=1)
+            with patch.object(mv, "list_contracts_as_of",
+                              return_value=[]) as listed, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                cli.do_fetch(args)
+        self.assertEqual(listed.call_count, 1)
+        self.assertNotIn(False, listed.call_args.kwargs.values())
+        self.assertIs(listed.call_args.kwargs.get("expired", True), True)
+
+    def test_expiry_floor_alone_does_not_make_the_sample_point_in_time(self):
+        """The floor is satisfied by survivors too, so validation cannot catch an
+        expired=false fetch. Demonstrate the loss the validator lets through."""
+        today = date.today()
+        chain = ["2024-01-19", "2024-06-21", "2025-01-17",
+                 (today + timedelta(days=400)).isoformat()]
+
+        def server(path, params, max_pages=20):
+            want = params["expired"] == "true"
+            floor = params["expiration_date.gte"]
+            return [{"ticker": "O:SPY%sC00470000" % e.replace("-", ""),
+                     "underlying_ticker": "SPY", "expiration_date": e,
+                     "strike_price": 470.0, "contract_type": "call"}
+                    for e in chain
+                    if e >= floor and (date.fromisoformat(e) < today) == want]
+
+        with patch.object(mv, "_paginate", server):
+            historical = mv.list_contracts_as_of("SPY", "2024-01-02")
+            survivors = mv.list_contracts_as_of("SPY", "2024-01-02", expired=False)
+
+        # Both pass _validate_contracts, so nothing raises on the biased sample.
+        self.assertEqual(len(historical), 3)
+        self.assertEqual(len(survivors), 1)
+        self.assertTrue(all(c["expiration"] >= "2024-01-02" for c in survivors))
+
+    def test_production_fetch_scope_matches_the_canary_probe_scope(self):
+        """The canary and the ladder both assert history with expired=true. If the
+        production call site drifts from them, the probe stops describing the
+        fetch it is meant to authorise."""
+        row = {"ticker": "O:SPY250919C00600000", "underlying_ticker": "SPY",
+               "expiration_date": "2025-09-19", "strike_price": 600,
+               "contract_type": "call"}
+        with patch.object(mv, "_get",
+                          return_value={"status": "OK", "results": [row]}) as get:
+            mv.probe("SPY", "2025-08-01")
+            probe_params = get.call_args.args[1]
+        self.assertEqual(probe_params["expired"], "true")
+        self.assertEqual(self._params_for()["expired"], probe_params["expired"])
+
+    def test_diagnostic_banner_and_verdict_column_stay_machine_readable(self):
+        """The CLI summary line is a documented sentinel (CODE_REVIEW_PR11.md) and
+        the verdict column is bracketed. PR19 shipped `DIAGNOSTI:` and a dangling
+        `]` through a fully green matrix because nothing asserted the text."""
+        import fetch_massive as cli
+        steps = [{"step": "bare", "verdict": "OK", "asks": "answers?"},
+                 {"step": "point in time", "verdict": "CONSISTENT",
+                  "asks": "as_of effect?"}]
+        args = types.SimpleNamespace(tickers="SPY", as_of="2024-01-02")
+        out = io.StringIO()
+        with patch.object(mv, "diagnose_access", return_value=steps), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(cli.do_diagnose(args), 0)
+        text = out.getvalue()
+
+        self.assertIn("DIAGNOSTIC: POINT_IN_TIME_CONSISTENT", text)
+        self.assertNotIn("DIAGNOSTI:", text.replace("DIAGNOSTIC:", ""))
+        for verdict in ("OK", "CONSISTENT"):
+            self.assertIn("[%s" % verdict, text)
+        for line in text.splitlines():
+            self.assertEqual(line.count("["), line.count("]"), line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
